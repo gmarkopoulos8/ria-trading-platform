@@ -145,10 +145,15 @@ export const api = {
   },
 
   performance: {
-    report: (period?: string) => get('/performance', { period }),
-    metrics: () => get('/performance/metrics'),
-    equityCurve: (period?: string) => get('/performance/equity-curve', { period }),
+    report: (params?: Record<string, unknown>) => get('/performance', params),
+    overview: (params?: Record<string, unknown>) => get('/performance/overview', params),
+    metrics: (params?: Record<string, unknown>) => get('/performance/metrics', params),
+    equityCurve: (params?: Record<string, unknown>) => get('/performance/equity-curve', params),
     tradeLog: (params?: Record<string, unknown>) => get('/performance/trade-log', params),
+    patterns: (params?: Record<string, unknown>) => get('/performance/patterns', params),
+    sectors: (params?: Record<string, unknown>) => get('/performance/sectors', params),
+    catalysts: (params?: Record<string, unknown>) => get('/performance/catalysts', params),
+    thesisQuality: (params?: Record<string, unknown>) => get('/performance/thesis-quality', params),
   },
 
   settings: {

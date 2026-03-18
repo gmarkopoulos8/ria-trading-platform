@@ -43,6 +43,7 @@ Full-stack AI paper trading research simulator. Premium dark-mode terminal UI fo
 6. **Multi-Agent Thesis Engine** — MarketStructure + Catalyst + Risk + Thesis agents, conviction/confidence/health scoring, entry/exit/invalidation zones, recommended actions, 3 API endpoints
 7. **Paper Trading System** — Full portfolio management: open/close positions, P&L computation (realized + unrealized), cash balance tracking, win rate, profit factor, audit logs, thesis-linked trades, "Paper Trade" button from ThesisPanel
 8. **Monitoring Engine** — Continuous position monitoring job (5-min intervals): re-runs full thesis analysis per position, evaluates 13 alert conditions, deduplicates within 30min windows, stores PositionSnapshot history, updates thesisHealth + recommendedAction on position; Alert Center page with severity feed, symbol/type/unread filters, mark-read, position monitor cards with health sparklines
+9. **Performance Analytics Layer** — 5 API endpoints (`/api/performance/overview`, `/patterns`, `/sectors`, `/catalysts`, `/thesis-quality`) backed by `PerformanceService.ts`; `PerformanceLab.tsx` fully rebuilt with 6 tabs (Overview, Patterns, Sectors, Catalysts, Thesis Quality, Trade Log), recharts equity curve / monthly P&L / outcome pie / hold-duration bar / asset-class bar charts, KPI stat cards, win-rate gauge, filter bar (date range / asset class / side / outcome), paginated trade log with full details
 
 ### API Endpoints
 - `GET /api/news` — Market news feed or symbol-filtered feed
