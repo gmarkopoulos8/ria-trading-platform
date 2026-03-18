@@ -1,0 +1,126 @@
+// This is your Prisma schema file.
+// Learn more about it in the docs: https://pris.ly/d/prisma-schema
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model User {
+  id          String   @id @default(cuid())
+  email       String   @unique
+  username    String   @unique
+  displayName String
+  passwordHash String
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  portfolios  Portfolio[]
+  alerts      Alert[]
+  sessions    UserSession[]
+
+  @@map("users")
+}
+
+model UserSession {
+  id        String   @id @default(cuid())
+  userId    String
+  token     String   @unique
+  expiresAt DateTime
+  createdAt DateTime @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@map("user_sessions")
+}
+
+model Portfolio {
+  id          String   @id @default(cuid())
+  userId      String
+  name        String
+  cashBalance Float    @default(100000)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  user      User            @relation(fields: [userId], references: [id], onDelete: Cascade)
+  positions PaperPosition[]
+
+  @@map("portfolios")
+}
+
+model PaperPosition {
+  id           String         @id @default(cuid())
+  portfolioId  String
+  symbol       String
+  name         String
+  side         PositionSide
+  quantity     Float
+  entryPrice   Float
+  exitPrice    Float?
+  targetPrice  Float?
+  stopLoss     Float?
+  thesis       String
+  tags         String[]
+  status       PositionStatus @default(OPEN)
+  openedAt     DateTime       @default(now())
+  closedAt     DateTime?
+  updatedAt    DateTime       @updatedAt
+
+  portfolio Portfolio @relation(fields: [portfolioId], references: [id], onDelete: Cascade)
+
+  @@map("paper_positions")
+}
+
+model Alert {
+  id          String        @id @default(cuid())
+  userId      String
+  symbol      String
+  type        AlertType
+  condition   AlertCondition
+  threshold   Float
+  message     String?
+  status      AlertStatus   @default(ACTIVE)
+  triggeredAt DateTime?
+  createdAt   DateTime      @default(now())
+  updatedAt   DateTime      @updatedAt
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@map("alerts")
+}
+
+enum PositionSide {
+  LONG
+  SHORT
+}
+
+enum PositionStatus {
+  OPEN
+  CLOSED
+  PENDING
+}
+
+enum AlertType {
+  PRICE
+  VOLUME
+  NEWS
+  TECHNICAL
+  CATALYST
+}
+
+enum AlertCondition {
+  ABOVE
+  BELOW
+  CROSSES
+  PERCENT_CHANGE
+}
+
+enum AlertStatus {
+  ACTIVE
+  TRIGGERED
+  DISMISSED
+}
