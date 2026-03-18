@@ -958,3 +958,40 @@ enum PolymarketSide {
   YES
   NO
 }
+
+// ─── Hyperliquid ──────────────────────────────────────────────────
+
+model HyperliquidOrderLog {
+  id            String   @id @default(cuid())
+  userId        String
+  asset         String
+  side          String
+  orderType     String
+  price         String?
+  size          String
+  leverage      Int      @default(1)
+  reduceOnly    Boolean  @default(false)
+  isDryRun      Boolean  @default(true)
+  status        String   @default("submitted")
+  exchangeOid   String?
+  errorMessage  String?
+  rawResponse   Json?
+
+  submittedAt DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  @@index([userId])
+  @@index([asset])
+  @@map("hl_order_logs")
+}
+
+model HyperliquidKillEvent {
+  id         String   @id @default(cuid())
+  userId     String?
+  reason     String
+  trigger    String
+  snapshot   Json?
+  createdAt  DateTime @default(now())
+
+  @@map("hl_kill_events")
+}

@@ -186,6 +186,20 @@ export const api = {
     searchHistory: () => get('/polymarket/search-history'),
   },
 
+  hyperliquid: {
+    status:           ()                         => get('/hyperliquid/status'),
+    markets:          ()                         => get('/hyperliquid/markets'),
+    candles:          (asset: string, interval = '1h') => get(`/hyperliquid/markets/${asset}/candles`, { interval }),
+    account:          (address?: string)         => get('/hyperliquid/account', address ? { address } : {}),
+    placeOrder:       (body: unknown)            => post('/hyperliquid/orders', body),
+    cancelOrder:      (asset: string, oid: number) => del(`/hyperliquid/orders/${oid}?asset=${asset}`),
+    closePosition:    (asset: string, size: string, isBuy: boolean) => post(`/hyperliquid/positions/${asset}/close`, { size, isBuy }),
+    setLeverage:      (body: unknown)            => post('/hyperliquid/leverage', body),
+    killswitch:       (reason?: string)          => post('/hyperliquid/killswitch', { reason }),
+    resetKillswitch:  ()                         => del('/hyperliquid/killswitch'),
+    orderHistory:     (limit?: number)           => get('/hyperliquid/order-history', limit ? { limit } : {}),
+  },
+
   scans: {
     trigger: (body?: {
       runType?: string;

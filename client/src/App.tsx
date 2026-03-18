@@ -15,6 +15,7 @@ import DailyScan from './pages/DailyScan';
 import PolymarketDashboard from './pages/polymarket/PolymarketDashboard';
 import PolymarketExplorer from './pages/polymarket/PolymarketExplorer';
 import PolymarketMarketDetail from './pages/polymarket/PolymarketMarketDetail';
+import HyperliquidDashboard from './pages/hyperliquid/HyperliquidDashboard';
 import StockHealthAnalyzer from './pages/StockHealthAnalyzer';
 import ScanReport from './pages/ScanReport';
 import ScanHistory from './pages/ScanHistory';
@@ -54,6 +55,7 @@ export default function App() {
           <Route path="polymarket" element={<PolymarketDashboard />} />
           <Route path="polymarket/explorer" element={<PolymarketExplorer />} />
           <Route path="polymarket/market/:id" element={<PolymarketMarketDetail />} />
+          <Route path="hyperliquid" element={<HyperliquidDashboard />} />
         </Route>
 
         <Route path="*" element={<Navigate to="/dashboard" replace />} />
