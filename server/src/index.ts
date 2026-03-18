@@ -3,6 +3,7 @@ import express from 'express';
 import cors from 'cors';
 import helmet from 'helmet';
 import session from 'express-session';
+import connectPgSimple from 'connect-pg-simple';
 import authRouter from './routes/auth';
 import symbolsRouter from './routes/symbols';
 import marketRouter from './routes/market';
@@ -16,6 +17,8 @@ import { errorHandler, notFoundHandler } from './middleware/errorHandler';
 const app = express();
 const PORT = process.env.PORT ?? 3001;
 
+app.set('trust proxy', 1);
+
 app.use(helmet({ contentSecurityPolicy: false }));
 app.use(cors({
   origin: process.env.CLIENT_URL ?? 'http://localhost:5000',
@@ -24,14 +27,24 @@ app.use(cors({
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
+const PgSession = connectPgSimple(session);
+
 app.use(session({
+  store: new PgSession({
+    conString: process.env.DATABASE_URL,
+    tableName: 'user_sessions_store',
+    createTableIfMissing: true,
+    ttl: 24 * 60 * 60,
+  }),
   secret: process.env.SESSION_SECRET ?? 'ria-bot-dev-secret-change-in-production',
   resave: false,
   saveUninitialized: false,
+  name: 'ria.sid',
   cookie: {
     secure: process.env.NODE_ENV === 'production',
     httpOnly: true,
     maxAge: 24 * 60 * 60 * 1000,
+    sameSite: 'lax',
   },
 }));
 
@@ -42,6 +55,7 @@ app.get('/api/health', (req, res) => {
     version: '1.0.0',
     environment: process.env.NODE_ENV ?? 'development',
     timestamp: new Date().toISOString(),
+    authenticated: !!req.session?.userId,
   });
 });
 
@@ -59,8 +73,9 @@ app.use(errorHandler);
 
 app.listen(PORT, () => {
   console.log(`✅ RIA BOT API running on port ${PORT}`);
-  console.log(`   Environment: ${process.env.NODE_ENV ?? 'development'}`);
-  console.log(`   Database: ${process.env.DATABASE_URL ? 'connected' : 'not configured'}`);
+  console.log(`   Environment : ${process.env.NODE_ENV ?? 'development'}`);
+  console.log(`   Database    : ${process.env.DATABASE_URL ? 'connected' : 'not configured'}`);
+  console.log(`   Sessions    : PostgreSQL`);
 });
 
 export default app;

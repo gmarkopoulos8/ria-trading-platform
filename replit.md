@@ -51,9 +51,17 @@ Full-stack AI paper trading research simulator. Premium dark-mode terminal UI fo
 - `/api/performance/*` — Analytics and reporting
 - `/api/settings/*` — User settings
 
+## Auth System
+- **Backend**: bcryptjs (12 rounds), connect-pg-simple PostgreSQL session store, requireAuth middleware
+- **Routes**: POST /api/auth/register, POST /api/auth/login, POST /api/auth/logout, GET /api/auth/me
+- **Session cookie**: `ria.sid` in `user_sessions_store` table
+- **Frontend**: AuthContext (React Query), ProtectedRoute, Login page, Register page
+- **Test user**: dev@riabot.local / password123 (devtrader username)
+
 ## Pages
 - Dashboard, OpportunityScanner, SymbolIntelligence, PaperPortfolio
-- CatalystIntelligence, RiskConsole, PerformanceLab, Login
+- CatalystIntelligence, RiskConsole, PerformanceLab, Login, Register
+- TopNav includes: live/offline status, PAPER badge, notifications, UserMenu (logout/settings/profile)
 
 ## Environment Variables
 - `DATABASE_URL` — PostgreSQL connection string

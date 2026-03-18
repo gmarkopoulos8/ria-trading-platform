@@ -1,4 +1,4 @@
-import axios from 'axios';
+import axios, { AxiosError } from 'axios';
 
 export const apiClient = axios.create({
   baseURL: '/api',
@@ -10,13 +10,24 @@ export const apiClient = axios.create({
 
 apiClient.interceptors.response.use(
   (response) => response,
-  (error) => {
-    if (error.response?.status === 401) {
+  (error: AxiosError) => {
+    const url = error.config?.url ?? '';
+    const isAuthMe = url.includes('/auth/me');
+    const isAuthRoute = url.includes('/auth/');
+    if (error.response?.status === 401 && !isAuthMe && !isAuthRoute) {
       window.location.href = '/login';
     }
     return Promise.reject(error);
   }
 );
+
+export interface ApiResponse<T = unknown> {
+  success: boolean;
+  data?: T;
+  error?: string;
+  message?: string;
+  details?: Array<{ field: string; message: string }>;
+}
 
 export async function get<T>(path: string, params?: Record<string, unknown>): Promise<T> {
   const { data } = await apiClient.get<T>(path, { params });
@@ -38,25 +49,54 @@ export async function del<T>(path: string): Promise<T> {
   return data;
 }
 
+export interface User {
+  id: string;
+  email: string;
+  username: string;
+  displayName: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface AuthResponse {
+  success: boolean;
+  data?: { user: User };
+  error?: string;
+  details?: Array<{ field: string; message: string }>;
+}
+
 export const api = {
   health: () => get<{ success: boolean; service: string }>('/health'),
+
   auth: {
-    me: () => get('/auth/me'),
-    login: (body: { email: string; password: string }) => post('/auth/login', body),
-    logout: () => post('/auth/logout'),
+    me: () => get<AuthResponse>('/auth/me'),
+    login: (body: { email: string; password: string }) =>
+      post<AuthResponse>('/auth/login', body),
+    logout: () => post<AuthResponse>('/auth/logout'),
+    register: (body: {
+      email: string;
+      username: string;
+      password: string;
+      displayName: string;
+    }) => post<AuthResponse>('/auth/register', body),
   },
+
   market: {
     overview: () => get('/market/overview'),
     opportunities: (params?: Record<string, unknown>) => get('/market/opportunities', params),
     movers: (params?: Record<string, unknown>) => get('/market/movers', params),
   },
+
   symbols: {
-    search: (q: string, params?: Record<string, unknown>) => get('/symbols/search', { q, ...params }),
+    search: (q: string, params?: Record<string, unknown>) =>
+      get('/symbols/search', { q, ...params }),
     get: (symbol: string) => get(`/symbols/${symbol}`),
     quote: (symbol: string) => get(`/symbols/${symbol}/quote`),
-    history: (symbol: string, period = '1D') => get(`/symbols/${symbol}/history`, { period }),
+    history: (symbol: string, period = '1D') =>
+      get(`/symbols/${symbol}/history`, { period }),
     catalysts: (symbol: string) => get(`/symbols/${symbol}/catalysts`),
   },
+
   positions: {
     list: () => get('/paper-positions'),
     open: (body: unknown) => post('/paper-positions/open', body),
@@ -64,21 +104,29 @@ export const api = {
     get: (id: string) => get(`/paper-positions/${id}`),
     delete: (id: string) => del(`/paper-positions/${id}`),
   },
+
   alerts: {
     list: () => get('/alerts'),
     create: (body: unknown) => post('/alerts', body),
     delete: (id: string) => del(`/alerts/${id}`),
     dismiss: (id: string) => post(`/alerts/${id}/dismiss`),
   },
+
   news: {
     list: (params?: Record<string, unknown>) => get('/news', params),
     catalysts: (params?: Record<string, unknown>) => get('/news/catalysts', params),
     sentiment: (symbol: string) => get('/news/sentiment', { symbol }),
   },
+
   performance: {
     report: (period?: string) => get('/performance', { period }),
     metrics: () => get('/performance/metrics'),
     equityCurve: (period?: string) => get('/performance/equity-curve', { period }),
     tradeLog: (params?: Record<string, unknown>) => get('/performance/trade-log', params),
+  },
+
+  settings: {
+    get: () => get('/settings'),
+    update: (body: unknown) => put('/settings', body),
   },
 };
