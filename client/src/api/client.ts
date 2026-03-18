@@ -100,6 +100,18 @@ export const api = {
       get(`/symbols/${symbol}/technical`, { timeframe, ...(assetClass ? { assetClass } : {}) }),
     patterns: (symbol: string, timeframe = '1M', assetClass?: string) =>
       get(`/symbols/${symbol}/patterns`, { timeframe, ...(assetClass ? { assetClass } : {}) }),
+    analyze: (symbol: string, assetClass?: string) =>
+      get(`/symbols/${symbol}/analyze`, assetClass ? { assetClass } : {}),
+    thesis: (symbol: string, assetClass?: string) =>
+      get(`/symbols/${symbol}/thesis`, assetClass ? { assetClass } : {}),
+  },
+
+  thesis: {
+    analyze: (symbol: string, assetClass?: string) =>
+      get(`/symbols/${symbol}/analyze`, assetClass ? { assetClass } : {}),
+    thesis: (symbol: string, assetClass?: string) =>
+      get(`/symbols/${symbol}/thesis`, assetClass ? { assetClass } : {}),
+    scan: (params?: Record<string, unknown>) => get('/market/scan', params),
   },
 
   positions: {

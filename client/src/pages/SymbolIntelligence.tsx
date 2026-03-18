@@ -4,7 +4,7 @@ import { useQuery } from '@tanstack/react-query';
 import {
   Search, TrendingUp, TrendingDown, Activity, Zap, BarChart2,
   RefreshCw, AlertCircle, ChevronUp, ChevronDown, Target,
-  TriangleIcon, Layers, Flame, Newspaper, Clock, ExternalLink,
+  TriangleIcon, Layers, Flame, Newspaper, Clock, ExternalLink, Brain,
 } from 'lucide-react';
 import {
   AreaChart, Area, XAxis, YAxis, Tooltip, ResponsiveContainer, CartesianGrid,
@@ -16,6 +16,7 @@ import { Badge } from '../components/ui/Badge';
 import { EmptyState } from '../components/ui/EmptyState';
 import { LoadingState } from '../components/ui/LoadingState';
 import { ErrorState } from '../components/ui/ErrorState';
+import { ThesisPanel } from '../components/thesis/ThesisPanel';
 
 type Timeframe = '1D' | '1W' | '1M' | '3M' | '6M' | '1Y' | '5Y';
 const TIMEFRAMES: Timeframe[] = ['1D', '1W', '1M', '3M', '6M', '1Y', '5Y'];
@@ -534,6 +535,7 @@ export default function SymbolIntelligence() {
   const [timeframe, setTimeframe] = useState<Timeframe>('1M');
   const [showTechnical, setShowTechnical] = useState(true);
   const [showCatalysts, setShowCatalysts] = useState(true);
+  const [showThesis, setShowThesis] = useState(true);
 
   const { data: quoteData, isLoading: quoteLoading, isError: quoteError, refetch: refetchQuote } = useQuery({
     queryKey: ['quote', symbol],
@@ -710,6 +712,7 @@ export default function SymbolIntelligence() {
               </div>
 
               {showCatalysts && catalystData && (
+
                 <div className="space-y-3">
                   {catalystData.sentimentSummary && (
                     <div className="grid grid-cols-3 gap-3">
@@ -763,6 +766,20 @@ export default function SymbolIntelligence() {
                     View full catalyst feed →
                   </a>
                 </div>
+              )}
+
+              <div className="flex items-center justify-between">
+                <h3 className="text-sm font-semibold text-white flex items-center gap-2">
+                  <Brain className="h-4 w-4 text-accent-blue" /> AI Trade Thesis
+                </h3>
+                <button onClick={() => setShowThesis((v) => !v)}
+                  className="text-xs text-slate-500 hover:text-white transition-colors font-mono">
+                  {showThesis ? 'Hide' : 'Show'}
+                </button>
+              </div>
+
+              {showThesis && (
+                <ThesisPanel symbol={symbol} assetClass={quote.assetClass} />
               )}
 
               {quote.isMock && (

@@ -1,6 +1,7 @@
 import { Router, Request, Response } from 'express';
 import { marketService } from '../services/market/MarketService';
 import { AssetClass } from '../services/market/types';
+import { thesisEngine } from '../services/thesis/ThesisEngine';
 
 const router = Router();
 
@@ -127,6 +128,40 @@ router.get('/movers', async (req: Request, res: Response) => {
   } catch (err) {
     console.error('[/market/movers]', err);
     return res.status(500).json({ success: false, error: 'Failed to fetch movers' });
+  }
+});
+
+router.get('/scan', async (req: Request, res: Response) => {
+  try {
+    const assetClassRaw = String(req.query.assetClass ?? '').toLowerCase();
+    const assetClass = ['stock', 'crypto'].includes(assetClassRaw) ? assetClassRaw : undefined;
+    const limit = Math.min(10, Math.max(1, parseInt(String(req.query.limit ?? '10'), 10)));
+
+    const summaries = await thesisEngine.scan(assetClass, limit);
+
+    const bullish = summaries.filter((s) => s.bias === 'BULLISH').length;
+    const highConviction = summaries.filter((s) => s.convictionScore >= 70).length;
+    const avgConviction = summaries.length > 0
+      ? Math.round(summaries.reduce((s, x) => s + x.convictionScore, 0) / summaries.length)
+      : 0;
+
+    return res.json({
+      success: true,
+      data: {
+        summaries,
+        meta: {
+          total: summaries.length,
+          bullish,
+          bearish: summaries.filter((s) => s.bias === 'BEARISH').length,
+          neutral: summaries.filter((s) => s.bias === 'NEUTRAL').length,
+          highConviction,
+          avgConviction,
+        },
+      },
+    });
+  } catch (err) {
+    console.error('[/market/scan]', err);
+    return res.status(500).json({ success: false, error: 'Scan failed' });
   }
 });
 

@@ -5,6 +5,7 @@ import { Timeframe } from '../services/market/types';
 import { technicalService } from '../services/technical/TechnicalService';
 import { Timeframe as TechTimeframe } from '../services/technical/types';
 import { newsService } from '../services/news/NewsService';
+import { thesisEngine } from '../services/thesis/ThesisEngine';
 
 const router = Router();
 
@@ -152,6 +153,40 @@ router.get('/:symbol/patterns', async (req: Request, res: Response) => {
   } catch (err) {
     console.error('[/symbols/:symbol/patterns]', err);
     return res.status(500).json({ success: false, error: 'Pattern analysis failed' });
+  }
+});
+
+router.get('/:symbol/analyze', async (req: Request, res: Response) => {
+  try {
+    const symbol = req.params.symbol.toUpperCase();
+    const assetClass = req.query.assetClass ? String(req.query.assetClass).toLowerCase() : undefined;
+    const result = await thesisEngine.analyze(symbol, assetClass);
+    return res.json({
+      success: true,
+      data: {
+        ticker: result.ticker,
+        marketStructure: result.marketStructure,
+        catalysts: result.catalysts,
+        risk: result.risk,
+        thesis: result.thesis,
+        analyzedAt: result.analyzedAt,
+      },
+    });
+  } catch (err) {
+    console.error('[/symbols/:symbol/analyze]', err);
+    return res.status(500).json({ success: false, error: 'Analysis failed' });
+  }
+});
+
+router.get('/:symbol/thesis', async (req: Request, res: Response) => {
+  try {
+    const symbol = req.params.symbol.toUpperCase();
+    const assetClass = req.query.assetClass ? String(req.query.assetClass).toLowerCase() : undefined;
+    const result = await thesisEngine.analyze(symbol, assetClass);
+    return res.json({ success: true, data: { thesis: result.thesis } });
+  } catch (err) {
+    console.error('[/symbols/:symbol/thesis]', err);
+    return res.status(500).json({ success: false, error: 'Failed to generate thesis' });
   }
 });
 
