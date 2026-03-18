@@ -1,0 +1,184 @@
+Expand the existing RIA BOT project.
+
+Goal:
+Build an NYSE Stock Health Analyzer that allows the user to search any NYSE-listed stock and instantly receive a Stock Health Score, explainable research verdict, and action label.
+
+Important TradingView implementation note:
+Use TradingView for charting and market visualization only, via TradingView widgets or TradingView Charting Library integration.
+Do not rely on a generic public “TradingView data API” for backend stock data.
+Instead:
+- use backend market data providers for quotes, OHLCV, and technical calculations
+- use TradingView widgets or Charting Library for chart display
+- keep all scoring and analysis logic inside the app’s backend thesis engine
+
+Feature name:
+NYSE Stock Health Analyzer
+
+Search behavior:
+- user can search any valid NYSE-listed stock ticker
+- validate ticker format
+- verify exchange is NYSE
+- return graceful error for invalid symbols or unsupported symbols
+- cache recent searches
+- save search history per user
+
+Primary output for each searched stock:
+- Stock Health Score from 0 to 100
+- Bias: bullish, bearish, or neutral
+- Confidence Score from 0 to 100
+- Risk Score from 0 to 100
+- Action Label:
+  - high conviction
+  - tradable
+  - developing
+  - weak
+  - avoid
+
+Every result must be explainable and based on structured analysis.
+
+Analysis inputs:
+1. historical price action
+2. trend strength
+3. support and resistance
+4. volume behavior
+5. RSI
+6. MACD
+7. ATR / volatility
+8. moving average alignment
+9. pattern detection
+10. recent news and catalysts
+11. sentiment trend
+12. liquidity
+13. reward-to-risk structure
+14. short-term downside risk
+
+Stock Health Score logic:
+Generate a weighted score using:
+- technical structure quality
+- catalyst/news quality
+- volatility suitability
+- liquidity quality
+- trend alignment
+- momentum quality
+- risk-adjusted setup quality
+- invalidation clarity
+
+Suggested weighting:
+- technical structure: 30%
+- catalyst/news: 20%
+- momentum/trend: 15%
+- risk profile: 15%
+- volatility suitability: 10%
+- liquidity: 10%
+
+Health score interpretation:
+- 85 to 100 = elite setup
+- 70 to 84 = strong setup
+- 55 to 69 = mixed but viable
+- 40 to 54 = weak / caution
+- below 40 = unhealthy setup
+
+Action label rules:
+- high conviction = very strong health score, strong technicals, favorable catalysts, acceptable risk, clean invalidation
+- tradable = attractive setup with decent structure and acceptable risk, but not top-tier
+- developing = setup is forming but needs more confirmation
+- weak = mixed or poor structure with elevated uncertainty
+- avoid = unhealthy setup, elevated risk, weak structure, poor catalysts, or bad liquidity
+
+For each searched stock, return:
+- ticker
+- company name
+- exchange
+- current price
+- Stock Health Score
+- bias
+- confidence score
+- risk score
+- trend state
+- support zone
+- resistance zone
+- volatility state
+- patterns detected
+- catalyst summary
+- sentiment summary
+- top strengths
+- top weaknesses
+- key invalidation level
+- suggested hold window
+- action label
+- one-paragraph explanation
+
+Backend requirements:
+Create endpoint:
+GET /api/stocks/:ticker/health
+
+Response shape:
+{
+  "ticker": "string",
+  "companyName": "string",
+  "exchange": "NYSE",
+  "currentPrice": number,
+  "healthScore": number,
+  "bias": "bullish | bearish | neutral",
+  "confidenceScore": number,
+  "riskScore": number,
+  "trendState": "string",
+  "supportZone": { "min": number, "max": number },
+  "resistanceZone": { "min": number, "max": number },
+  "volatilityState": "string",
+  "patternsDetected": ["string"],
+  "catalystSummary": "string",
+  "sentimentSummary": "string",
+  "topStrengths": ["string"],
+  "topWeaknesses": ["string"],
+  "invalidationLevel": number,
+  "suggestedHoldWindow": "string",
+  "actionLabel": "high conviction | tradable | developing | weak | avoid",
+  "explanation": "string"
+}
+
+TradingView UI requirements:
+On the dashboard and Symbol Intelligence page:
+- add a stock search bar
+- display a TradingView chart widget or TradingView Charting Library chart for the searched symbol
+- show timeframe switching
+- show chart beside the health score card
+- show clean integration between chart, technical summary, catalyst summary, and score verdict
+
+Do not attempt to compute the health score from TradingView alone.
+Use backend market data plus internal technical and thesis services.
+Use TradingView only for rendering chart experiences and symbol visualization.
+
+Frontend requirements:
+Create a premium research verdict card with:
+- large Stock Health Score badge
+- action label badge
+- bias badge
+- confidence and risk scores
+- mini thesis summary
+- technical breakdown
+- catalyst breakdown
+- strengths vs weaknesses
+- invalidation level
+- hold window
+- TradingView chart panel
+- explainability section
+
+Design style:
+- premium dark-mode finance UI
+- institutional feel
+- high-signal layout
+- clear score badges
+- clean typography
+- instant search experience
+- responsive design
+
+Persistence requirements:
+- save search history per user
+- optionally save latest health analysis snapshot
+- support recent searches panel
+- support reloading most recent analyzed symbols
+
+Important system behavior:
+The result must clearly explain why the stock received its health score and action label.
+The experience should feel like a fast research verdict with strong explainability, not a random opinion.

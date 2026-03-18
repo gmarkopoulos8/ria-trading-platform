@@ -116,6 +116,8 @@ model Symbol {
   riskScores       RiskScore[]
   theses           Thesis[]
   agentOutputs     AgentOutput[]
+  dailyScanResults DailyScanResult[]     @relation("DailyScanResultSymbol")
+  rankedSnapshots  RankedOpportunitySnapshot[] @relation("RankedOpportunitySnapshotSymbol")
 
   @@index([ticker])
   @@index([assetClass])
@@ -531,6 +533,141 @@ model AuditLog {
   @@index([action])
   @@index([entity, entityId])
   @@map("audit_logs")
+}
+
+// ─── Daily Scan Engine ───────────────────────────────────────────
+
+model DailyScanRun {
+  id                  String   @id @default(cuid())
+  runType             String   @default("SCHEDULED") // SCHEDULED | PREMARKET | MANUAL
+  status              String   @default("PENDING")   // PENDING | RUNNING | COMPLETED | FAILED | PARTIAL
+  startedAt           DateTime?
+  completedAt         DateTime?
+  scheduledFor        DateTime?
+  marketSession       String   @default("MARKET_OPEN") // PREMARKET | MARKET_OPEN | MIDDAY
+  assetScope          String   @default("ALL")          // ALL | STOCKS_ONLY | CRYPTO_ONLY
+  riskMode            String   @default("ALL")          // ALL | CONSERVATIVE | AGGRESSIVE
+  totalUniverseCount  Int      @default(0)
+  totalRankedCount    Int      @default(0)
+  topSymbol           String?
+  summary             String?
+  errorMessage        String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  results DailyScanResult[]
+  snapshots RankedOpportunitySnapshot[]
+  report    DailyMarketReport?
+
+  @@index([status])
+  @@index([scheduledFor])
+  @@index([runType, status])
+  @@map("daily_scan_runs")
+}
+
+model DailyScanResult {
+  id                   String @id @default(cuid())
+  scanRunId            String
+  symbolId             String?
+  symbol               String
+  assetClass           String @default("STOCK")
+  rank                 Int
+  bias                 String @default("NEUTRAL")
+  convictionScore      Float  @default(0)
+  confidenceScore      Float  @default(0)
+  technicalScore       Float  @default(0)
+  catalystScore        Float  @default(0)
+  riskScore            Float  @default(0)
+  volatilityScore      Float  @default(0)
+  liquidityScore       Float  @default(0)
+  setupType            String?
+  trendState           String?
+  supportZoneJson      Json?
+  resistanceZoneJson   Json?
+  entryZoneJson        Json?
+  invalidationZoneJson Json?
+  takeProfit1Json      Json?
+  takeProfit2Json      Json?
+  suggestedHoldWindow  String?
+  thesisHealthScore    Float  @default(0)
+  monitoringFrequency  String @default("DAILY")
+  supportingReasonsJson Json?
+  mainRiskToThesis     String?
+  catalystSummary      String?
+  patternSummary       String?
+  recommendedAction    String @default("watch-for-confirmation")
+  thesisId             String?
+  rawAgentOutputJson   Json?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  scanRun DailyScanRun @relation(fields: [scanRunId], references: [id], onDelete: Cascade)
+  symbol_ Symbol?      @relation("DailyScanResultSymbol", fields: [symbolId], references: [id], onDelete: SetNull)
+
+  @@index([scanRunId, rank])
+  @@index([symbol])
+  @@index([scanRunId, symbol])
+  @@map("daily_scan_results")
+}
+
+model RankedOpportunitySnapshot {
+  id                   String   @id @default(cuid())
+  symbolId             String?
+  scanRunId            String
+  symbol               String
+  rank                 Int
+  scoreComposite       Float    @default(0)
+  scoreTechnical       Float    @default(0)
+  scoreCatalyst        Float    @default(0)
+  scoreRiskAdjusted    Float    @default(0)
+  scoreVolatilityFit   Float    @default(0)
+  scoreLiquidity       Float    @default(0)
+  scoreTimeHorizonFit  Float    @default(0)
+  scoreMonitorability  Float    @default(0)
+  scoreRewardRisk      Float    @default(0)
+  scoreInvalidationClarity Float @default(0)
+  snapshotDate         DateTime @default(now())
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  scanRun  DailyScanRun @relation(fields: [scanRunId], references: [id], onDelete: Cascade)
+  symbol_  Symbol?      @relation("RankedOpportunitySnapshotSymbol", fields: [symbolId], references: [id], onDelete: SetNull)
+
+  @@index([scanRunId])
+  @@index([symbol, snapshotDate])
+  @@index([snapshotDate])
+  @@map("ranked_opportunity_snapshots")
+}
+
+model DailyMarketReport {
+  id                          String   @id @default(cuid())
+  scanRunId                   String   @unique
+  reportDate                  DateTime
+  marketRegimeSummary         String?
+  strongestSectorsJson        Json?
+  weakestSectorsJson          Json?
+  strongestMomentumJson       Json?
+  highestRiskNamesJson        Json?
+  topConservativeCandidatesJson Json?
+  topAggressiveCandidatesJson Json?
+  topCatalystsJson            Json?
+  topConvictionSetupsJson     Json?
+  topRiskRewardSetupsJson     Json?
+  reportSummary               String?
+  countsByAssetClass          Json?
+  countsByBias                Json?
+  countsByAction              Json?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  scanRun DailyScanRun @relation(fields: [scanRunId], references: [id], onDelete: Cascade)
+
+  @@index([reportDate])
+  @@map("daily_market_reports")
 }
 
 // ─── Enums ───────────────────────────────────────────────────────

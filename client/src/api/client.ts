@@ -162,4 +162,24 @@ export const api = {
     get: () => get('/settings'),
     update: (body: unknown) => put('/settings', body),
   },
+
+  scans: {
+    trigger: (body?: {
+      runType?: string;
+      marketSession?: string;
+      assetScope?: string;
+      riskMode?: string;
+      force?: boolean;
+    }) => post('/daily-scans/trigger', body),
+    latest: () => get('/daily-scans/latest'),
+    runs: (params?: Record<string, unknown>) => get('/daily-scans/runs', params),
+    run: (id: string) => get(`/daily-scans/runs/${id}`),
+    results: (id: string, params?: Record<string, unknown>) =>
+      get(`/daily-scans/runs/${id}/results`, params),
+    symbolHistory: (symbol: string, days?: number) =>
+      get(`/daily-scans/history/${symbol}`, days ? { days } : {}),
+    schedulerStatus: () => get('/daily-scans/scheduler/status'),
+    schedulerToggle: (enabled: boolean) =>
+      post('/daily-scans/scheduler/toggle', { enabled }),
+  },
 };

@@ -11,6 +11,9 @@ import CatalystIntelligence from './pages/CatalystIntelligence';
 import RiskConsole from './pages/RiskConsole';
 import PerformanceLab from './pages/PerformanceLab';
 import Settings from './pages/Settings';
+import DailyScan from './pages/DailyScan';
+import ScanReport from './pages/ScanReport';
+import ScanHistory from './pages/ScanHistory';
 import Login from './pages/Login';
 import Register from './pages/Register';
 
@@ -39,6 +42,9 @@ export default function App() {
           <Route path="risk" element={<RiskConsole />} />
           <Route path="performance" element={<PerformanceLab />} />
           <Route path="settings" element={<Settings />} />
+          <Route path="daily-scan" element={<DailyScan />} />
+          <Route path="scan-report/:id" element={<ScanReport />} />
+          <Route path="scan-history" element={<ScanHistory />} />
         </Route>
 
         <Route path="*" element={<Navigate to="/dashboard" replace />} />

@@ -12,8 +12,10 @@ import alertsRouter from './routes/alerts';
 import newsRouter from './routes/news';
 import performanceRouter from './routes/performance';
 import settingsRouter from './routes/settings';
+import dailyScansRouter from './routes/daily-scans';
 import { errorHandler, notFoundHandler } from './middleware/errorHandler';
 import { monitorAllOpenPositions } from './services/monitoring/PositionMonitor';
+import { startDailyScanScheduler } from './services/scans/dailyScanScheduler';
 
 const app = express();
 const PORT = process.env.PORT ?? 3001;
@@ -97,6 +99,7 @@ app.use('/api/alerts', alertsRouter);
 app.use('/api/news', newsRouter);
 app.use('/api/performance', performanceRouter);
 app.use('/api/settings', settingsRouter);
+app.use('/api/daily-scans', dailyScansRouter);
 
 app.use('/api/*', notFoundHandler);
 app.use(errorHandler);
@@ -115,6 +118,8 @@ app.listen(PORT, () => {
       console.warn('[Monitor] Initial cycle error:', err?.message);
     });
   }, 15_000);
+
+  startDailyScanScheduler();
 
   setInterval(() => {
     monitorAllOpenPositions().catch((err) => {

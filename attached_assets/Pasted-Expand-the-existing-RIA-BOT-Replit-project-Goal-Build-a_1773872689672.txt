@@ -1,0 +1,526 @@
+Expand the existing RIA BOT Replit project.
+
+Goal:
+Build a dedicated Daily Scan Engine that ranks and returns the 100 highest-conviction paper-trading opportunities for each session based on combined technical structure, catalyst strength, volatility suitability, and risk-adjusted thesis quality.
+
+This phase should include:
+- scheduler logic
+- scan orchestration
+- database models
+- backend APIs
+- admin/manual run controls
+- daily scan report UI
+- ranked top 100 market open dashboard
+
+Core daily scan requirement
+
+Every trading day, the system must generate a ranked list of the 100 highest-conviction paper-trading opportunities for that session using the existing Trade Thesis Engine.
+
+Ranking must be based on a weighted blend of:
+- technical structure quality
+- catalyst strength
+- sentiment direction
+- volatility suitability
+- liquidity quality
+- risk-adjusted thesis quality
+- time horizon alignment
+- monitoring quality
+- clarity of invalidation
+- reward-to-risk structure
+
+The system must support:
+- market open scan
+- optional premarket scan
+- manual scan on demand
+- historical comparison across daily scans
+
+Scheduler requirements
+
+Build a backend scheduler service for daily scans.
+
+Requirements:
+- run a scan every trading day at market open
+- support optional premarket scan 30 minutes before market open
+- skip weekends
+- support market holiday awareness via a pluggable trading-calendar abstraction
+- use timezone-aware scheduling
+- allow market timezone configuration
+- log every scan attempt
+- prevent duplicate runs for the same scheduled window
+- support retries for partial provider failures
+- support partial scan completion if some providers fail
+
+Implementation requirements:
+- create a dedicated scheduler service in /server/jobs
+- create a scan orchestrator service in /server/services/scans
+- isolate scan timing logic from ranking logic
+- make scheduling configurable via environment variables or settings table
+- support enabling or disabling scheduled scans
+- support manual "Run Scan Now" trigger from backend API and admin UI
+
+Suggested scheduler config:
+- ENABLE_DAILY_SCANS=true
+- MARKET_TIMEZONE=America/New_York
+- MARKET_OPEN_HOUR=9
+- MARKET_OPEN_MINUTE=30
+- PREMARKET_SCAN_ENABLED=true
+- PREMARKET_OFFSET_MINUTES=30
+
+Scan universe requirements
+
+Build a scan universe service that selects eligible assets for ranking.
+
+Support:
+- liquid stocks
+- major crypto assets
+- filtering by:
+  - stocks only
+  - crypto only
+  - conservative mode
+  - aggressive mode
+  - sector
+  - market cap bucket
+  - volatility range
+  - liquidity threshold
+
+The system should:
+- define a normalized candidate universe
+- fetch candidate symbols
+- enrich each symbol with market, technical, catalyst, and risk data
+- score all candidates
+- sort by highest conviction
+- return the top 100 results
+
+Allow the scan engine to run in these modes:
+- all assets
+- stocks only
+- crypto only
+- conservative only
+- aggressive only
+
+Ranking engine requirements
+
+Create a dedicated daily ranking service that uses the existing Trade Thesis Engine.
+
+For each candidate symbol:
+- fetch current quote and relevant historical data
+- compute technical analysis
+- compute patterns
+- gather latest catalyst and sentiment data
+- compute risk profile
+- generate thesis
+- assign ranking score
+- store a full ranked result snapshot
+
+Each ranked result must include:
+- symbol
+- asset class
+- rank
+- directional bias
+- conviction score
+- confidence score
+- technical score
+- catalyst score
+- risk score
+- volatility score
+- liquidity score
+- setup type
+- trend state
+- support zone
+- resistance zone
+- entry zone
+- invalidation zone
+- take profit zone 1
+- take profit zone 2
+- suggested hold window
+- thesis health score
+- monitoring frequency
+- top supporting reasons
+- main risk to thesis
+- catalyst summary
+- pattern summary
+- recommended action label
+
+Allowed recommended action labels:
+- high-priority watch
+- watch for confirmation
+- paper trade candidate
+- momentum candidate
+- mean reversion candidate
+- risk elevated
+- avoid for now
+
+Database requirements
+
+Add Prisma models for daily scan persistence.
+
+Create models for:
+1. DailyScanRun
+Fields:
+- id
+- runType
+- status
+- startedAt
+- completedAt
+- scheduledFor
+- marketSession
+- assetScope
+- riskMode
+- totalUniverseCount
+- totalRankedCount
+- topSymbol
+- summary
+- errorMessage
+- createdAt
+- updatedAt
+
+2. DailyScanResult
+Fields:
+- id
+- scanRunId
+- symbolId
+- symbol
+- assetClass
+- rank
+- bias
+- convictionScore
+- confidenceScore
+- technicalScore
+- catalystScore
+- riskScore
+- volatilityScore
+- liquidityScore
+- setupType
+- trendState
+- supportZoneJson
+- resistanceZoneJson
+- entryZoneJson
+- invalidationZoneJson
+- takeProfit1Json
+- takeProfit2Json
+- suggestedHoldWindow
+- thesisHealthScore
+- monitoringFrequency
+- supportingReasonsJson
+- mainRiskToThesis
+- catalystSummary
+- patternSummary
+- recommendedAction
+- thesisId
+- rawAgentOutputJson
+- createdAt
+- updatedAt
+
+3. RankedOpportunitySnapshot
+Fields:
+- id
+- symbolId
+- scanRunId
+- rank
+- scoreComposite
+- scoreTechnical
+- scoreCatalyst
+- scoreRiskAdjusted
+- scoreVolatilityFit
+- scoreLiquidity
+- scoreTimeHorizonFit
+- scoreMonitorability
+- scoreRewardRisk
+- scoreInvalidationClarity
+- snapshotDate
+- createdAt
+- updatedAt
+
+4. DailyMarketReport
+Fields:
+- id
+- scanRunId
+- reportDate
+- marketRegimeSummary
+- strongestSectorsJson
+- weakestSectorsJson
+- strongestMomentumJson
+- highestRiskNamesJson
+- topConservativeCandidatesJson
+- topAggressiveCandidatesJson
+- topCatalystsJson
+- topConvictionSetupsJson
+- topRiskRewardSetupsJson
+- reportSummary
+- createdAt
+- updatedAt
+
+Requirements:
+- define proper relations
+- add indexes on scanRunId, symbolId, reportDate, rank, status
+- ensure data is queryable by date and symbol
+- support future analytics against scan history
+
+Backend services
+
+Create:
+- /server/services/scans/dailyScanScheduler.ts
+- /server/services/scans/dailyScanOrchestrator.ts
+- /server/services/scans/dailyRankingService.ts
+- /server/services/scans/dailyMarketReportService.ts
+- /server/services/scans/scanUniverseService.ts
+- /server/services/scans/scanPersistenceService.ts
+
+Responsibilities:
+1. dailyScanScheduler
+- schedules runs
+- deduplicates runs
+- triggers orchestrator
+
+2. dailyScanOrchestrator
+- coordinates full scan execution
+- collects candidate universe
+- calls scoring pipeline
+- persists results
+- generates report
+- writes logs
+
+3. dailyRankingService
+- computes top 100 ranked opportunities
+- applies sorting and tie-breaking
+- attaches explainable fields
+
+4. dailyMarketReportService
+- generates daily summary report
+- identifies sector strength/weakness
+- identifies highest conviction and highest risk ideas
+- builds report payloads for UI
+
+5. scanUniverseService
+- fetches and filters candidate universe
+- handles stocks and crypto
+- supports risk mode filtering
+
+6. scanPersistenceService
+- stores runs, results, snapshots, and reports
+- supports retrieval by date and run id
+
+Backend API requirements
+
+Build REST endpoints:
+
+1. GET /api/daily-scans
+- list scan runs
+- filter by date, status, runType, marketSession
+
+2. POST /api/daily-scans/run
+- manually trigger a scan
+- accept optional body:
+  - assetScope
+  - riskMode
+  - runType
+  - marketSession
+
+3. GET /api/daily-scans/:id
+- get a single scan run with summary
+
+4. GET /api/daily-scans/:id/results
+- get ranked results
+- support pagination, sorting, filters
+
+5. GET /api/daily-scans/:id/report
+- get full daily market report
+
+6. GET /api/daily-scans/latest
+- get latest completed run
+
+7. GET /api/daily-scans/latest/top100
+- get latest top 100 ranked opportunities
+
+8. GET /api/daily-scans/compare
+- compare two scan dates or run ids
+
+9. GET /api/daily-scans/symbol/:symbol/history
+- retrieve historical ranking appearances for a symbol
+
+10. GET /api/daily-scans/settings
+- read scheduler settings
+
+11. PATCH /api/daily-scans/settings
+- update scheduler settings
+
+Frontend requirements
+
+Build a dedicated Daily Scan Report experience with premium dark terminal-style UI.
+
+Create the following pages and modules:
+
+1. Market Open Top 100 page
+Purpose:
+Show the latest top 100 ranked opportunities for the most recent scan.
+
+Features:
+- ranked table of 100 symbols
+- sortable columns:
+  - rank
+  - conviction
+  - confidence
+  - technical score
+  - catalyst score
+  - risk score
+  - volatility
+  - sector
+- filter bar for:
+  - stocks
+  - crypto
+  - conservative
+  - aggressive
+  - sector
+  - setup type
+  - action label
+- quick actions:
+  - save to watchlist
+  - open symbol page
+  - open paper trade modal
+- expandable row or detail drawer showing:
+  - thesis summary
+  - supporting reasons
+  - main risk
+  - catalyst summary
+  - pattern summary
+  - entry/invalidation/targets
+
+2. Daily Scan Report page
+Purpose:
+Show a report for one scan date.
+
+Include:
+- market regime summary
+- strongest sectors
+- weakest sectors
+- strongest momentum names
+- highest risk names
+- top conservative candidates
+- top aggressive candidates
+- most important catalysts of the session
+- top 10 highest-conviction setups
+- top 10 highest-risk/high-reward setups
+- full ranked top 100 list preview
+- scan metadata:
+  - start time
+  - completion time
+  - universe size
+  - total ranked count
+  - run status
+
+3. Scan History page
+Purpose:
+Browse previous runs.
+
+Include:
+- date list
+- status badges
+- run type
+- market session
+- universe count
+- top symbol
+- quick link to report
+- quick link to results
+- compare mode for 2 dates
+
+4. Admin / Control panel module
+Include:
+- Run Scan Now button
+- scheduler enabled toggle
+- premarket enabled toggle
+- market timezone
+- market open time
+- latest run status
+- latest error if any
+
+5. Symbol ranking history module
+On Symbol Intelligence page, add:
+- recent daily scan appearances
+- best rank in last 30 days
+- conviction trend
+- scan frequency
+- last action label
+
+UI/UX requirements
+
+The design should feel like a premium institutional scanner.
+
+Requirements:
+- dark mode first
+- strong typography
+- dense but readable data layout
+- sticky filters
+- sticky table headers
+- score badges
+- conviction heat indicators
+- hover detail cards
+- loading skeletons
+- robust empty states
+- graceful error states
+
+Use:
+- React Query for scan data
+- reusable table components
+- reusable filter bar
+- reusable score badge components
+- reusable thesis detail panel
+
+Daily market report generation requirements
+
+The DailyMarketReport service must generate:
+- market regime summary text
+- strongest sectors ranked list
+- weakest sectors ranked list
+- strongest momentum names
+- highest risk names
+- top conservative candidates
+- top aggressive candidates
+- top catalysts of the day
+- top 10 highest-conviction setups
+- top 10 highest-risk/high-reward setups
+- concise report summary paragraph
+
+Also include:
+- report generation timestamp
+- scan reference id
+- counts by asset class
+- counts by bias type
+- counts by action label
+
+Analytics requirements
+
+Track forward performance of each daily scan result for:
+- 1 day
+- 3 day
+- 1 week
+
+Store enough structure to evaluate:
+- how top-ranked ideas performed
+- whether conviction correlated with results
+- whether catalyst-heavy ideas outperformed technical-only ideas
+- action-label quality over time
+
+Implementation quality requirements
+
+- keep all scan services modular
+- separate scheduling from ranking logic
+- separate persistence from orchestration
+- use strong typing everywhere
+- validate all request payloads with Zod
+- protect manual scan endpoint behind auth/admin check
+- ensure scans can fail partially without corrupting existing data
+- add structured logs for scan lifecycle events
+- avoid duplicate scan inserts
+- keep UI responsive even with large result sets
+
+Deliverable
+
+A production-ready Phase 12 implementation for Replit that adds:
+- daily scheduled scan engine
+- top 100 ranking pipeline
+- persistent scan history
+- daily market report generation
+- manual scan controls
+- polished daily scan UI
+- historical comparison support
+- full integration with the existing thesis engine and paper trading workflow
