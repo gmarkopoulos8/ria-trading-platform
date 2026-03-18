@@ -79,6 +79,8 @@ export const api = {
       password: string;
       displayName: string;
     }) => post<AuthResponse>('/auth/register', body),
+    updateProfile: (body: unknown) => put('/auth/profile', body),
+    changePassword: (body: unknown) => put('/auth/password', body),
   },
 
   market: {

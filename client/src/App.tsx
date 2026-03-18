@@ -10,6 +10,7 @@ import AlertCenter from './pages/AlertCenter';
 import CatalystIntelligence from './pages/CatalystIntelligence';
 import RiskConsole from './pages/RiskConsole';
 import PerformanceLab from './pages/PerformanceLab';
+import Settings from './pages/Settings';
 import Login from './pages/Login';
 import Register from './pages/Register';
 
@@ -37,6 +38,7 @@ export default function App() {
           <Route path="catalysts" element={<CatalystIntelligence />} />
           <Route path="risk" element={<RiskConsole />} />
           <Route path="performance" element={<PerformanceLab />} />
+          <Route path="settings" element={<Settings />} />
         </Route>
 
         <Route path="*" element={<Navigate to="/dashboard" replace />} />

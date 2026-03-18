@@ -139,7 +139,7 @@ router.post('/logout', requireAuth, (req: Request, res: Response) => {
     if (err) {
       return res.status(500).json({ success: false, error: 'Logout failed' });
     }
-    res.clearCookie('connect.sid');
+    res.clearCookie('ria.sid');
     return res.json({ success: true, message: 'Logged out successfully' });
   });
 });
@@ -149,6 +149,45 @@ router.get('/me', requireAuth, (req: Request, res: Response) => {
     success: true,
     data: { user: req.currentUser },
   });
+});
+
+router.put('/profile', requireAuth, async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const { displayName } = req.body;
+    if (displayName !== undefined && (typeof displayName !== 'string' || displayName.trim().length < 1)) {
+      return res.status(400).json({ success: false, error: 'Invalid display name' });
+    }
+    const userId = req.session.userId!;
+    const updated = await prisma.user.update({
+      where: { id: userId },
+      data: { ...(displayName !== undefined && { displayName: displayName.trim() }) },
+    });
+    return res.json({ success: true, data: { user: sanitizeUser(updated) } });
+  } catch (err) {
+    next(err);
+  }
+});
+
+router.put('/password', requireAuth, async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const { currentPassword, newPassword } = req.body;
+    if (!currentPassword || !newPassword) {
+      return res.status(400).json({ success: false, error: 'Current and new password required' });
+    }
+    if (newPassword.length < 8) {
+      return res.status(400).json({ success: false, error: 'New password must be at least 8 characters' });
+    }
+    const userId = req.session.userId!;
+    const user = await prisma.user.findUnique({ where: { id: userId } });
+    if (!user) return res.status(404).json({ success: false, error: 'User not found' });
+    const valid = await verifyPassword(currentPassword, user.passwordHash);
+    if (!valid) return res.status(401).json({ success: false, error: 'Current password is incorrect' });
+    const newHash = await hashPassword(newPassword);
+    await prisma.user.update({ where: { id: userId }, data: { passwordHash: newHash } });
+    return res.json({ success: true, message: 'Password updated successfully' });
+  } catch (err) {
+    next(err);
+  }
 });
 
 export default router;

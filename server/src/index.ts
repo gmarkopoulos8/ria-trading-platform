@@ -17,16 +17,45 @@ import { monitorAllOpenPositions } from './services/monitoring/PositionMonitor';
 
 const app = express();
 const PORT = process.env.PORT ?? 3001;
+const isProd = process.env.NODE_ENV === 'production';
+
+const SESSION_SECRET = process.env.SESSION_SECRET ?? '';
+if (!SESSION_SECRET || SESSION_SECRET === 'ria-bot-dev-secret-change-in-production') {
+  if (isProd) {
+    console.error('❌ FATAL: SESSION_SECRET env var is not set or is using the default value. Set a strong secret before deploying.');
+    process.exit(1);
+  } else {
+    console.warn('⚠️  SESSION_SECRET not set — using insecure default. Set SESSION_SECRET before deploying.');
+  }
+}
 
 app.set('trust proxy', 1);
 
 app.use(helmet({ contentSecurityPolicy: false }));
+
+const allowedOrigins: (string | RegExp)[] = [
+  'http://localhost:5000',
+  'http://localhost:3000',
+  /\.replit\.dev$/,
+  /\.replit\.app$/,
+  /\.repl\.co$/,
+  /\.kirk\.replit\.dev$/,
+];
+if (process.env.CLIENT_URL) allowedOrigins.push(process.env.CLIENT_URL);
+
 app.use(cors({
-  origin: process.env.CLIENT_URL ?? 'http://localhost:5000',
+  origin: (origin, callback) => {
+    if (!origin) return callback(null, true);
+    const allowed = allowedOrigins.some((o) =>
+      typeof o === 'string' ? o === origin : o.test(origin),
+    );
+    callback(allowed ? null : new Error(`CORS: origin ${origin} not allowed`), allowed);
+  },
   credentials: true,
 }));
-app.use(express.json());
-app.use(express.urlencoded({ extended: true }));
+
+app.use(express.json({ limit: '1mb' }));
+app.use(express.urlencoded({ extended: true, limit: '1mb' }));
 
 const PgSession = connectPgSimple(session);
 
@@ -37,15 +66,15 @@ app.use(session({
     createTableIfMissing: true,
     ttl: 24 * 60 * 60,
   }),
-  secret: process.env.SESSION_SECRET ?? 'ria-bot-dev-secret-change-in-production',
+  secret: SESSION_SECRET || 'ria-bot-dev-secret-change-in-production',
   resave: false,
   saveUninitialized: false,
   name: 'ria.sid',
   cookie: {
-    secure: process.env.NODE_ENV === 'production',
+    secure: isProd,
     httpOnly: true,
     maxAge: 24 * 60 * 60 * 1000,
-    sameSite: 'lax',
+    sameSite: isProd ? 'none' : 'lax',
   },
 }));
 
@@ -78,7 +107,8 @@ app.listen(PORT, () => {
   console.log(`✅ RIA BOT API running on port ${PORT}`);
   console.log(`   Environment : ${process.env.NODE_ENV ?? 'development'}`);
   console.log(`   Database    : ${process.env.DATABASE_URL ? 'connected' : 'not configured'}`);
-  console.log(`   Sessions    : PostgreSQL`);
+  console.log(`   Sessions    : PostgreSQL (ria.sid)`);
+  console.log(`   Monitor     : ${MONITOR_INTERVAL_MS / 1000}s interval (first run in 15s)`);
 
   setTimeout(() => {
     monitorAllOpenPositions().catch((err) => {
@@ -91,8 +121,6 @@ app.listen(PORT, () => {
       console.warn('[Monitor] Cycle error:', err?.message);
     });
   }, MONITOR_INTERVAL_MS);
-
-  console.log(`   Monitor     : ${MONITOR_INTERVAL_MS / 1000}s interval (first run in 15s)`);
 });
 
 export default app;

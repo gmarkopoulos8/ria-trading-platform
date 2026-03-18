@@ -1,6 +1,7 @@
 import { useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
+import { toast } from 'sonner';
 import {
   Briefcase, Plus, TrendingUp, TrendingDown, DollarSign, Target,
   X, RefreshCw, ChevronUp, ChevronDown, Activity, Shield, Brain,
@@ -201,13 +202,17 @@ function OpenPositionModal({
 
   const mutation = useMutation({
     mutationFn: (body: unknown) => api.positions.open(body),
-    onSuccess: () => {
+    onSuccess: (data: any) => {
       qc.invalidateQueries({ queryKey: ['portfolio'] });
+      qc.invalidateQueries({ queryKey: ['perf-overview-full'] });
+      toast.success(data?.message ?? `Position opened: ${symbol.toUpperCase()}`);
       onSuccess();
       onClose();
     },
     onError: (err: any) => {
-      setError(err?.response?.data?.error ?? 'Failed to open position');
+      const msg = err?.response?.data?.error ?? 'Failed to open position';
+      setError(msg);
+      toast.error(msg);
     },
   });
 
@@ -410,13 +415,25 @@ function ClosePositionModal({
 
   const mutation = useMutation({
     mutationFn: (body: unknown) => api.positions.close(body),
-    onSuccess: () => {
+    onSuccess: (data: any) => {
       qc.invalidateQueries({ queryKey: ['portfolio'] });
+      qc.invalidateQueries({ queryKey: ['perf-overview-full'] });
+      qc.invalidateQueries({ queryKey: ['perf-patterns'] });
+      qc.invalidateQueries({ queryKey: ['perf-sectors'] });
+      qc.invalidateQueries({ queryKey: ['perf-catalysts'] });
+      qc.invalidateQueries({ queryKey: ['perf-thesis'] });
+      qc.invalidateQueries({ queryKey: ['perf-tradelog'] });
+      const msg = data?.message ?? 'Position closed';
+      const isWin = msg.includes('WIN');
+      if (isWin) toast.success(msg);
+      else toast.error(msg);
       onSuccess();
       onClose();
     },
     onError: (err: any) => {
-      setError(err?.response?.data?.error ?? 'Failed to close position');
+      const msg = err?.response?.data?.error ?? 'Failed to close position';
+      setError(msg);
+      toast.error(msg);
     },
   });
 
@@ -747,7 +764,7 @@ export default function PaperPortfolio() {
   const navigate = useNavigate();
   const [showOpenModal, setShowOpenModal] = useState(false);
   const [closingPosition, setClosingPosition] = useState<OpenPosition | null>(null);
-  const [successMsg, setSuccessMsg] = useState<string | null>(null);
+
 
   const { data, isLoading, isError, refetch, isFetching } = useQuery({
     queryKey: ['portfolio'],
@@ -769,32 +786,20 @@ export default function PaperPortfolio() {
   const longPositions = positions.filter((p) => p.side === 'LONG');
   const shortPositions = positions.filter((p) => p.side === 'SHORT');
 
-  const showSuccess = (msg: string) => {
-    setSuccessMsg(msg);
-    setTimeout(() => setSuccessMsg(null), 3000);
-  };
-
   return (
     <div className="space-y-6">
       {showOpenModal && (
         <OpenPositionModal
           onClose={() => setShowOpenModal(false)}
-          onSuccess={() => showSuccess('Position opened successfully')}
+          onSuccess={() => {}}
         />
       )}
       {closingPosition && (
         <ClosePositionModal
           position={closingPosition}
           onClose={() => setClosingPosition(null)}
-          onSuccess={() => showSuccess('Position closed')}
+          onSuccess={() => {}}
         />
-      )}
-
-      {successMsg && (
-        <div className="fixed top-4 right-4 z-40 flex items-center gap-2 px-4 py-2.5 bg-emerald-500/20 border border-emerald-500/30 rounded-lg backdrop-blur-sm">
-          <CheckCircle className="h-4 w-4 text-emerald-400" />
-          <span className="text-sm text-emerald-400 font-medium">{successMsg}</span>
-        </div>
       )}
 
       <div className="flex items-start justify-between">

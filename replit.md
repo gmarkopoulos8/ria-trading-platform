@@ -44,6 +44,12 @@ Full-stack AI paper trading research simulator. Premium dark-mode terminal UI fo
 7. **Paper Trading System** — Full portfolio management: open/close positions, P&L computation (realized + unrealized), cash balance tracking, win rate, profit factor, audit logs, thesis-linked trades, "Paper Trade" button from ThesisPanel
 8. **Monitoring Engine** — Continuous position monitoring job (5-min intervals): re-runs full thesis analysis per position, evaluates 13 alert conditions, deduplicates within 30min windows, stores PositionSnapshot history, updates thesisHealth + recommendedAction on position; Alert Center page with severity feed, symbol/type/unread filters, mark-read, position monitor cards with health sparklines
 9. **Performance Analytics Layer** — 5 API endpoints (`/api/performance/overview`, `/patterns`, `/sectors`, `/catalysts`, `/thesis-quality`) backed by `PerformanceService.ts`; `PerformanceLab.tsx` fully rebuilt with 6 tabs (Overview, Patterns, Sectors, Catalysts, Thesis Quality, Trade Log), recharts equity curve / monthly P&L / outcome pie / hold-duration bar / asset-class bar charts, KPI stat cards, win-rate gauge, filter bar (date range / asset class / side / outcome), paginated trade log with full details
+10. **Deployment Hardening** — Fixed `ria.sid` cookie logout, SESSION_SECRET production kill-switch, CORS regex for all Replit domains, 1mb body limit, sameSite `none`+secure in prod, sonner Toaster in main.tsx
+11. **Live Dashboard** — All portfolio KPIs from API (value, P&L, positions, win rate, alerts, opportunities), live movers, open positions list, recent closed trades
+12. **Settings Page** — Profile update, password change, notification preferences, appearance, about; backed by `PUT /api/auth/profile` and `PUT /api/auth/password` endpoints
+13. **Mobile Sidebar Drawer** — AppShell handles mobile (hamburger → drawer + overlay) and desktop (collapse toggle) sidebar states
+14. **Toast Notifications** — All PaperPortfolio mutations (open/close) use sonner toasts with WIN/LOSS coloring; performance queries invalidated on position close
+15. **Seed Enhancement** — Seed script generates 15 demo closed trades with realistic P&L, thesis text, tags, hold periods, outcomes for Performance Lab showcase
 
 ### API Endpoints
 - `GET /api/news` — Market news feed or symbol-filtered feed
@@ -85,14 +91,14 @@ Full-stack AI paper trading research simulator. Premium dark-mode terminal UI fo
 
 ## API Routes
 - `/api/health` — Health check
-- `/api/auth/*` — Authentication (login, register, logout, me)
+- `/api/auth/*` — Authentication (login, register, logout, me, profile update, password change)
 - `/api/symbols/*` — Symbol search and intelligence
 - `/api/market/*` — Market overview, opportunities, movers
 - `/api/paper-positions/*` — Paper portfolio CRUD
 - `/api/alerts/*` — Alert management
 - `/api/news/*` — News feed and catalyst analysis
 - `/api/performance/*` — Analytics and reporting
-- `/api/settings/*` — User settings
+- `/api/settings/*` — User settings (stub)
 
 ## Auth System
 - **Backend**: bcryptjs (12 rounds), connect-pg-simple PostgreSQL session store, requireAuth middleware
@@ -103,8 +109,10 @@ Full-stack AI paper trading research simulator. Premium dark-mode terminal UI fo
 
 ## Pages
 - Dashboard, OpportunityScanner, SymbolIntelligence, PaperPortfolio
-- CatalystIntelligence, RiskConsole, PerformanceLab, Login, Register
+- CatalystIntelligence, RiskConsole, PerformanceLab, Settings, Login, Register
 - TopNav includes: live/offline status, PAPER badge, notifications, UserMenu (logout/settings/profile)
+- Sidebar: real user info from AuthContext, animated unread alert badge, collapsible on desktop, drawer on mobile
+- AppShell: desktop collapse toggle + mobile hamburger → drawer with overlay
 
 ## Market Data Layer
 Service layer at `server/src/services/market/`:
