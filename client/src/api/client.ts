@@ -169,6 +169,23 @@ export const api = {
     clearHistory: () => del('/stocks/search/history'),
   },
 
+  polymarket: {
+    markets: (params?: Record<string, unknown>) => get('/polymarket/markets', params),
+    market:  (id: string) => get(`/polymarket/markets/${id}`),
+    event:   (id: string) => get(`/polymarket/events/${id}`),
+    thesis:  (id: string) => get(`/polymarket/markets/${id}/thesis`),
+    history: (id: string, interval = '7d') => get(`/polymarket/markets/${id}/history`, { interval }),
+    orderbook: (id: string) => get(`/polymarket/markets/${id}/orderbook`),
+    openPosition:  (body: unknown) => post('/polymarket/paper-positions', body),
+    positions:     () => get('/polymarket/paper-positions'),
+    position:      (id: string) => get(`/polymarket/paper-positions/${id}`),
+    closePosition: (id: string, body: unknown) => post(`/polymarket/paper-positions/${id}/close`, body),
+    alerts:        (params?: Record<string, unknown>) => get('/polymarket/alerts', params),
+    readAlert:     (id: string) => post(`/polymarket/alerts/${id}/read`),
+    dismissAlert:  (id: string) => post(`/polymarket/alerts/${id}/dismiss`),
+    searchHistory: () => get('/polymarket/search-history'),
+  },
+
   scans: {
     trigger: (body?: {
       runType?: string;

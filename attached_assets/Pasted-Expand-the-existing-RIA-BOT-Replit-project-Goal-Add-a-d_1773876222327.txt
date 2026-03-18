@@ -1,0 +1,223 @@
+Expand the existing RIA BOT Replit project.
+
+Goal:
+Add a dedicated Polymarket module that lets users browse Polymarket markets, analyze probabilities and event momentum, track positions in a paper portfolio, and simulate trades using paper money only.
+
+Important implementation rules:
+- Do not place live trades
+- Do not submit authenticated CLOB orders
+- Do not require a private key for the paper-trading workflow
+- Use Polymarket public APIs for market discovery and analytics
+- Build all buy/sell actions as simulated paper trades stored in the app database
+
+Polymarket integration overview:
+Use the official Polymarket public APIs for read-only data:
+- Gamma API for market and event metadata
+- Data API for positions, analytics, and trade-related public data where applicable
+- Optional CLOB public read endpoints for prices, order books, midpoint, spread, and price history
+
+Architecture requirements:
+Create a dedicated Polymarket module with:
+- /server/services/polymarket/
+- /server/routes/polymarket.ts
+- /client/src/pages/polymarket/
+- /client/src/components/polymarket/
+
+Environment variables:
+- POLY_GAMMA_BASE_URL=https://gamma-api.polymarket.com
+- POLY_DATA_BASE_URL=https://data-api.polymarket.com
+- POLY_CLOB_BASE_URL=https://clob.polymarket.com
+
+Do not require authenticated trading credentials for this phase.
+
+Core features:
+
+1. Polymarket Market Explorer
+Build a page where users can:
+- browse active markets
+- search by keyword
+- filter by category, status, event, liquidity, volume, and end date
+- view market question, outcomes, implied probabilities, volume, liquidity, end time, and event metadata
+- open a detailed market page
+
+2. Market Detail Page
+For any selected market, display:
+- market question
+- event title
+- category
+- active / closed state
+- outcome tokens
+- current yes/no prices or midpoint
+- spread
+- order book snapshot if available
+- recent price history
+- volume and liquidity stats
+- event end date
+- market description
+- related markets in the same event
+- recent momentum summary
+- volatility summary
+- AI research summary
+
+3. AI Market Thesis for Polymarket
+Create a Polymarket Thesis Engine that evaluates each market using:
+- recent price movement
+- momentum in implied probability
+- spread / liquidity quality
+- volume trend
+- event recency
+- market activity
+- related-news catalyst analysis
+- confidence of current consensus
+- reversal risk
+- binary event uncertainty
+
+For each market, output:
+- Market Health Score from 0 to 100
+- Bias: yes, no, or neutral
+- Confidence Score
+- Liquidity Score
+- Risk Score
+- Momentum Score
+- Thesis Summary
+- Supporting Reasons
+- Main Risk to Thesis
+- Suggested Hold Window
+- Action Label:
+  - high conviction
+  - tradable
+  - developing
+  - weak
+  - avoid
+
+4. Polymarket Paper Trading
+Allow the user to simulate opening a paper position on a Polymarket market outcome.
+
+Paper position fields:
+- market id
+- event id
+- question
+- selected side: yes or no
+- entry probability / price
+- quantity
+- paper capital allocated
+- current mark
+- unrealized P&L
+- realized P&L
+- status
+- entry time
+- close time
+- thesis id
+- thesis health
+- notes
+
+Users should be able to:
+- open simulated yes/no positions
+- close simulated positions
+- view open paper positions
+- view closed paper positions
+- compare thesis vs outcome
+
+5. Polymarket Dashboard
+Create a dedicated dashboard showing:
+- top active markets
+- highest-volume markets
+- highest-liquidity markets
+- strongest momentum markets
+- strongest reversal-risk markets
+- user’s open paper positions
+- recently closed paper positions
+- AI-ranked opportunities
+- alerts for markets nearing key thresholds
+
+6. Alerts & Monitoring
+For open simulated positions, monitor:
+- major move in yes/no probability
+- spread widening
+- liquidity drop
+- momentum acceleration
+- momentum reversal
+- market nearing resolution
+- related news catalyst change
+- thesis weakening
+- thesis strengthening
+
+Create alerts with labels:
+- thesis strengthening
+- thesis weakening
+- momentum accelerating
+- momentum fading
+- liquidity risk elevated
+- event approaching
+- review position
+- simulated exit condition hit
+
+Backend services:
+Create:
+- polymarketMarketService
+- polymarketClobReadService
+- polymarketThesisService
+- polymarketPaperTradeService
+- polymarketAlertService
+
+Backend endpoints:
+- GET /api/polymarket/markets
+- GET /api/polymarket/markets/:id
+- GET /api/polymarket/events/:id
+- GET /api/polymarket/markets/:id/thesis
+- GET /api/polymarket/markets/:id/history
+- GET /api/polymarket/markets/:id/orderbook
+- POST /api/polymarket/paper-positions
+- GET /api/polymarket/paper-positions
+- GET /api/polymarket/paper-positions/:id
+- POST /api/polymarket/paper-positions/:id/close
+- GET /api/polymarket/alerts
+
+Database models:
+Create Prisma models for:
+- PolymarketEvent
+- PolymarketMarket
+- PolymarketMarketSnapshot
+- PolymarketThesis
+- PolymarketPaperPosition
+- PolymarketClosedPosition
+- PolymarketAlert
+- PolymarketSearchHistory
+
+UI requirements:
+Use a premium dark-mode institutional interface.
+Build:
+- Polymarket dashboard
+- market explorer table
+- market detail page
+- thesis verdict card
+- paper position table
+- alert center
+- recent search module
+
+Each thesis card must display:
+- market question
+- yes/no pricing
+- Market Health Score
+- bias
+- confidence
+- liquidity score
+- momentum score
+- risk score
+- action label
+- thesis summary
+- supporting reasons
+- key risk
+- suggested hold window
+
+Implementation notes:
+- Use public Polymarket APIs for data retrieval
+- Normalize all API responses into internal typed models
+- Use React Query for client data fetching
+- Use Zod for validation
+- Cache recent market fetches
+- Persist user paper positions in PostgreSQL
+- Keep the module modular and isolated from stock/crypto services
+
+Deliverable:
+A production-ready Polymarket market intelligence and paper-trading module inside RIA BOT with market browsing, AI thesis scoring, simulated positions, alerts, and a polished dark UI.

@@ -48,6 +48,9 @@ Full-stack AI paper trading research simulator. Premium dark-mode terminal UI fo
 11. **Live Dashboard** — All portfolio KPIs from API (value, P&L, positions, win rate, alerts, opportunities), live movers, open positions list, recent closed trades
 12. **Settings Page** — Profile update, password change, notification preferences, appearance, about; backed by `PUT /api/auth/profile` and `PUT /api/auth/password` endpoints
 13. **Mobile Sidebar Drawer** — AppShell handles mobile (hamburger → drawer + overlay) and desktop (collapse toggle) sidebar states
+14. **Daily Scan Engine** — 4 Prisma models (DailyScanRun, DailyScanResult, RankedOpportunitySnapshot, DailyMarketReport); 6 backend services; 8 API endpoints at `/api/daily-scans`; scheduler at 9:30 ET weekdays; 3 frontend pages (DailyScan, ScanReport, ScanHistory)
+15. **Stock Health Analyzer** — StockSearchHistory model; StockHealthService (6-factor weighted score: technical 30%, catalyst 20%, momentum 15%, risk 15%, volatility 10%, liquidity 10%); TradingView chart widget integration; search history panel
+16. **Polymarket Module** — 8 Prisma models (PolymarketEvent, PolymarketMarket, PolymarketMarketSnapshot, PolymarketThesis, PolymarketPaperPosition, PolymarketClosedPosition, PolymarketAlert, PolymarketSearchHistory); 5 backend services (market, CLOB read, thesis, paper trade, alerts); 13 API endpoints at `/api/polymarket`; 3 frontend pages (Dashboard, Explorer, MarketDetail) + ThesisCard component; paper position open/close with P&L; AI thesis scoring with 5 signals; alert monitoring for open positions
 14. **Toast Notifications** — All PaperPortfolio mutations (open/close) use sonner toasts with WIN/LOSS coloring; performance queries invalidated on position close
 15. **Seed Enhancement** — Seed script generates 15 demo closed trades with realistic P&L, thesis text, tags, hold periods, outcomes for Performance Lab showcase
 

@@ -12,6 +12,9 @@ import RiskConsole from './pages/RiskConsole';
 import PerformanceLab from './pages/PerformanceLab';
 import Settings from './pages/Settings';
 import DailyScan from './pages/DailyScan';
+import PolymarketDashboard from './pages/polymarket/PolymarketDashboard';
+import PolymarketExplorer from './pages/polymarket/PolymarketExplorer';
+import PolymarketMarketDetail from './pages/polymarket/PolymarketMarketDetail';
 import StockHealthAnalyzer from './pages/StockHealthAnalyzer';
 import ScanReport from './pages/ScanReport';
 import ScanHistory from './pages/ScanHistory';
@@ -48,6 +51,9 @@ export default function App() {
           <Route path="stock-health/:ticker" element={<StockHealthAnalyzer />} />
           <Route path="scan-report/:id" element={<ScanReport />} />
           <Route path="scan-history" element={<ScanHistory />} />
+          <Route path="polymarket" element={<PolymarketDashboard />} />
+          <Route path="polymarket/explorer" element={<PolymarketExplorer />} />
+          <Route path="polymarket/market/:id" element={<PolymarketMarketDetail />} />
         </Route>
 
         <Route path="*" element={<Navigate to="/dashboard" replace />} />

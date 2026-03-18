@@ -14,6 +14,7 @@ import performanceRouter from './routes/performance';
 import settingsRouter from './routes/settings';
 import dailyScansRouter from './routes/daily-scans';
 import stocksRouter from './routes/stocks';
+import polymarketRouter from './routes/polymarket';
 import { errorHandler, notFoundHandler } from './middleware/errorHandler';
 import { monitorAllOpenPositions } from './services/monitoring/PositionMonitor';
 import { startDailyScanScheduler } from './services/scans/dailyScanScheduler';
@@ -102,6 +103,7 @@ app.use('/api/performance', performanceRouter);
 app.use('/api/settings', settingsRouter);
 app.use('/api/daily-scans', dailyScansRouter);
 app.use('/api/stocks', stocksRouter);
+app.use('/api/polymarket', polymarketRouter);
 
 app.use('/api/*', notFoundHandler);
 app.use(errorHandler);

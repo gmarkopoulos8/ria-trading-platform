@@ -761,3 +761,200 @@ enum MonitorAlertType {
   THESIS_HEALTH_IMPROVED
   THESIS_HEALTH_DETERIORATED
 }
+
+// ─── Polymarket ───────────────────────────────────────────────────
+
+model PolymarketEvent {
+  id           String   @id
+  slug         String?
+  title        String
+  description  String?
+  category     String?
+  startDate    DateTime?
+  endDate      DateTime?
+  closed       Boolean  @default(false)
+  imageUrl     String?
+  rawPayload   Json?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  markets PolymarketMarket[]
+
+  @@map("polymarket_events")
+}
+
+model PolymarketMarket {
+  id               String   @id
+  eventId          String?
+  slug             String?
+  question         String
+  description      String?
+  category         String?
+  conditionId      String?
+  outcomes         Json
+  outcomePrices    Json
+  volume           Float    @default(0)
+  liquidity        Float    @default(0)
+  active           Boolean  @default(true)
+  closed           Boolean  @default(false)
+  archived         Boolean  @default(false)
+  endDate          DateTime?
+  imageUrl         String?
+  rawPayload       Json?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  event     PolymarketEvent?    @relation(fields: [eventId], references: [id])
+  snapshots PolymarketMarketSnapshot[]
+  theses    PolymarketThesis[]
+  positions PolymarketPaperPosition[]
+
+  @@index([eventId])
+  @@index([active, closed])
+  @@map("polymarket_markets")
+}
+
+model PolymarketMarketSnapshot {
+  id           String   @id @default(cuid())
+  marketId     String
+  yesPrice     Float?
+  noPrice      Float?
+  midpoint     Float?
+  spread       Float?
+  volume24h    Float?
+  liquidity    Float?
+  momentum     Float?
+  rawOrderbook Json?
+
+  snapshotAt DateTime @default(now())
+
+  market PolymarketMarket @relation(fields: [marketId], references: [id], onDelete: Cascade)
+
+  @@index([marketId, snapshotAt])
+  @@map("polymarket_market_snapshots")
+}
+
+model PolymarketThesis {
+  id                String   @id @default(cuid())
+  marketId          String
+  userId            String?
+  healthScore       Float
+  bias              String
+  confidenceScore   Float
+  liquidityScore    Float
+  momentumScore     Float
+  riskScore         Float
+  actionLabel       String
+  thesisSummary     String
+  supportingReasons Json
+  mainRisk          String
+  suggestedHold     String
+  priceSnapshot     Json?
+  analyzedAt        DateTime @default(now())
+
+  market PolymarketMarket @relation(fields: [marketId], references: [id], onDelete: Cascade)
+
+  @@index([marketId])
+  @@index([userId])
+  @@map("polymarket_theses")
+}
+
+model PolymarketPaperPosition {
+  id               String    @id @default(cuid())
+  userId           String
+  marketId         String
+  eventId          String?
+  question         String
+  selectedSide     String
+  entryProbability Float
+  quantity         Float
+  capitalAllocated Float
+  currentMark      Float?
+  unrealizedPnl    Float?
+  thesisId         String?
+  thesisHealth     Float?
+  notes            String?
+  status           String    @default("open")
+
+  openedAt  DateTime  @default(now())
+  closedAt  DateTime?
+  updatedAt DateTime  @updatedAt
+
+  market    PolymarketMarket @relation(fields: [marketId], references: [id])
+  closed    PolymarketClosedPosition?
+  alerts    PolymarketAlert[]
+
+  @@index([userId, status])
+  @@map("polymarket_paper_positions")
+}
+
+model PolymarketClosedPosition {
+  id               String   @id @default(cuid())
+  positionId       String   @unique
+  userId           String
+  marketId         String
+  question         String
+  selectedSide     String
+  entryProbability Float
+  exitProbability  Float
+  quantity         Float
+  capitalAllocated Float
+  realizedPnl      Float
+  pnlPercent       Float
+  resolution       String?
+  thesisId         String?
+  notes            String?
+
+  openedAt  DateTime
+  closedAt  DateTime @default(now())
+
+  position PolymarketPaperPosition @relation(fields: [positionId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([marketId])
+  @@map("polymarket_closed_positions")
+}
+
+model PolymarketAlert {
+  id           String   @id @default(cuid())
+  userId       String
+  positionId   String?
+  marketId     String
+  alertType    String
+  severity     String   @default("info")
+  title        String
+  message      String
+  isRead       Boolean  @default(false)
+  isDismissed  Boolean  @default(false)
+  metadata     Json?
+
+  createdAt DateTime @default(now())
+
+  position PolymarketPaperPosition? @relation(fields: [positionId], references: [id], onDelete: SetNull)
+
+  @@index([userId, isRead])
+  @@index([marketId])
+  @@map("polymarket_alerts")
+}
+
+model PolymarketSearchHistory {
+  id              String   @id @default(cuid())
+  userId          String
+  marketId        String
+  question        String
+  lastHealthScore Float?
+  lastActionLabel String?
+  searchCount     Int      @default(1)
+  lastSearchedAt  DateTime @default(now())
+
+  @@unique([userId, marketId])
+  @@index([userId])
+  @@map("polymarket_search_history")
+}
+
+enum PolymarketSide {
+  YES
+  NO
+}
