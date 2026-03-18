@@ -104,17 +104,19 @@ export class CoinGeckoProvider implements ICryptoProvider {
   async history(symbol: string, timeframe: Timeframe): Promise<OHLCVBar[]> {
     const id = this.coinIdForSymbol(symbol);
     const days = TIMEFRAME_DAYS[timeframe];
+    const normalizedDays = days <= 1 ? 1 : days <= 7 ? 7 : days <= 14 ? 14 : days <= 30 ? 30 : days <= 90 ? 90 : days <= 180 ? 180 : 365;
 
-    const { data } = await axios.get<{ ohlc: [number, number, number, number, number][] }>(
+    const { data } = await axios.get<[number, number, number, number, number][]>(
       `${BASE}/coins/${id}/ohlc`,
       {
-        params: { vs_currency: 'usd', days: days <= 1 ? 1 : days <= 7 ? 7 : days <= 14 ? 14 : days <= 30 ? 30 : days <= 90 ? 90 : days <= 180 ? 180 : 365 },
+        params: { vs_currency: 'usd', days: normalizedDays },
         headers: this.headers,
         timeout: 10000,
       }
     );
 
-    return (data.ohlc ?? []).map(([ts, o, h, l, c]) => ({
+    const raw = Array.isArray(data) ? data : [];
+    return raw.map(([ts, o, h, l, c]) => ({
       timestamp: new Date(ts),
       open: o,
       high: h,

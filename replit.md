@@ -86,9 +86,55 @@ Service layer at `server/src/services/market/`:
 - `GET /api/market/movers?direction=up|down` — Top gainers/losers
 
 ### Frontend Data Integration
-- **SymbolIntelligence**: Real search + live dropdown, quote display, recharts AreaChart with 7 timeframes
+- **SymbolIntelligence**: Real search + live dropdown, quote display, recharts AreaChart with 7 timeframes, full technical analysis panel
 - **OpportunityScanner**: Live from `/api/market/opportunities`, filtering + sorting, refresh button
 - **TopNav CommandBar**: Smart search with real-time suggestions → navigates to `/symbol/:symbol`
+
+## Technical Analysis Engine
+Service layer at `server/src/services/technical/`:
+
+### Indicators (`indicators/`)
+- **sma.ts** — SMA20/50/200, MA alignment detection
+- **ema.ts** — EMA9/21/50, golden/death cross detection
+- **rsi.ts** — RSI-14 with overbought/oversold zones
+- **macd.ts** — MACD line, signal line, histogram (12/26/9)
+- **atr.ts** — ATR-14, volatility classification (HIGH/MEDIUM/LOW)
+- **volume.ts** — Volume ratio vs 20-bar avg, spike detection
+- **levels.ts** — Pivot-based support/resistance with clustering
+- **trend.ts** — Slope angle, MA-based directional bias
+- **relativeStrength.ts** — Win-rate-based RS percentile
+
+### Patterns (`patterns/detector.ts`) — 15 patterns
+- Ascending/Descending/Symmetrical Triangle, Bull Flag, Bear Flag
+- Cup and Handle, Double Top, Double Bottom
+- Head and Shoulders, Inverse Head and Shoulders
+- Range Breakout, Momentum Continuation, Mean Reversion
+- Failed Breakout, Failed Breakdown
+- Each: confidence score, price target, stop loss, plain-language explanation
+
+### TechnicalService.ts
+- Orchestrates all indicators → composite `technicalScore` (0-100)
+- 10-minute TTL in-memory cache
+- DB persistence to `TechnicalSignal` and `Pattern` tables
+- Returns `TechnicalAnalysisResult` and `PatternAnalysisResult` typed contracts
+
+### Wired Endpoints
+- `GET /api/symbols/:symbol/technical?timeframe=&assetClass=` — Full technical analysis
+- `GET /api/symbols/:symbol/patterns?timeframe=&assetClass=` — Pattern detection
+
+### Frontend Technical Panel (SymbolIntelligence)
+- Technical Score with color-coded bar (0-100)
+- RSI gauge with overbought/oversold zones
+- MACD histogram bar visualization
+- Trend card with MA alignment grid
+- ATR & volatility card
+- Support/Resistance level stack with distance percentages
+- Volume & Relative Strength gauges
+- Pattern detection grid with confidence, targets, explanations
+- S/R reference lines overlaid on the recharts AreaChart
+
+### Bug Fix
+- CoinGecko OHLC API returns a plain array, not `{ohlc: [...]}`. Fixed in `CoinGeckoProvider.ts`.
 
 ## Environment Variables
 - `DATABASE_URL` — PostgreSQL connection string

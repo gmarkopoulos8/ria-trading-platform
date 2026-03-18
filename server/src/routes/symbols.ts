@@ -2,6 +2,8 @@ import { Router, Request, Response } from 'express';
 import { z } from 'zod';
 import { marketService } from '../services/market/MarketService';
 import { Timeframe } from '../services/market/types';
+import { technicalService } from '../services/technical/TechnicalService';
+import { Timeframe as TechTimeframe } from '../services/technical/types';
 
 const router = Router();
 
@@ -71,6 +73,64 @@ router.get('/:symbol/catalysts', async (req: Request, res: Response) => {
     success: true,
     data: { symbol: symbol.toUpperCase(), catalysts: [] },
   });
+});
+
+router.get('/:symbol/technical', async (req: Request, res: Response) => {
+  try {
+    const symbol = req.params.symbol.toUpperCase();
+    const timeframe = parseTimeframe(req.query.timeframe) as TechTimeframe;
+    const assetClassRaw = String(req.query.assetClass ?? '').toLowerCase();
+    const assetClass =
+      assetClassRaw === 'crypto' ? 'crypto' :
+      assetClassRaw === 'etf' ? 'etf' :
+      assetClassRaw === 'stock' ? 'stock' : undefined;
+
+    const bars = await marketService.history(symbol, timeframe, assetClass);
+
+    const ohlcvBars = bars.map((b: any) => ({
+      timestamp: new Date(b.timestamp),
+      open: b.open,
+      high: b.high,
+      low: b.low,
+      close: b.close,
+      volume: b.volume,
+    }));
+
+    const analysis = await technicalService.analyze(symbol, ohlcvBars, timeframe);
+    return res.json({ success: true, data: { analysis } });
+  } catch (err) {
+    console.error('[/symbols/:symbol/technical]', err);
+    return res.status(500).json({ success: false, error: 'Technical analysis failed' });
+  }
+});
+
+router.get('/:symbol/patterns', async (req: Request, res: Response) => {
+  try {
+    const symbol = req.params.symbol.toUpperCase();
+    const timeframe = parseTimeframe(req.query.timeframe) as TechTimeframe;
+    const assetClassRaw = String(req.query.assetClass ?? '').toLowerCase();
+    const assetClass =
+      assetClassRaw === 'crypto' ? 'crypto' :
+      assetClassRaw === 'etf' ? 'etf' :
+      assetClassRaw === 'stock' ? 'stock' : undefined;
+
+    const bars = await marketService.history(symbol, timeframe, assetClass);
+
+    const ohlcvBars = bars.map((b: any) => ({
+      timestamp: new Date(b.timestamp),
+      open: b.open,
+      high: b.high,
+      low: b.low,
+      close: b.close,
+      volume: b.volume,
+    }));
+
+    const patterns = await technicalService.analyzePatterns(symbol, ohlcvBars, timeframe);
+    return res.json({ success: true, data: { patterns } });
+  } catch (err) {
+    console.error('[/symbols/:symbol/patterns]', err);
+    return res.status(500).json({ success: false, error: 'Pattern analysis failed' });
+  }
 });
 
 router.get('/:symbol', async (req: Request, res: Response) => {

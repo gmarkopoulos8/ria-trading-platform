@@ -95,6 +95,10 @@ export const api = {
     history: (symbol: string, period = '1D') =>
       get(`/symbols/${symbol}/history`, { period }),
     catalysts: (symbol: string) => get(`/symbols/${symbol}/catalysts`),
+    technical: (symbol: string, timeframe = '1M', assetClass?: string) =>
+      get(`/symbols/${symbol}/technical`, { timeframe, ...(assetClass ? { assetClass } : {}) }),
+    patterns: (symbol: string, timeframe = '1M', assetClass?: string) =>
+      get(`/symbols/${symbol}/patterns`, { timeframe, ...(assetClass ? { assetClass } : {}) }),
   },
 
   positions: {
