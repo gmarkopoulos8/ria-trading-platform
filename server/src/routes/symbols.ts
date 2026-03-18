@@ -4,6 +4,7 @@ import { marketService } from '../services/market/MarketService';
 import { Timeframe } from '../services/market/types';
 import { technicalService } from '../services/technical/TechnicalService';
 import { Timeframe as TechTimeframe } from '../services/technical/types';
+import { newsService } from '../services/news/NewsService';
 
 const router = Router();
 
@@ -68,11 +69,32 @@ router.get('/:symbol/history', async (req: Request, res: Response) => {
 });
 
 router.get('/:symbol/catalysts', async (req: Request, res: Response) => {
-  const { symbol } = req.params;
-  return res.json({
-    success: true,
-    data: { symbol: symbol.toUpperCase(), catalysts: [] },
-  });
+  try {
+    const symbol = req.params.symbol.toUpperCase();
+    const limit = Math.min(20, Math.max(1, parseInt(String(req.query.limit ?? '10'), 10)));
+    const eventType = req.query.eventType ? String(req.query.eventType).toUpperCase() : undefined;
+    const sentiment = req.query.sentiment ? String(req.query.sentiment).toUpperCase() : undefined;
+
+    const analysis = await newsService.getCatalysts(symbol, {
+      limit,
+      eventType: eventType !== 'ALL' ? eventType : undefined,
+      sentiment: sentiment !== 'ALL' ? sentiment : undefined,
+    });
+
+    return res.json({
+      success: true,
+      data: {
+        ticker: analysis.ticker,
+        catalysts: analysis.newsItems,
+        sentimentSummary: analysis.sentimentSummary,
+        analyzedAt: analysis.analyzedAt,
+        timespan: analysis.timespan,
+      },
+    });
+  } catch (err) {
+    console.error('[/symbols/:symbol/catalysts]', err);
+    return res.status(500).json({ success: false, error: 'Failed to fetch catalysts' });
+  }
 });
 
 router.get('/:symbol/technical', async (req: Request, res: Response) => {

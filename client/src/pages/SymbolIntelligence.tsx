@@ -4,7 +4,7 @@ import { useQuery } from '@tanstack/react-query';
 import {
   Search, TrendingUp, TrendingDown, Activity, Zap, BarChart2,
   RefreshCw, AlertCircle, ChevronUp, ChevronDown, Target,
-  TriangleIcon, Layers, Flame,
+  TriangleIcon, Layers, Flame, Newspaper, Clock, ExternalLink,
 } from 'lucide-react';
 import {
   AreaChart, Area, XAxis, YAxis, Tooltip, ResponsiveContainer, CartesianGrid,
@@ -533,6 +533,7 @@ export default function SymbolIntelligence() {
   const [searchFocused, setSearchFocused] = useState(false);
   const [timeframe, setTimeframe] = useState<Timeframe>('1M');
   const [showTechnical, setShowTechnical] = useState(true);
+  const [showCatalysts, setShowCatalysts] = useState(true);
 
   const { data: quoteData, isLoading: quoteLoading, isError: quoteError, refetch: refetchQuote } = useQuery({
     queryKey: ['quote', symbol],
@@ -555,6 +556,24 @@ export default function SymbolIntelligence() {
     },
     enabled: !!symbol,
     staleTime: 10 * 60 * 1000,
+  });
+
+  const { data: catalystData } = useQuery({
+    queryKey: ['catalysts', symbol],
+    queryFn: async () => {
+      const r = await api.symbols.catalysts(symbol!, { limit: 5 }) as {
+        success: boolean;
+        data?: { catalysts: Array<{
+          id: string; headline: string; summary: string; url: string;
+          source: { name: string }; publishedAt: string;
+          sentiment: string; urgency: string; eventType: string;
+          scores: { catalyst: number };
+        }>; sentimentSummary: { overallSentiment: string; sentimentScore: number; sentimentTrend: string } };
+      };
+      return r.data ?? null;
+    },
+    enabled: !!symbol,
+    staleTime: 15 * 60 * 1000,
   });
 
   const quote = quoteData;
@@ -678,6 +697,72 @@ export default function SymbolIntelligence() {
 
               {showTechnical && (
                 <TechnicalPanel symbol={symbol} timeframe={timeframe} assetClass={quote.assetClass} />
+              )}
+
+              <div className="flex items-center justify-between">
+                <h3 className="text-sm font-semibold text-white flex items-center gap-2">
+                  <Newspaper className="h-4 w-4 text-accent-blue" /> Catalyst Intelligence
+                </h3>
+                <button onClick={() => setShowCatalysts((v) => !v)}
+                  className="text-xs text-slate-500 hover:text-white transition-colors font-mono">
+                  {showCatalysts ? 'Hide' : 'Show'}
+                </button>
+              </div>
+
+              {showCatalysts && catalystData && (
+                <div className="space-y-3">
+                  {catalystData.sentimentSummary && (
+                    <div className="grid grid-cols-3 gap-3">
+                      <Card className="p-3">
+                        <p className="text-[10px] text-slate-600 font-mono uppercase tracking-wide mb-1">Overall</p>
+                        <p className={`text-sm font-bold font-mono ${
+                          catalystData.sentimentSummary.overallSentiment === 'POSITIVE' ? 'text-emerald-400' :
+                          catalystData.sentimentSummary.overallSentiment === 'NEGATIVE' ? 'text-red-400' : 'text-slate-400'
+                        }`}>{catalystData.sentimentSummary.overallSentiment}</p>
+                      </Card>
+                      <Card className="p-3">
+                        <p className="text-[10px] text-slate-600 font-mono uppercase tracking-wide mb-1">Score</p>
+                        <p className={`text-sm font-bold font-mono ${
+                          catalystData.sentimentSummary.sentimentScore > 0 ? 'text-emerald-400' :
+                          catalystData.sentimentSummary.sentimentScore < 0 ? 'text-red-400' : 'text-slate-400'
+                        }`}>{catalystData.sentimentSummary.sentimentScore > 0 ? '+' : ''}{catalystData.sentimentSummary.sentimentScore.toFixed(2)}</p>
+                      </Card>
+                      <Card className="p-3">
+                        <p className="text-[10px] text-slate-600 font-mono uppercase tracking-wide mb-1">Trend</p>
+                        <p className="text-sm font-bold font-mono text-white">{catalystData.sentimentSummary.sentimentTrend}</p>
+                      </Card>
+                    </div>
+                  )}
+                  <div className="space-y-2">
+                    {catalystData.catalysts.slice(0, 5).map((item) => (
+                      <div key={item.id} className={`p-3 rounded-lg bg-surface-2 border border-surface-border border-l-2 ${
+                        item.sentiment === 'POSITIVE' ? 'border-l-emerald-400/60' :
+                        item.sentiment === 'NEGATIVE' ? 'border-l-red-400/60' : 'border-l-slate-600/40'
+                      }`}>
+                        <div className="flex items-start justify-between gap-2 mb-1">
+                          <h4 className="text-xs font-semibold text-white leading-snug flex-1">{item.headline}</h4>
+                          <span className={`text-[10px] font-mono flex-shrink-0 px-1 py-0.5 rounded ${
+                            item.sentiment === 'POSITIVE' ? 'text-emerald-400 bg-emerald-400/10' :
+                            item.sentiment === 'NEGATIVE' ? 'text-red-400 bg-red-400/10' : 'text-slate-500'
+                          }`}>{item.sentiment}</span>
+                        </div>
+                        <p className="text-[11px] text-slate-500 leading-relaxed mb-1.5">{item.summary}</p>
+                        <div className="flex items-center gap-3 text-[10px] font-mono text-slate-600">
+                          <span className="text-slate-500">{item.source.name}</span>
+                          <span className="flex items-center gap-1"><Clock className="h-2.5 w-2.5" />{new Date(item.publishedAt).toLocaleDateString()}</span>
+                          <span>Impact: {item.scores.catalyst}/100</span>
+                          <a href={item.url} target="_blank" rel="noopener noreferrer" className="ml-auto text-accent-blue hover:underline flex items-center gap-1">
+                            <ExternalLink className="h-2.5 w-2.5" />Read
+                          </a>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                  <a href={`/catalysts?symbol=${symbol}`}
+                    className="block text-center text-xs text-accent-blue hover:underline font-mono py-1">
+                    View full catalyst feed →
+                  </a>
+                </div>
               )}
 
               {quote.isMock && (

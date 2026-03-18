@@ -94,7 +94,8 @@ export const api = {
     quote: (symbol: string) => get(`/symbols/${symbol}/quote`),
     history: (symbol: string, period = '1D') =>
       get(`/symbols/${symbol}/history`, { period }),
-    catalysts: (symbol: string) => get(`/symbols/${symbol}/catalysts`),
+    catalysts: (symbol: string, params?: Record<string, unknown>) =>
+      get(`/symbols/${symbol}/catalysts`, params),
     technical: (symbol: string, timeframe = '1M', assetClass?: string) =>
       get(`/symbols/${symbol}/technical`, { timeframe, ...(assetClass ? { assetClass } : {}) }),
     patterns: (symbol: string, timeframe = '1M', assetClass?: string) =>
@@ -117,8 +118,10 @@ export const api = {
   },
 
   news: {
+    feed: (params?: Record<string, unknown>) => get('/news', params),
     list: (params?: Record<string, unknown>) => get('/news', params),
-    catalysts: (params?: Record<string, unknown>) => get('/news/catalysts', params),
+    catalysts: (symbol: string, params?: Record<string, unknown>) =>
+      get('/news/catalysts', { symbol, ...params }),
     sentiment: (symbol: string) => get('/news/sentiment', { symbol }),
   },
 

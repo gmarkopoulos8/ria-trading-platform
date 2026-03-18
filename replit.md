@@ -32,6 +32,23 @@ Full-stack AI paper trading research simulator. Premium dark-mode terminal UI fo
 - TypeScript interfaces for all domain entities
 - Exported as `@ria-bot/shared` workspace package
 
+## Feature Status
+
+### Completed Features
+1. **Auth** — bcryptjs sessions, PostgreSQL session store, login/register pages
+2. **Market Data** — CoinGecko crypto (real), Alpha Vantage stocks (mock fallback), 6 endpoints
+3. **Technical Analysis Engine** — 9 indicators (SMA, EMA, RSI, MACD, ATR, Volume, Levels, Trend, RelativeStrength), 15 chart patterns, orchestrator, 2 endpoints
+4. **Symbol Intelligence** — Full RSI gauge, MACD histogram, trend card, ATR/volatility, S/R levels, volume/RS gauges, pattern grid, catalyst panel
+5. **Catalyst Intelligence Engine** — News service (generator, sentiment, classifier, explainer), market-wide feed, symbol catalyst analysis, sentiment scoring, event classification (17 types), urgency levels, DB persistence, 4 API endpoints
+
+### API Endpoints
+- `GET /api/news` — Market news feed or symbol-filtered feed
+- `GET /api/news/catalysts?symbol=X` — Symbol catalyst analysis
+- `GET /api/news/sentiment?symbol=X` — Symbol sentiment summary
+- `GET /api/symbols/:symbol/catalysts` — Catalysts via symbols route
+- `GET /api/symbols/:symbol/technical` — Full technical analysis
+- `GET /api/symbols/:symbol/patterns` — Pattern detection
+
 ## Key Files
 - `client/vite.config.ts` — Vite config with /api proxy to Express port 3001
 - `client/tailwind.config.ts` — Custom dark theme (surface-0/1/2/3/4, accent colors)
