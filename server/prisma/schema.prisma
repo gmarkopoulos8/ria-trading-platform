@@ -324,11 +324,16 @@ model PaperPosition {
   tags                 String[]
   status               PositionStatus @default(OPEN)
   openedAt             DateTime       @default(now())
+  recommendedAction    String?
+  lastMonitoredAt      DateTime?
+  lastThesisAnalysis   Json?
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
-  portfolio Portfolio @relation(fields: [portfolioId], references: [id], onDelete: Cascade)
+  portfolio        Portfolio          @relation(fields: [portfolioId], references: [id], onDelete: Cascade)
+  monitoringAlerts MonitoringAlert[]
+  snapshots        PositionSnapshot[]
 
   @@index([portfolioId])
   @@index([userId])
@@ -369,6 +374,60 @@ model ClosedPosition {
   @@index([userId])
   @@index([symbol])
   @@map("closed_positions")
+}
+
+// ─── Position Monitoring ─────────────────────────────────────────
+
+model MonitoringAlert {
+  id          String               @id @default(cuid())
+  userId      String
+  positionId  String?
+  symbol      String
+  severity    MonitorAlertSeverity
+  alertType   MonitorAlertType
+  title       String
+  message     String
+  isRead      Boolean              @default(false)
+  metadata    Json?
+  triggeredAt DateTime             @default(now())
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  position PaperPosition? @relation(fields: [positionId], references: [id], onDelete: SetNull)
+
+  @@index([userId, isRead])
+  @@index([userId, triggeredAt])
+  @@index([positionId])
+  @@index([symbol])
+  @@map("monitoring_alerts")
+}
+
+model PositionSnapshot {
+  id                String   @id @default(cuid())
+  positionId        String
+  symbol            String
+  currentPrice      Float
+  thesisHealth      Float
+  recommendedAction String?
+  technicalScore    Float?
+  catalystScore     Float?
+  riskScore         Float?
+  targetProximityPct Float?
+  stopProximityPct  Float?
+  holdWindowPct     Float?
+  unrealizedPnl     Float
+  unrealizedPnlPct  Float
+  metadata          Json?
+  snapshotAt        DateTime @default(now())
+
+  createdAt DateTime @default(now())
+
+  position PaperPosition @relation(fields: [positionId], references: [id], onDelete: Cascade)
+
+  @@index([positionId, snapshotAt])
+  @@index([symbol])
+  @@map("position_snapshots")
 }
 
 // ─── Alerts ───────────────────────────────────────────────────────
@@ -520,4 +579,27 @@ enum AlertStatus {
   ACTIVE
   TRIGGERED
   DISMISSED
+}
+
+enum MonitorAlertSeverity {
+  INFO
+  CAUTION
+  WARNING
+  CRITICAL
+}
+
+enum MonitorAlertType {
+  ENTRY_ZONE_REACHED
+  BREAKOUT_CONFIRMED
+  SUPPORT_LOST
+  MOMENTUM_ACCELERATING
+  MOMENTUM_FADING
+  MAJOR_NEWS_DETECTED
+  EVENT_RISK_ELEVATED
+  INVALIDATION_THREATENED
+  TARGET_APPROACHED
+  HOLD_WINDOW_NEARLY_EXHAUSTED
+  SETUP_INVALIDATED
+  THESIS_HEALTH_IMPROVED
+  THESIS_HEALTH_DETERIORATED
 }

@@ -42,6 +42,7 @@ Full-stack AI paper trading research simulator. Premium dark-mode terminal UI fo
 5. **Catalyst Intelligence Engine** — News service (generator, sentiment, classifier, explainer), market-wide feed, symbol catalyst analysis, sentiment scoring, event classification (17 types), urgency levels, DB persistence, 4 API endpoints
 6. **Multi-Agent Thesis Engine** — MarketStructure + Catalyst + Risk + Thesis agents, conviction/confidence/health scoring, entry/exit/invalidation zones, recommended actions, 3 API endpoints
 7. **Paper Trading System** — Full portfolio management: open/close positions, P&L computation (realized + unrealized), cash balance tracking, win rate, profit factor, audit logs, thesis-linked trades, "Paper Trade" button from ThesisPanel
+8. **Monitoring Engine** — Continuous position monitoring job (5-min intervals): re-runs full thesis analysis per position, evaluates 13 alert conditions, deduplicates within 30min windows, stores PositionSnapshot history, updates thesisHealth + recommendedAction on position; Alert Center page with severity feed, symbol/type/unread filters, mark-read, position monitor cards with health sparklines
 
 ### API Endpoints
 - `GET /api/news` — Market news feed or symbol-filtered feed

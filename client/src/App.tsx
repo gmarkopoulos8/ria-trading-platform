@@ -6,6 +6,7 @@ import Dashboard from './pages/Dashboard';
 import OpportunityScanner from './pages/OpportunityScanner';
 import SymbolIntelligence from './pages/SymbolIntelligence';
 import PaperPortfolio from './pages/PaperPortfolio';
+import AlertCenter from './pages/AlertCenter';
 import CatalystIntelligence from './pages/CatalystIntelligence';
 import RiskConsole from './pages/RiskConsole';
 import PerformanceLab from './pages/PerformanceLab';
@@ -32,6 +33,7 @@ export default function App() {
           <Route path="scanner" element={<OpportunityScanner />} />
           <Route path="symbol/:symbol?" element={<SymbolIntelligence />} />
           <Route path="portfolio" element={<PaperPortfolio />} />
+          <Route path="alerts" element={<AlertCenter />} />
           <Route path="catalysts" element={<CatalystIntelligence />} />
           <Route path="risk" element={<RiskConsole />} />
           <Route path="performance" element={<PerformanceLab />} />

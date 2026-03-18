@@ -122,13 +122,18 @@ export const api = {
     update: (id: string, body: unknown) => put(`/paper-positions/${id}`, body),
     delete: (id: string) => del(`/paper-positions/${id}`),
     closed: (params?: Record<string, unknown>) => get('/paper-positions/closed', params),
+    refresh: (id: string) => post(`/paper-positions/${id}/refresh`),
+    snapshots: (id: string, limit = 50) => get(`/paper-positions/${id}/snapshots`, { limit }),
   },
 
   alerts: {
-    list: () => get('/alerts'),
-    create: (body: unknown) => post('/alerts', body),
+    list: (params?: Record<string, unknown>) => get('/alerts', params),
+    unreadCount: () => get<{ success: boolean; data: { count: number } }>('/alerts/unread-count'),
+    markRead: (id: string) => post(`/alerts/${id}/read`),
+    markAllRead: (symbol?: string) => post('/alerts/read-all', symbol ? { symbol } : {}),
     delete: (id: string) => del(`/alerts/${id}`),
-    dismiss: (id: string) => post(`/alerts/${id}/dismiss`),
+    clearAll: (params?: { symbol?: string; read?: boolean }) =>
+      del(`/alerts${params?.symbol ? `?symbol=${params.symbol}` : ''}${params?.read ? `${params?.symbol ? '&' : '?'}read=true` : ''}`),
   },
 
   news: {

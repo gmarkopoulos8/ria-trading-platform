@@ -4,6 +4,7 @@ import { OpenPositionSchema, ClosePositionSchema } from '@ria-bot/shared';
 import { prisma } from '../lib/prisma';
 import { requireAuth } from '../middleware/requireAuth';
 import { marketService } from '../services/market/MarketService';
+import { refreshPosition } from '../services/monitoring/PositionMonitor';
 
 const router = Router();
 router.use(requireAuth);
@@ -477,6 +478,41 @@ router.delete('/:id', async (req: Request, res: Response) => {
     return res.json({ success: true, message: 'Position deleted' });
   } catch (err) {
     return res.status(500).json({ success: false, error: 'Failed to delete position' });
+  }
+});
+
+router.post('/:id/refresh', async (req: Request, res: Response) => {
+  const userId = req.session.userId!;
+  const { id } = req.params;
+  try {
+    const result = await refreshPosition(id, userId);
+    return res.json({ success: true, data: result });
+  } catch (err: any) {
+    const msg = err?.message ?? 'Failed to refresh position';
+    const status = msg === 'Position not found or not open' ? 404 : 500;
+    return res.status(status).json({ success: false, error: msg });
+  }
+});
+
+router.get('/:id/snapshots', async (req: Request, res: Response) => {
+  const userId = req.session.userId!;
+  const { id } = req.params;
+  const limit = Math.min(parseInt((req.query.limit as string) ?? '50', 10), 200);
+  try {
+    const position = await prisma.paperPosition.findFirst({
+      where: { id, userId },
+      select: { id: true, symbol: true },
+    });
+    if (!position) return res.status(404).json({ success: false, error: 'Position not found' });
+
+    const snapshots = await prisma.positionSnapshot.findMany({
+      where: { positionId: id },
+      orderBy: { snapshotAt: 'desc' },
+      take: limit,
+    });
+    return res.json({ success: true, data: { snapshots: snapshots.reverse() } });
+  } catch {
+    return res.status(500).json({ success: false, error: 'Failed to fetch snapshots' });
   }
 });
 

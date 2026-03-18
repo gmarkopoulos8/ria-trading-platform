@@ -13,6 +13,7 @@ import newsRouter from './routes/news';
 import performanceRouter from './routes/performance';
 import settingsRouter from './routes/settings';
 import { errorHandler, notFoundHandler } from './middleware/errorHandler';
+import { monitorAllOpenPositions } from './services/monitoring/PositionMonitor';
 
 const app = express();
 const PORT = process.env.PORT ?? 3001;
@@ -71,11 +72,27 @@ app.use('/api/settings', settingsRouter);
 app.use('/api/*', notFoundHandler);
 app.use(errorHandler);
 
+const MONITOR_INTERVAL_MS = 5 * 60 * 1000;
+
 app.listen(PORT, () => {
   console.log(`✅ RIA BOT API running on port ${PORT}`);
   console.log(`   Environment : ${process.env.NODE_ENV ?? 'development'}`);
   console.log(`   Database    : ${process.env.DATABASE_URL ? 'connected' : 'not configured'}`);
   console.log(`   Sessions    : PostgreSQL`);
+
+  setTimeout(() => {
+    monitorAllOpenPositions().catch((err) => {
+      console.warn('[Monitor] Initial cycle error:', err?.message);
+    });
+  }, 15_000);
+
+  setInterval(() => {
+    monitorAllOpenPositions().catch((err) => {
+      console.warn('[Monitor] Cycle error:', err?.message);
+    });
+  }, MONITOR_INTERVAL_MS);
+
+  console.log(`   Monitor     : ${MONITOR_INTERVAL_MS / 1000}s interval (first run in 15s)`);
 });
 
 export default app;

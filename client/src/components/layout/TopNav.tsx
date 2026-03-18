@@ -9,6 +9,7 @@ import { api } from '../../api/client';
 import { useAuth } from '../../contexts/AuthContext';
 import { cn } from '../../lib/utils';
 
+
 interface TopNavProps {
   onToggleSidebar?: () => void;
 }
@@ -244,12 +245,22 @@ function UserMenu() {
 }
 
 export default function TopNav({ onToggleSidebar }: TopNavProps) {
+  const navigate = useNavigate();
+
   const { data: health, isError } = useQuery({
     queryKey: ['health'],
     queryFn: api.health,
     refetchInterval: 30000,
     retry: 1,
   });
+
+  const { data: unreadData } = useQuery({
+    queryKey: ['alert-unread-count'],
+    queryFn: () => api.alerts.unreadCount(),
+    refetchInterval: 30_000,
+    staleTime: 15_000,
+  });
+  const unreadCount = unreadData?.data?.count ?? 0;
 
   const isConnected = !!health?.success && !isError;
   const now = new Date();
@@ -289,9 +300,17 @@ export default function TopNav({ onToggleSidebar }: TopNavProps) {
           <span className="text-xs font-mono text-accent-amber">PAPER</span>
         </div>
 
-        <button className="relative p-1.5 rounded-lg text-slate-500 hover:text-white hover:bg-surface-3 transition-colors">
+        <button
+          onClick={() => navigate('/alerts')}
+          className="relative p-1.5 rounded-lg text-slate-500 hover:text-white hover:bg-surface-3 transition-colors"
+          title={unreadCount > 0 ? `${unreadCount} unread alerts` : 'Alert Center'}
+        >
           <Bell className="h-4 w-4" />
-          <span className="absolute top-1 right-1 w-1.5 h-1.5 bg-accent-red rounded-full" />
+          {unreadCount > 0 && (
+            <span className="absolute -top-0.5 -right-0.5 min-w-[14px] h-[14px] bg-red-500 text-white text-[9px] font-bold rounded-full flex items-center justify-center px-0.5">
+              {unreadCount > 9 ? '9+' : unreadCount}
+            </span>
+          )}
         </button>
 
         <UserMenu />

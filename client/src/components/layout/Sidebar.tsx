@@ -1,4 +1,5 @@
 import { NavLink, useLocation } from 'react-router-dom';
+import { useQuery } from '@tanstack/react-query';
 import {
   LayoutDashboard,
   ScanSearch,
@@ -8,8 +9,10 @@ import {
   ShieldAlert,
   FlaskConical,
   ChevronRight,
+  Bell,
 } from 'lucide-react';
 import { cn } from '../../lib/utils';
+import { api } from '../../api/client';
 
 const navItems = [
   {
@@ -37,6 +40,13 @@ const navItems = [
     description: 'Active positions',
   },
   {
+    path: '/alerts',
+    label: 'Alert Center',
+    icon: Bell,
+    description: 'Position monitoring',
+    badge: true,
+  },
+  {
     path: '/catalysts',
     label: 'Catalyst Intelligence',
     icon: Zap,
@@ -62,6 +72,14 @@ interface SidebarProps {
 
 export default function Sidebar({ collapsed }: SidebarProps) {
   const location = useLocation();
+
+  const { data: unreadData } = useQuery({
+    queryKey: ['alert-unread-count'],
+    queryFn: () => api.alerts.unreadCount(),
+    refetchInterval: 30_000,
+    staleTime: 15_000,
+  });
+  const unreadCount = unreadData?.data?.count ?? 0;
 
   return (
     <aside
@@ -95,6 +113,7 @@ export default function Sidebar({ collapsed }: SidebarProps) {
         {navItems.map((item) => {
           const Icon = item.icon;
           const isActive = location.pathname.startsWith(item.path);
+          const showBadge = item.badge && unreadCount > 0;
 
           return (
             <NavLink
@@ -105,14 +124,24 @@ export default function Sidebar({ collapsed }: SidebarProps) {
                 isActive ? 'nav-item-active' : 'nav-item-inactive'
               )}
             >
-              <Icon className="h-4 w-4 flex-shrink-0" />
+              <div className="relative flex-shrink-0">
+                <Icon className="h-4 w-4" />
+                {showBadge && collapsed && (
+                  <span className="absolute -top-1 -right-1 w-2 h-2 bg-red-500 rounded-full" />
+                )}
+              </div>
               {!collapsed && (
                 <>
                   <div className="flex-1 min-w-0">
                     <p className="text-xs font-semibold truncate">{item.label}</p>
                     <p className="text-xs text-slate-600 truncate">{item.description}</p>
                   </div>
-                  {isActive && <ChevronRight className="h-3 w-3 opacity-50 flex-shrink-0" />}
+                  {showBadge && (
+                    <span className="flex-shrink-0 min-w-[18px] h-[18px] bg-red-500 text-white text-[10px] font-bold rounded-full flex items-center justify-center px-1">
+                      {unreadCount > 99 ? '99+' : unreadCount}
+                    </span>
+                  )}
+                  {!showBadge && isActive && <ChevronRight className="h-3 w-3 opacity-50 flex-shrink-0" />}
                 </>
               )}
             </NavLink>
