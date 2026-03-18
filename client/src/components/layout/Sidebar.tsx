@@ -11,7 +11,8 @@ import {
   ChevronRight,
   Bell,
   X,
-  Telescope,
+  Radar,
+  HeartPulse,
 } from 'lucide-react';
 import { cn } from '../../lib/utils';
 import { api } from '../../api/client';
@@ -19,7 +20,8 @@ import { useAuth } from '../../contexts/AuthContext';
 
 const navItems = [
   { path: '/dashboard', label: 'Dashboard', icon: LayoutDashboard, description: 'Market overview' },
-  { path: '/daily-scan', label: 'Daily Scan', icon: Telescope, description: 'Ranked universe · top 100' },
+  { path: '/daily-scan', label: 'Daily Scan', icon: Radar, description: 'Ranked universe · top 100' },
+  { path: '/stock-health', label: 'Stock Health', icon: HeartPulse, description: 'NYSE health analyzer' },
   { path: '/scanner', label: 'Opportunity Scanner', icon: ScanSearch, description: 'AI-scored picks' },
   { path: '/symbol', label: 'Symbol Intelligence', icon: LineChart, description: 'Deep dive' },
   { path: '/portfolio', label: 'Paper Portfolio', icon: Briefcase, description: 'Active positions' },

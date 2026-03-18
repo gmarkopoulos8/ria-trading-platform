@@ -6,9 +6,9 @@ import {
 } from 'lucide-react';
 import { cn } from '../lib/utils';
 import { api } from '../api/client';
-import { Card, CardHeader, CardTitle, CardContent } from '../components/ui/Card';
-import LoadingState from '../components/ui/LoadingState';
-import ErrorState from '../components/ui/ErrorState';
+import { Card, CardHeader } from '../components/ui/Card';
+import { LoadingState } from '../components/ui/LoadingState';
+import { ErrorState } from '../components/ui/ErrorState';
 
 interface ReportEntry {
   symbol: string;
@@ -33,9 +33,6 @@ interface SectorStat {
 }
 
 interface DailyReport {
-  id: string;
-  scanRunId: string;
-  reportDate: string;
   marketRegimeSummary: string | null;
   strongestSectorsJson: SectorStat[];
   weakestSectorsJson: SectorStat[];
@@ -68,11 +65,7 @@ interface ScanRun {
 
 function MiniList({ items, renderItem }: { items: ReportEntry[]; renderItem: (r: ReportEntry, i: number) => React.ReactNode }) {
   if (!items || items.length === 0) return <p className="text-xs text-slate-500 italic">No data</p>;
-  return (
-    <div className="space-y-1.5">
-      {items.slice(0, 8).map((item, i) => renderItem(item, i))}
-    </div>
-  );
+  return <div className="space-y-1.5">{items.slice(0, 8).map((item, i) => renderItem(item, i))}</div>;
 }
 
 function SectorList({ items }: { items: SectorStat[] }) {
@@ -121,9 +114,8 @@ export default function ScanReport() {
   const report = run?.report ?? null;
 
   if (isLoading) return <div className="flex-1 overflow-auto"><LoadingState message="Loading scan report…" /></div>;
-  if (isError || !run) return <div className="flex-1 overflow-auto"><ErrorState title="Report not found" message="This scan run could not be loaded." /></div>;
+  if (isError || !run) return <div className="flex-1 overflow-auto"><ErrorState message="This scan run could not be loaded." /></div>;
 
-  const totalRanked = run.totalRankedCount;
   const bullishCount = report?.countsByBias?.BULLISH ?? 0;
   const bearishCount = report?.countsByBias?.BEARISH ?? 0;
   const neutralCount = report?.countsByBias?.NEUTRAL ?? 0;
@@ -131,7 +123,7 @@ export default function ScanReport() {
   return (
     <div className="flex flex-col h-full overflow-hidden">
       <div className="flex-shrink-0 border-b border-surface-border bg-surface-1 px-6 py-4">
-        <div className="flex items-center gap-3 mb-1">
+        <div className="flex items-center gap-3">
           <Link to="/daily-scan" className="p-1.5 text-slate-500 hover:text-white transition-colors rounded-lg hover:bg-surface-2">
             <ArrowLeft className="h-4 w-4" />
           </Link>
@@ -156,19 +148,13 @@ export default function ScanReport() {
 
         {report?.marketRegimeSummary && (
           <Card>
-            <CardHeader>
-              <CardTitle className="text-sm flex items-center gap-2">
-                <Activity className="h-4 w-4 text-accent-blue" /> Market Regime
-              </CardTitle>
-            </CardHeader>
-            <CardContent>
-              <p className="text-sm text-slate-300">{report.marketRegimeSummary}</p>
-            </CardContent>
+            <CardHeader title="Market Regime" icon={<Activity className="h-4 w-4 text-accent-blue" />} />
+            <p className="text-sm text-slate-300">{report.marketRegimeSummary}</p>
           </Card>
         )}
 
         <div className="flex flex-wrap gap-3">
-          <StatPill label="Total Ranked" value={totalRanked} />
+          <StatPill label="Total Ranked" value={run.totalRankedCount} />
           <StatPill label="Universe" value={run.totalUniverseCount} />
           <StatPill label="Bullish" value={bullishCount} color="text-accent-green" />
           <StatPill label="Bearish" value={bearishCount} color="text-red-400" />
@@ -180,216 +166,158 @@ export default function ScanReport() {
           <>
             <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
               <Card>
-                <CardHeader>
-                  <CardTitle className="text-sm flex items-center gap-2">
-                    <TrendingUp className="h-4 w-4 text-accent-green" /> Strongest Sectors
-                  </CardTitle>
-                </CardHeader>
-                <CardContent>
-                  <SectorList items={report.strongestSectorsJson ?? []} />
-                </CardContent>
+                <CardHeader title="Strongest Sectors" icon={<TrendingUp className="h-4 w-4 text-accent-green" />} />
+                <SectorList items={report.strongestSectorsJson ?? []} />
               </Card>
-
               <Card>
-                <CardHeader>
-                  <CardTitle className="text-sm flex items-center gap-2">
-                    <TrendingDown className="h-4 w-4 text-red-400" /> Weakest Sectors
-                  </CardTitle>
-                </CardHeader>
-                <CardContent>
-                  <SectorList items={report.weakestSectorsJson ?? []} />
-                </CardContent>
+                <CardHeader title="Weakest Sectors" icon={<TrendingDown className="h-4 w-4 text-red-400" />} />
+                <SectorList items={report.weakestSectorsJson ?? []} />
               </Card>
             </div>
 
             <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
               <Card>
-                <CardHeader>
-                  <CardTitle className="text-sm flex items-center gap-2">
-                    <Target className="h-4 w-4 text-accent-blue" /> Top Conviction Setups
-                  </CardTitle>
-                </CardHeader>
-                <CardContent>
-                  <MiniList
-                    items={report.topConvictionSetupsJson ?? []}
-                    renderItem={(r, i) => (
-                      <div key={i} className="flex items-center justify-between">
-                        <div className="flex items-center gap-2">
-                          <span className="text-[10px] text-slate-600 font-mono w-4">{r.rank ?? i + 1}</span>
-                          <Link to={`/symbol/${r.symbol}`} className="text-xs font-bold text-white hover:text-accent-blue">{r.symbol}</Link>
-                          {r.action && <span className="text-[10px] text-slate-500">{r.action}</span>}
-                        </div>
-                        <span className={cn('text-xs font-mono font-bold', convColor(r.conviction ?? 0))}>{r.conviction}</span>
+                <CardHeader title="Top Conviction Setups" icon={<Target className="h-4 w-4 text-accent-blue" />} />
+                <MiniList
+                  items={report.topConvictionSetupsJson ?? []}
+                  renderItem={(r, i) => (
+                    <div key={i} className="flex items-center justify-between">
+                      <div className="flex items-center gap-2">
+                        <span className="text-[10px] text-slate-600 font-mono w-4">{r.rank ?? i + 1}</span>
+                        <Link to={`/symbol/${r.symbol}`} className="text-xs font-bold text-white hover:text-accent-blue">{r.symbol}</Link>
+                        {r.action && <span className="text-[10px] text-slate-500">{r.action}</span>}
                       </div>
-                    )}
-                  />
-                </CardContent>
+                      <span className={cn('text-xs font-mono font-bold', convColor(r.conviction ?? 0))}>{r.conviction}</span>
+                    </div>
+                  )}
+                />
               </Card>
-
               <Card>
-                <CardHeader>
-                  <CardTitle className="text-sm flex items-center gap-2">
-                    <BarChart3 className="h-4 w-4 text-teal-400" /> Best Reward/Risk
-                  </CardTitle>
-                </CardHeader>
-                <CardContent>
-                  <MiniList
-                    items={report.topRiskRewardSetupsJson ?? []}
-                    renderItem={(r, i) => (
-                      <div key={i} className="flex items-center justify-between">
-                        <div className="flex items-center gap-2">
-                          <span className="text-[10px] text-slate-600 font-mono w-4">{r.rank ?? i + 1}</span>
-                          <Link to={`/symbol/${r.symbol}`} className="text-xs font-bold text-white hover:text-accent-blue">{r.symbol}</Link>
-                        </div>
-                        <span className="text-xs font-mono text-teal-400">{r.rewardRisk ?? '—'}/100</span>
+                <CardHeader title="Best Reward / Risk" icon={<BarChart3 className="h-4 w-4 text-teal-400" />} />
+                <MiniList
+                  items={report.topRiskRewardSetupsJson ?? []}
+                  renderItem={(r, i) => (
+                    <div key={i} className="flex items-center justify-between">
+                      <div className="flex items-center gap-2">
+                        <span className="text-[10px] text-slate-600 font-mono w-4">{r.rank ?? i + 1}</span>
+                        <Link to={`/symbol/${r.symbol}`} className="text-xs font-bold text-white hover:text-accent-blue">{r.symbol}</Link>
                       </div>
-                    )}
-                  />
-                </CardContent>
+                      <span className="text-xs font-mono text-teal-400">{r.rewardRisk ?? '—'}/100</span>
+                    </div>
+                  )}
+                />
               </Card>
             </div>
 
             <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
               <Card>
-                <CardHeader>
-                  <CardTitle className="text-sm flex items-center gap-2">
-                    <Shield className="h-4 w-4 text-accent-purple" /> Conservative Candidates
-                  </CardTitle>
-                </CardHeader>
-                <CardContent>
-                  <MiniList
-                    items={report.topConservativeCandidatesJson ?? []}
-                    renderItem={(r, i) => (
-                      <div key={i} className="flex items-center justify-between">
-                        <Link to={`/symbol/${r.symbol}`} className="text-xs font-bold text-white hover:text-accent-blue">{r.symbol}</Link>
-                        <div className="flex items-center gap-3 text-xs font-mono">
-                          <span className={cn(convColor(r.conviction ?? 0))}>{r.conviction}</span>
-                          <span className="text-slate-500">risk {r.risk}</span>
-                        </div>
+                <CardHeader title="Conservative Candidates" icon={<Shield className="h-4 w-4 text-accent-purple" />} />
+                <MiniList
+                  items={report.topConservativeCandidatesJson ?? []}
+                  renderItem={(r, i) => (
+                    <div key={i} className="flex items-center justify-between">
+                      <Link to={`/symbol/${r.symbol}`} className="text-xs font-bold text-white hover:text-accent-blue">{r.symbol}</Link>
+                      <div className="flex items-center gap-3 text-xs font-mono">
+                        <span className={convColor(r.conviction ?? 0)}>{r.conviction}</span>
+                        <span className="text-slate-500">risk {r.risk}</span>
                       </div>
-                    )}
-                  />
-                </CardContent>
+                    </div>
+                  )}
+                />
               </Card>
-
               <Card>
-                <CardHeader>
-                  <CardTitle className="text-sm flex items-center gap-2">
-                    <Zap className="h-4 w-4 text-yellow-400" /> Aggressive Candidates
-                  </CardTitle>
-                </CardHeader>
-                <CardContent>
-                  <MiniList
-                    items={report.topAggressiveCandidatesJson ?? []}
-                    renderItem={(r, i) => (
-                      <div key={i} className="flex items-center justify-between">
-                        <Link to={`/symbol/${r.symbol}`} className="text-xs font-bold text-white hover:text-accent-blue">{r.symbol}</Link>
-                        <span className={cn('text-xs font-mono font-bold', convColor(r.conviction ?? 0))}>{r.conviction}</span>
-                      </div>
-                    )}
-                  />
-                </CardContent>
+                <CardHeader title="Aggressive Candidates" icon={<Zap className="h-4 w-4 text-yellow-400" />} />
+                <MiniList
+                  items={report.topAggressiveCandidatesJson ?? []}
+                  renderItem={(r, i) => (
+                    <div key={i} className="flex items-center justify-between">
+                      <Link to={`/symbol/${r.symbol}`} className="text-xs font-bold text-white hover:text-accent-blue">{r.symbol}</Link>
+                      <span className={cn('text-xs font-mono font-bold', convColor(r.conviction ?? 0))}>{r.conviction}</span>
+                    </div>
+                  )}
+                />
               </Card>
             </div>
 
             <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
               <Card>
-                <CardHeader>
-                  <CardTitle className="text-sm flex items-center gap-2">
-                    <TrendingUp className="h-4 w-4 text-accent-green" /> Strongest Momentum
-                  </CardTitle>
-                </CardHeader>
-                <CardContent>
-                  <MiniList
-                    items={report.strongestMomentumJson ?? []}
-                    renderItem={(r, i) => (
-                      <div key={i} className="flex items-center justify-between">
-                        <Link to={`/symbol/${r.symbol}`} className="text-xs font-bold text-white hover:text-accent-blue">{r.symbol}</Link>
-                        <div className="flex items-center gap-2 text-xs font-mono">
-                          <span className="text-slate-500">tech {r.technical}</span>
-                          <span className={convColor(r.conviction ?? 0)}>{r.conviction}</span>
-                        </div>
+                <CardHeader title="Strongest Momentum" icon={<TrendingUp className="h-4 w-4 text-accent-green" />} />
+                <MiniList
+                  items={report.strongestMomentumJson ?? []}
+                  renderItem={(r, i) => (
+                    <div key={i} className="flex items-center justify-between">
+                      <Link to={`/symbol/${r.symbol}`} className="text-xs font-bold text-white hover:text-accent-blue">{r.symbol}</Link>
+                      <div className="flex items-center gap-2 text-xs font-mono">
+                        <span className="text-slate-500">tech {r.technical}</span>
+                        <span className={convColor(r.conviction ?? 0)}>{r.conviction}</span>
                       </div>
-                    )}
-                  />
-                </CardContent>
+                    </div>
+                  )}
+                />
               </Card>
-
               <Card>
-                <CardHeader>
-                  <CardTitle className="text-sm flex items-center gap-2">
-                    <AlertTriangle className="h-4 w-4 text-red-400" /> Highest Risk Names
-                  </CardTitle>
-                </CardHeader>
-                <CardContent>
-                  <MiniList
-                    items={report.highestRiskNamesJson ?? []}
-                    renderItem={(r, i) => (
-                      <div key={i} className="flex items-center justify-between">
-                        <Link to={`/symbol/${r.symbol}`} className="text-xs font-bold text-white hover:text-accent-blue">{r.symbol}</Link>
-                        <span className="text-xs font-mono text-red-400">{r.risk}/100</span>
-                      </div>
-                    )}
-                  />
-                </CardContent>
+                <CardHeader title="Highest Risk Names" icon={<AlertTriangle className="h-4 w-4 text-red-400" />} />
+                <MiniList
+                  items={report.highestRiskNamesJson ?? []}
+                  renderItem={(r, i) => (
+                    <div key={i} className="flex items-center justify-between">
+                      <Link to={`/symbol/${r.symbol}`} className="text-xs font-bold text-white hover:text-accent-blue">{r.symbol}</Link>
+                      <span className="text-xs font-mono text-red-400">{r.risk}/100</span>
+                    </div>
+                  )}
+                />
               </Card>
             </div>
 
             <Card>
-              <CardHeader>
-                <CardTitle className="text-sm flex items-center gap-2">
-                  <Zap className="h-4 w-4 text-accent-purple" /> Top Catalyst Plays
-                </CardTitle>
-              </CardHeader>
-              <CardContent>
-                <MiniList
-                  items={report.topCatalystsJson ?? []}
-                  renderItem={(r, i) => (
-                    <div key={i} className="flex items-start justify-between gap-4">
-                      <div>
-                        <Link to={`/symbol/${r.symbol}`} className="text-xs font-bold text-white hover:text-accent-blue">{r.symbol}</Link>
-                        {r.catalyst && <p className="text-xs text-slate-400 mt-0.5 line-clamp-1">{r.catalyst}</p>}
-                      </div>
-                      <span className="text-xs font-mono text-accent-purple flex-shrink-0">{r.score}</span>
+              <CardHeader title="Top Catalyst Plays" icon={<Zap className="h-4 w-4 text-accent-purple" />} />
+              <MiniList
+                items={report.topCatalystsJson ?? []}
+                renderItem={(r, i) => (
+                  <div key={i} className="flex items-start justify-between gap-4">
+                    <div>
+                      <Link to={`/symbol/${r.symbol}`} className="text-xs font-bold text-white hover:text-accent-blue">{r.symbol}</Link>
+                      {r.catalyst && <p className="text-xs text-slate-400 mt-0.5 line-clamp-1">{r.catalyst}</p>}
                     </div>
-                  )}
-                />
-              </CardContent>
+                    <span className="text-xs font-mono text-accent-purple flex-shrink-0">{r.score}</span>
+                  </div>
+                )}
+              />
             </Card>
 
             <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
               <Card>
-                <CardHeader><CardTitle className="text-sm">By Asset Class</CardTitle></CardHeader>
-                <CardContent className="space-y-1.5">
+                <CardHeader title="By Asset Class" />
+                <div className="space-y-1.5">
                   {Object.entries(report.countsByAssetClass ?? {}).map(([k, v]) => (
                     <div key={k} className="flex justify-between text-xs">
                       <span className="text-slate-400">{k}</span>
                       <span className="font-mono text-white">{v}</span>
                     </div>
                   ))}
-                </CardContent>
+                </div>
               </Card>
               <Card>
-                <CardHeader><CardTitle className="text-sm">By Bias</CardTitle></CardHeader>
-                <CardContent className="space-y-1.5">
+                <CardHeader title="By Bias" />
+                <div className="space-y-1.5">
                   {Object.entries(report.countsByBias ?? {}).map(([k, v]) => (
                     <div key={k} className="flex justify-between text-xs">
                       <span className={cn('font-semibold', k === 'BULLISH' ? 'text-accent-green' : k === 'BEARISH' ? 'text-red-400' : 'text-slate-400')}>{k}</span>
                       <span className="font-mono text-white">{v}</span>
                     </div>
                   ))}
-                </CardContent>
+                </div>
               </Card>
               <Card>
-                <CardHeader><CardTitle className="text-sm">By Action</CardTitle></CardHeader>
-                <CardContent className="space-y-1.5">
+                <CardHeader title="By Action" />
+                <div className="space-y-1.5">
                   {Object.entries(report.countsByAction ?? {}).map(([k, v]) => (
                     <div key={k} className="flex justify-between text-xs">
                       <span className="text-slate-400 truncate">{k}</span>
                       <span className="font-mono text-white ml-2">{v}</span>
                     </div>
                   ))}
-                </CardContent>
+                </div>
               </Card>
             </div>
           </>
@@ -397,8 +325,7 @@ export default function ScanReport() {
 
         <div className="flex items-center justify-between pt-2 border-t border-surface-border">
           <div className="flex items-center gap-2 text-xs text-slate-600">
-            <Clock className="h-3 w-3" />
-            <span>Run ID: {run.id}</span>
+            <Clock className="h-3 w-3" /><span>Run ID: {run.id}</span>
           </div>
           <Link to="/daily-scan" className="text-xs text-accent-blue hover:underline">← Back to Scanner</Link>
         </div>

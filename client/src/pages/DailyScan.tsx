@@ -3,16 +3,15 @@ import { Link, useNavigate } from 'react-router-dom';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { toast } from 'sonner';
 import {
-  Telescope, RefreshCw, ChevronDown, ChevronUp, Clock, Zap,
+  Radar, RefreshCw, ChevronDown, ChevronUp, Clock, Play,
   TrendingUp, TrendingDown, Minus, Filter, History, Settings2,
-  ArrowUpRight, AlertTriangle, ExternalLink, Play, Info
+  ArrowUpRight, AlertTriangle, ExternalLink, Info
 } from 'lucide-react';
 import { cn } from '../lib/utils';
 import { api } from '../api/client';
 import { Card } from '../components/ui/Card';
-import { Badge } from '../components/ui/Badge';
-import LoadingState from '../components/ui/LoadingState';
-import ErrorState from '../components/ui/ErrorState';
+import { LoadingState } from '../components/ui/LoadingState';
+import { ErrorState } from '../components/ui/ErrorState';
 
 type AssetScope = 'ALL' | 'STOCKS_ONLY' | 'CRYPTO_ONLY';
 type RiskMode = 'ALL' | 'CONSERVATIVE' | 'AGGRESSIVE';
@@ -59,10 +58,7 @@ interface ScanRun {
   summary: string | null;
   startedAt: string | null;
   completedAt: string | null;
-  report?: {
-    marketRegimeSummary: string | null;
-    reportDate: string;
-  } | null;
+  report?: { marketRegimeSummary: string | null; reportDate: string } | null;
 }
 
 function biasColor(bias: string) {
@@ -95,12 +91,12 @@ function actionBadge(action: string) {
   return <span className={cn('text-[10px] font-bold px-2 py-0.5 rounded border', m.color)}>{m.label}</span>;
 }
 
-function ScoreBar({ value, max = 100, color }: { value: number; max?: number; color: string }) {
-  const pct = Math.min(100, (value / max) * 100);
+function ScoreBar({ value, color }: { value: number; color: string }) {
+  const pct = Math.min(100, Math.max(0, value));
   return (
     <div className="flex items-center gap-2">
       <div className="flex-1 h-1.5 bg-surface-border rounded-full overflow-hidden">
-        <div className={cn('h-full rounded-full transition-all', color)} style={{ width: `${pct}%` }} />
+        <div className={cn('h-full rounded-full', color)} style={{ width: `${pct}%` }} />
       </div>
       <span className="text-xs font-mono text-slate-400 w-7 text-right">{Math.round(value)}</span>
     </div>
@@ -141,9 +137,7 @@ function ExpandedRow({ result }: { result: ScanResult }) {
             <span className="text-slate-500">TP2</span>
             <span className="font-mono text-accent-purple">{tp2 ? fmt(tp2.level) : '—'}</span>
           </div>
-        </div>
-        <div className="pt-1 space-y-1 text-xs">
-          <div className="flex justify-between">
+          <div className="flex justify-between pt-1 border-t border-surface-border">
             <span className="text-slate-500">Hold Window</span>
             <span className="text-white font-mono">{result.suggestedHoldWindow ?? '—'}</span>
           </div>
@@ -160,25 +154,25 @@ function ExpandedRow({ result }: { result: ScanResult }) {
 
       <div className="space-y-3">
         <p className="text-[10px] text-slate-500 uppercase tracking-wider font-mono">Score Breakdown</p>
-        <div className="space-y-1.5">
+        <div className="space-y-2">
           <div>
-            <div className="flex justify-between text-xs mb-0.5"><span className="text-slate-500">Technical</span></div>
+            <p className="text-[10px] text-slate-500 mb-1">Technical</p>
             <ScoreBar value={result.technicalScore} color="bg-accent-blue" />
           </div>
           <div>
-            <div className="flex justify-between text-xs mb-0.5"><span className="text-slate-500">Catalyst</span></div>
+            <p className="text-[10px] text-slate-500 mb-1">Catalyst</p>
             <ScoreBar value={result.catalystScore} color="bg-accent-purple" />
           </div>
           <div>
-            <div className="flex justify-between text-xs mb-0.5"><span className="text-slate-500">Risk (lower = better)</span></div>
+            <p className="text-[10px] text-slate-500 mb-1">Risk (lower = better)</p>
             <ScoreBar value={result.riskScore} color={result.riskScore >= 60 ? 'bg-red-500' : 'bg-accent-green'} />
           </div>
           <div>
-            <div className="flex justify-between text-xs mb-0.5"><span className="text-slate-500">Liquidity</span></div>
+            <p className="text-[10px] text-slate-500 mb-1">Liquidity</p>
             <ScoreBar value={result.liquidityScore} color="bg-teal-500" />
           </div>
           <div>
-            <div className="flex justify-between text-xs mb-0.5"><span className="text-slate-500">Volatility Fit</span></div>
+            <p className="text-[10px] text-slate-500 mb-1">Volatility Fit</p>
             <ScoreBar value={result.volatilityScore} color="bg-orange-400" />
           </div>
         </div>
@@ -207,7 +201,7 @@ function ExpandedRow({ result }: { result: ScanResult }) {
         )}
         <Link
           to={`/symbol/${result.symbol}`}
-          className="inline-flex items-center gap-1 text-xs text-accent-blue hover:text-blue-300 transition-colors mt-1"
+          className="inline-flex items-center gap-1 text-xs text-accent-blue hover:text-blue-300 transition-colors"
         >
           Deep dive <ExternalLink className="h-3 w-3" />
         </Link>
@@ -219,32 +213,25 @@ function ExpandedRow({ result }: { result: ScanResult }) {
 function ResultRow({ result, expanded, onToggle }: { result: ScanResult; expanded: boolean; onToggle: () => void }) {
   return (
     <div className="border-b border-surface-border last:border-0">
-      <button
-        onClick={onToggle}
-        className="w-full text-left hover:bg-surface-2/50 transition-colors px-4 py-3"
-      >
+      <button onClick={onToggle} className="w-full text-left hover:bg-surface-2/50 transition-colors px-4 py-3">
         <div className="flex items-center gap-3">
           <span className="text-xs font-mono text-slate-600 w-6 flex-shrink-0 text-right">{result.rank}</span>
-
           <div className="flex items-center gap-2 w-28 flex-shrink-0">
             <span className="font-bold text-sm text-white">{result.symbol}</span>
             <span className="text-[10px] text-slate-500 bg-surface-border px-1.5 py-0.5 rounded">
               {result.assetClass === 'STOCK' ? 'STK' : result.assetClass === 'CRYPTO' ? 'CRY' : 'ETF'}
             </span>
           </div>
-
           <div className={cn('flex items-center gap-1 w-20 flex-shrink-0', biasColor(result.bias))}>
             {biasIcon(result.bias)}
             <span className="text-xs font-semibold">{result.bias}</span>
           </div>
-
           <div className="flex items-center gap-1 w-20 flex-shrink-0">
             <span className={cn('text-sm font-bold font-mono', convictionColor(result.convictionScore))}>
               {result.convictionScore}
             </span>
             <span className="text-[10px] text-slate-600">/100</span>
           </div>
-
           <div className="hidden md:flex items-center gap-3 flex-1">
             <div className="flex-1 space-y-1">
               <div className="flex items-center gap-2">
@@ -257,24 +244,15 @@ function ResultRow({ result, expanded, onToggle }: { result: ScanResult; expande
               </div>
             </div>
           </div>
-
-          <div className="hidden lg:block w-40 flex-shrink-0">
-            {actionBadge(result.recommendedAction)}
-          </div>
-
+          <div className="hidden lg:block w-40 flex-shrink-0">{actionBadge(result.recommendedAction)}</div>
           <div className="hidden xl:block w-32 flex-shrink-0">
             <span className="text-xs text-slate-400 truncate block">{result.setupType}</span>
           </div>
-
           <div className="ml-auto flex-shrink-0">
-            {expanded
-              ? <ChevronUp className="h-4 w-4 text-slate-500" />
-              : <ChevronDown className="h-4 w-4 text-slate-500" />
-            }
+            {expanded ? <ChevronUp className="h-4 w-4 text-slate-500" /> : <ChevronDown className="h-4 w-4 text-slate-500" />}
           </div>
         </div>
       </button>
-
       {expanded && <ExpandedRow result={result} />}
     </div>
   );
@@ -313,13 +291,7 @@ export default function DailyScan() {
   const results: ScanResult[] = (resultsData as any)?.data?.results ?? [];
 
   const triggerMutation = useMutation({
-    mutationFn: () => api.scans.trigger({
-      runType: 'MANUAL',
-      marketSession: 'MARKET_OPEN',
-      assetScope,
-      riskMode,
-      force: true,
-    }),
+    mutationFn: () => api.scans.trigger({ runType: 'MANUAL', marketSession: 'MARKET_OPEN', assetScope, riskMode, force: true }),
     onSuccess: (data: any) => {
       const id = data?.data?.scanRunId;
       toast.success('Scan triggered — analyzing universe…', { description: `Run ID: ${id?.slice(0, 8) ?? '?'}` });
@@ -330,8 +302,7 @@ export default function DailyScan() {
       }, 2000);
     },
     onError: (err: any) => {
-      const msg = err?.response?.data?.error ?? err?.message ?? 'Scan failed';
-      toast.error('Scan failed', { description: msg });
+      toast.error('Scan failed', { description: err?.response?.data?.error ?? err?.message ?? 'Unknown error' });
     },
   });
 
@@ -347,22 +318,18 @@ export default function DailyScan() {
         <div className="flex items-center justify-between px-6 py-4">
           <div className="flex items-center gap-3">
             <div className="w-9 h-9 rounded-lg bg-accent-blue/10 border border-accent-blue/20 flex items-center justify-center">
-              <Telescope className="h-4 w-4 text-accent-blue" />
+              <Radar className="h-4 w-4 text-accent-blue" />
             </div>
             <div>
               <h1 className="text-base font-bold text-white">Daily Scan</h1>
               <p className="text-xs text-slate-500">Ranked opportunity universe</p>
             </div>
           </div>
-
           <div className="flex items-center gap-2">
             <Link to="/scan-history" className="p-2 text-slate-500 hover:text-white transition-colors rounded-lg hover:bg-surface-2">
               <History className="h-4 w-4" />
             </Link>
-            <button
-              onClick={() => navigate('/settings')}
-              className="p-2 text-slate-500 hover:text-white transition-colors rounded-lg hover:bg-surface-2"
-            >
+            <button onClick={() => navigate('/settings')} className="p-2 text-slate-500 hover:text-white transition-colors rounded-lg hover:bg-surface-2">
               <Settings2 className="h-4 w-4" />
             </button>
             <button
@@ -370,76 +337,45 @@ export default function DailyScan() {
               disabled={isRunning}
               className={cn(
                 'flex items-center gap-2 px-4 py-2 rounded-lg text-sm font-semibold transition-all',
-                isRunning
-                  ? 'bg-accent-blue/30 text-accent-blue/50 cursor-not-allowed'
-                  : 'bg-accent-blue text-white hover:bg-blue-500'
+                isRunning ? 'bg-accent-blue/30 text-accent-blue/50 cursor-not-allowed' : 'bg-accent-blue text-white hover:bg-blue-500'
               )}
             >
-              {isRunning ? (
-                <><RefreshCw className="h-4 w-4 animate-spin" /> Scanning…</>
-              ) : (
-                <><Play className="h-4 w-4" /> Run Scan</>
-              )}
+              {isRunning ? <><RefreshCw className="h-4 w-4 animate-spin" /> Scanning…</> : <><Play className="h-4 w-4" /> Run Scan</>}
             </button>
           </div>
         </div>
 
         <div className="px-6 pb-3 flex flex-wrap items-center gap-3">
           <div className="flex items-center gap-2 text-xs text-slate-500">
-            <Filter className="h-3.5 w-3.5" />
-            <span>Scope:</span>
+            <Filter className="h-3.5 w-3.5" /><span>Scope:</span>
           </div>
           {(['ALL', 'STOCKS_ONLY', 'CRYPTO_ONLY'] as AssetScope[]).map((s) => (
-            <button
-              key={s}
-              onClick={() => setAssetScope(s)}
-              className={cn(
-                'px-3 py-1 rounded text-xs font-semibold transition-colors',
-                assetScope === s ? 'bg-accent-blue text-white' : 'bg-surface-2 text-slate-400 hover:text-white'
-              )}
-            >
+            <button key={s} onClick={() => setAssetScope(s)}
+              className={cn('px-3 py-1 rounded text-xs font-semibold transition-colors', assetScope === s ? 'bg-accent-blue text-white' : 'bg-surface-2 text-slate-400 hover:text-white')}>
               {s === 'ALL' ? 'All' : s === 'STOCKS_ONLY' ? 'Stocks' : 'Crypto'}
             </button>
           ))}
           <div className="w-px h-4 bg-surface-border" />
           <span className="text-xs text-slate-500">Risk:</span>
           {(['ALL', 'CONSERVATIVE', 'AGGRESSIVE'] as RiskMode[]).map((m) => (
-            <button
-              key={m}
-              onClick={() => setRiskMode(m)}
-              className={cn(
-                'px-3 py-1 rounded text-xs font-semibold transition-colors',
-                riskMode === m ? 'bg-accent-purple text-white' : 'bg-surface-2 text-slate-400 hover:text-white'
-              )}
-            >
+            <button key={m} onClick={() => setRiskMode(m)}
+              className={cn('px-3 py-1 rounded text-xs font-semibold transition-colors', riskMode === m ? 'bg-accent-purple text-white' : 'bg-surface-2 text-slate-400 hover:text-white')}>
               {m === 'ALL' ? 'All' : m === 'CONSERVATIVE' ? 'Conservative' : 'Aggressive'}
             </button>
           ))}
         </div>
 
         {latestRun && (
-          <div className="px-6 pb-3 flex items-center gap-4 text-xs text-slate-500">
+          <div className="px-6 pb-3 flex items-center gap-4 text-xs text-slate-500 flex-wrap">
             <span className="flex items-center gap-1.5">
               <Clock className="h-3 w-3" />
-              {latestRun.completedAt
-                ? `Last scan: ${new Date(latestRun.completedAt).toLocaleString()}`
-                : 'No completed scan yet'}
+              {latestRun.completedAt ? `Last scan: ${new Date(latestRun.completedAt).toLocaleString()}` : 'No completed scan yet'}
             </span>
             <span className="text-slate-600">·</span>
             <span>{latestRun.totalRankedCount} ranked / {latestRun.totalUniverseCount} universe</span>
-            {latestRun.topSymbol && (
-              <>
-                <span className="text-slate-600">·</span>
-                <span>Top: <span className="text-accent-green font-mono">{latestRun.topSymbol}</span></span>
-              </>
-            )}
+            {latestRun.topSymbol && (<><span className="text-slate-600">·</span><span>Top: <span className="text-accent-green font-mono">{latestRun.topSymbol}</span></span></>)}
             {latestRun.report?.marketRegimeSummary && (
-              <>
-                <span className="text-slate-600">·</span>
-                <span className="hidden xl:inline text-slate-400 italic truncate max-w-sm">
-                  {latestRun.report.marketRegimeSummary}
-                </span>
-              </>
+              <><span className="text-slate-600">·</span><span className="hidden xl:inline text-slate-400 italic truncate max-w-sm">{latestRun.report.marketRegimeSummary}</span></>
             )}
             <Link to={`/scan-report/${latestRun.id}`} className="ml-auto flex items-center gap-1 text-accent-blue hover:text-blue-300">
               Full Report <ArrowUpRight className="h-3 w-3" />
@@ -449,32 +385,18 @@ export default function DailyScan() {
       </div>
 
       {latestRun?.id && (
-        <div className="flex-shrink-0 px-6 py-2 border-b border-surface-border flex items-center gap-3">
+        <div className="flex-shrink-0 px-6 py-2 border-b border-surface-border flex items-center gap-3 flex-wrap">
           <span className="text-xs text-slate-500">Filter:</span>
           {(['ALL', 'BULLISH', 'BEARISH', 'NEUTRAL'] as BiasFilter[]).map((b) => (
-            <button
-              key={b}
-              onClick={() => setBiasFilter(b)}
-              className={cn(
-                'px-2.5 py-1 rounded text-xs transition-colors',
-                biasFilter === b
-                  ? b === 'BULLISH' ? 'bg-accent-green/20 text-accent-green' : b === 'BEARISH' ? 'bg-red-500/20 text-red-400' : 'bg-accent-blue/20 text-accent-blue'
-                  : 'text-slate-500 hover:text-white'
-              )}
-            >
+            <button key={b} onClick={() => setBiasFilter(b)}
+              className={cn('px-2.5 py-1 rounded text-xs transition-colors', biasFilter === b ? (b === 'BULLISH' ? 'bg-accent-green/20 text-accent-green' : b === 'BEARISH' ? 'bg-red-500/20 text-red-400' : 'bg-accent-blue/20 text-accent-blue') : 'text-slate-500 hover:text-white')}>
               {b === 'ALL' ? 'All Bias' : b}
             </button>
           ))}
           <div className="w-px h-4 bg-surface-border" />
           {(['ALL', 'STOCK', 'CRYPTO', 'ETF'] as AssetFilter[]).map((a) => (
-            <button
-              key={a}
-              onClick={() => setAssetFilter(a)}
-              className={cn(
-                'px-2.5 py-1 rounded text-xs transition-colors',
-                assetFilter === a ? 'bg-surface-border text-white' : 'text-slate-500 hover:text-white'
-              )}
-            >
+            <button key={a} onClick={() => setAssetFilter(a)}
+              className={cn('px-2.5 py-1 rounded text-xs transition-colors', assetFilter === a ? 'bg-surface-border text-white' : 'text-slate-500 hover:text-white')}>
               {a}
             </button>
           ))}
@@ -486,25 +408,19 @@ export default function DailyScan() {
         {latestLoading ? (
           <LoadingState message="Loading latest scan…" />
         ) : latestError ? (
-          <ErrorState title="Failed to load scan" message="Could not fetch the latest scan run." />
+          <ErrorState message="Could not fetch the latest scan run." />
         ) : !latestRun ? (
           <div className="flex flex-col items-center justify-center h-full gap-4 text-center p-8">
             <div className="w-16 h-16 rounded-2xl bg-accent-blue/10 border border-accent-blue/20 flex items-center justify-center">
-              <Telescope className="h-7 w-7 text-accent-blue/60" />
+              <Radar className="h-7 w-7 text-accent-blue/60" />
             </div>
             <div>
               <p className="text-white font-semibold mb-1">No scan results yet</p>
-              <p className="text-slate-500 text-sm max-w-sm">
-                Run your first daily scan to rank the full market universe by conviction, setup quality, and risk-adjusted opportunity.
-              </p>
+              <p className="text-slate-500 text-sm max-w-sm">Run your first daily scan to rank the full market universe by conviction, setup quality, and risk-adjusted opportunity.</p>
             </div>
-            <button
-              onClick={() => triggerMutation.mutate()}
-              disabled={isRunning}
-              className="flex items-center gap-2 px-6 py-2.5 bg-accent-blue text-white rounded-lg text-sm font-semibold hover:bg-blue-500 transition-colors"
-            >
-              <Play className="h-4 w-4" />
-              {isRunning ? 'Scanning…' : 'Run First Scan'}
+            <button onClick={() => triggerMutation.mutate()} disabled={isRunning}
+              className="flex items-center gap-2 px-6 py-2.5 bg-accent-blue text-white rounded-lg text-sm font-semibold hover:bg-blue-500 transition-colors">
+              <Play className="h-4 w-4" />{isRunning ? 'Scanning…' : 'Run First Scan'}
             </button>
           </div>
         ) : resultsLoading ? (
@@ -513,9 +429,7 @@ export default function DailyScan() {
           <div className="flex flex-col items-center justify-center h-64 gap-3 text-center">
             <Info className="h-8 w-8 text-slate-600" />
             <p className="text-slate-400 text-sm">No results match the current filters</p>
-            <button onClick={() => { setBiasFilter('ALL'); setAssetFilter('ALL'); }} className="text-accent-blue text-xs hover:underline">
-              Clear filters
-            </button>
+            <button onClick={() => { setBiasFilter('ALL'); setAssetFilter('ALL'); }} className="text-accent-blue text-xs hover:underline">Clear filters</button>
           </div>
         ) : (
           <div>
@@ -529,14 +443,8 @@ export default function DailyScan() {
               <span className="w-32 flex-shrink-0 hidden xl:block">Setup</span>
               <span className="w-5 flex-shrink-0" />
             </div>
-
             {results.map((r) => (
-              <ResultRow
-                key={r.id}
-                result={r}
-                expanded={expandedId === r.id}
-                onToggle={() => handleToggle(r.id)}
-              />
+              <ResultRow key={r.id} result={r} expanded={expandedId === r.id} onToggle={() => handleToggle(r.id)} />
             ))}
           </div>
         )}

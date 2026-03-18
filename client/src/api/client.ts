@@ -163,6 +163,12 @@ export const api = {
     update: (body: unknown) => put('/settings', body),
   },
 
+  stocks: {
+    health: (ticker: string) => get(`/stocks/${ticker}/health`),
+    searchHistory: (limit?: number) => get('/stocks/search/history', limit ? { limit } : {}),
+    clearHistory: () => del('/stocks/search/history'),
+  },
+
   scans: {
     trigger: (body?: {
       runType?: string;

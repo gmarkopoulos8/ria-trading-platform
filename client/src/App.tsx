@@ -12,6 +12,7 @@ import RiskConsole from './pages/RiskConsole';
 import PerformanceLab from './pages/PerformanceLab';
 import Settings from './pages/Settings';
 import DailyScan from './pages/DailyScan';
+import StockHealthAnalyzer from './pages/StockHealthAnalyzer';
 import ScanReport from './pages/ScanReport';
 import ScanHistory from './pages/ScanHistory';
 import Login from './pages/Login';
@@ -43,6 +44,8 @@ export default function App() {
           <Route path="performance" element={<PerformanceLab />} />
           <Route path="settings" element={<Settings />} />
           <Route path="daily-scan" element={<DailyScan />} />
+          <Route path="stock-health" element={<StockHealthAnalyzer />} />
+          <Route path="stock-health/:ticker" element={<StockHealthAnalyzer />} />
           <Route path="scan-report/:id" element={<ScanReport />} />
           <Route path="scan-history" element={<ScanHistory />} />
         </Route>

@@ -27,6 +27,7 @@ model User {
   agentOutputs      AgentOutput[]
   auditLogs         AuditLog[]
   performanceMetrics PerformanceMetric[]
+  stockSearchHistory StockSearchHistory[]
 
   @@index([email])
   @@map("users")
@@ -533,6 +534,26 @@ model AuditLog {
   @@index([action])
   @@index([entity, entityId])
   @@map("audit_logs")
+}
+
+// ─── Stock Health Analyzer ────────────────────────────────────────
+
+model StockSearchHistory {
+  id              String   @id @default(cuid())
+  userId          String
+  ticker          String
+  lastHealthScore Float?
+  lastActionLabel String?
+  searchCount     Int      @default(1)
+  lastSearchedAt  DateTime @default(now())
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, ticker])
+  @@index([userId, lastSearchedAt])
+  @@map("stock_search_history")
 }
 
 // ─── Daily Scan Engine ───────────────────────────────────────────
