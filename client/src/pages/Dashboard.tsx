@@ -34,7 +34,7 @@ export default function Dashboard() {
 
   const { data: portfolioData, isLoading: portLoading } = useQuery({
     queryKey: ['portfolio'],
-    queryFn: api.positions.portfolio,
+    queryFn: () => api.positions.list(),
     refetchInterval: 60_000,
   });
 
