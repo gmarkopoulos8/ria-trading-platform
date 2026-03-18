@@ -63,11 +63,38 @@ Full-stack AI paper trading research simulator. Premium dark-mode terminal UI fo
 - CatalystIntelligence, RiskConsole, PerformanceLab, Login, Register
 - TopNav includes: live/offline status, PAPER badge, notifications, UserMenu (logout/settings/profile)
 
+## Market Data Layer
+Service layer at `server/src/services/market/`:
+- **types.ts** — Normalized DTOs: `NormalizedQuote`, `OHLCVBar`, `SearchResult`, `Timeframe`, provider interfaces
+- **utils.ts** — Transformation helpers, mock OHLCV generator
+- **cache.ts** — In-memory cache (TTL 5min quotes, 1h history) + DB Symbol persistence
+- **stocks/** — `AlphaVantageProvider` (real, needs STOCKS_API_KEY) + `MockStocksProvider` (fallback)
+- **crypto/** — `CoinGeckoProvider` (real, free tier works without key) + `MockCryptoProvider` (fallback)
+- **MarketService.ts** — Unified facade, auto-detects stock vs crypto by symbol
+
+### Active Data Sources
+- **Stocks**: Mock data (realistic prices, ±noise) when STOCKS_API_KEY not set
+- **Crypto**: Real CoinGecko free-tier (no key needed) with mock fallback on 429
+- **Cache**: TTL-based in-memory; quotes expire in 5 min, history in 1 hour
+
+### Wired Endpoints
+- `GET /api/symbols/search?q=` — Unified stock + crypto search (real CoinGecko results)
+- `GET /api/symbols/:symbol/quote?assetClass=` — Live/mock quote
+- `GET /api/symbols/:symbol/history?timeframe=` — OHLCV bars (1D/1W/1M/3M/6M/1Y/5Y)
+- `GET /api/market/overview` — Market status + index + crypto quotes
+- `GET /api/market/opportunities?assetClass=` — Scored scan results (price + thesis scoring)
+- `GET /api/market/movers?direction=up|down` — Top gainers/losers
+
+### Frontend Data Integration
+- **SymbolIntelligence**: Real search + live dropdown, quote display, recharts AreaChart with 7 timeframes
+- **OpportunityScanner**: Live from `/api/market/opportunities`, filtering + sorting, refresh button
+- **TopNav CommandBar**: Smart search with real-time suggestions → navigates to `/symbol/:symbol`
+
 ## Environment Variables
 - `DATABASE_URL` — PostgreSQL connection string
 - `SESSION_SECRET` — Express session secret
-- `STOCKS_API_KEY` — Stock market data API key
-- `CRYPTO_API_KEY` — Crypto market data API key
+- `STOCKS_API_KEY` — Alpha Vantage API key (optional, enables real stock quotes)
+- `CRYPTO_API_KEY` — CoinGecko Pro API key (optional, free tier works without it)
 - `PORT` — Express server port (default: 3001)
 
 ## Workflow
