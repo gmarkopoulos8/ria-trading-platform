@@ -1,9 +1,9 @@
 import { useState } from 'react';
-import { useQuery } from '@tanstack/react-query';
+import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import {
   Brain, TrendingUp, TrendingDown, Minus, Target, Shield, Zap,
   Activity, AlertTriangle, CheckCircle, Clock, ChevronDown, ChevronUp,
-  RefreshCw, Info,
+  RefreshCw, Info, Plus, X, Briefcase,
 } from 'lucide-react';
 import { Card, CardHeader } from '../ui/Card';
 import { api } from '../../api/client';
@@ -103,6 +103,26 @@ function ScoreBar({ value, label, colorClass }: { value: number; label: string; 
 
 export function ThesisPanel({ symbol, assetClass }: { symbol: string; assetClass?: string }) {
   const [showDetail, setShowDetail] = useState(false);
+  const [showTradeForm, setShowTradeForm] = useState(false);
+  const [tradeQty, setTradeQty] = useState('');
+  const [tradeEntry, setTradeEntry] = useState('');
+  const [tradeError, setTradeError] = useState<string | null>(null);
+  const [tradeSuccess, setTradeSuccess] = useState(false);
+  const qc = useQueryClient();
+
+  const tradeMutation = useMutation({
+    mutationFn: (body: unknown) => api.positions.open(body),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['portfolio'] });
+      setTradeSuccess(true);
+      setShowTradeForm(false);
+      setTradeQty('');
+      setTimeout(() => setTradeSuccess(false), 3000);
+    },
+    onError: (err: any) => {
+      setTradeError(err?.response?.data?.error ?? 'Failed to open position');
+    },
+  });
 
   const { data, isLoading, isError, refetch, isFetching } = useQuery({
     queryKey: ['thesis', symbol],
@@ -233,13 +253,115 @@ export function ThesisPanel({ symbol, assetClass }: { symbol: string; assetClass
         </div>
       </div>
 
-      <button
-        onClick={() => setShowDetail((v) => !v)}
-        className="flex items-center gap-2 text-xs text-accent-blue hover:text-accent-blue/80 transition-colors mb-3"
-      >
-        {showDetail ? <ChevronUp className="h-3.5 w-3.5" /> : <ChevronDown className="h-3.5 w-3.5" />}
-        {showDetail ? 'Hide' : 'Show'} detailed analysis
-      </button>
+      <div className="flex items-center gap-2 mb-3">
+        <button
+          onClick={() => {
+            setTradeEntry(String(((thesis.entryZone.low + thesis.entryZone.high) / 2).toFixed(2)));
+            setTradeError(null);
+            setShowTradeForm((v) => !v);
+          }}
+          className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold border transition-all ${
+            thesis.bias === 'BEARISH'
+              ? 'bg-red-500/15 border-red-500/25 text-red-400 hover:bg-red-500/25'
+              : 'bg-emerald-500/15 border-emerald-500/25 text-emerald-400 hover:bg-emerald-500/25'
+          }`}
+        >
+          <Briefcase className="h-3.5 w-3.5" />
+          {showTradeForm ? 'Cancel' : 'Paper Trade'}
+        </button>
+        {tradeSuccess && (
+          <span className="flex items-center gap-1 text-xs text-emerald-400">
+            <CheckCircle className="h-3.5 w-3.5" />Position opened
+          </span>
+        )}
+        <button
+          onClick={() => setShowDetail((v) => !v)}
+          className="flex items-center gap-1.5 text-xs text-slate-500 hover:text-slate-300 transition-colors ml-auto"
+        >
+          {showDetail ? <ChevronUp className="h-3.5 w-3.5" /> : <ChevronDown className="h-3.5 w-3.5" />}
+          {showDetail ? 'Hide' : 'Show'} analysis
+        </button>
+      </div>
+
+      {showTradeForm && (
+        <div className="mb-4 p-4 rounded-lg bg-surface-3 border border-accent-blue/20 space-y-3">
+          <p className="text-xs font-semibold text-slate-400 font-mono uppercase tracking-wider">
+            Quick Paper Trade · {thesis.bias === 'BEARISH' ? 'SHORT' : 'LONG'} {symbol}
+          </p>
+          <div className="grid grid-cols-2 gap-3">
+            <div>
+              <label className="block text-[10px] text-slate-600 font-mono mb-1">ENTRY PRICE</label>
+              <input type="number" step="any" min="0"
+                value={tradeEntry} onChange={(e) => setTradeEntry(e.target.value)}
+                className="w-full px-2.5 py-1.5 bg-surface-2 border border-surface-border rounded-lg text-white font-mono text-xs outline-none focus:border-accent-blue/50"
+              />
+              <p className="text-[10px] text-slate-600 mt-0.5">Midpoint of entry zone</p>
+            </div>
+            <div>
+              <label className="block text-[10px] text-slate-600 font-mono mb-1">QUANTITY</label>
+              <input type="number" step="any" min="0"
+                value={tradeQty} onChange={(e) => setTradeQty(e.target.value)}
+                placeholder="e.g. 10"
+                className="w-full px-2.5 py-1.5 bg-surface-2 border border-surface-border rounded-lg text-white font-mono text-xs outline-none focus:border-accent-blue/50"
+              />
+              {tradeEntry && tradeQty && !isNaN(parseFloat(tradeEntry)) && !isNaN(parseFloat(tradeQty)) && (
+                <p className="text-[10px] text-slate-600 mt-0.5">
+                  Cost: ${(parseFloat(tradeEntry) * parseFloat(tradeQty)).toLocaleString('en-US', { maximumFractionDigits: 2 })}
+                </p>
+              )}
+            </div>
+          </div>
+
+          <div className="grid grid-cols-2 gap-2 text-[10px] font-mono">
+            <div className="px-2.5 py-1.5 rounded bg-emerald-400/5 border border-emerald-400/10">
+              <span className="text-slate-600">TP1: </span>
+              <span className="text-emerald-400 font-semibold">{formatPrice(thesis.takeProfit1.level)}</span>
+            </div>
+            <div className="px-2.5 py-1.5 rounded bg-red-400/5 border border-red-400/10">
+              <span className="text-slate-600">Stop: </span>
+              <span className="text-red-400 font-semibold">{formatPrice(thesis.invalidationZone.level)}</span>
+            </div>
+          </div>
+
+          {tradeError && (
+            <p className="text-xs text-red-400 flex items-center gap-1">
+              <AlertTriangle className="h-3.5 w-3.5" />{tradeError}
+            </p>
+          )}
+
+          <button
+            disabled={tradeMutation.isPending}
+            onClick={() => {
+              setTradeError(null);
+              const ep = parseFloat(tradeEntry);
+              const qty = parseFloat(tradeQty);
+              if (isNaN(ep) || ep <= 0) { setTradeError('Valid entry price required'); return; }
+              if (isNaN(qty) || qty <= 0) { setTradeError('Valid quantity required'); return; }
+              tradeMutation.mutate({
+                symbol,
+                assetClass: assetClass ?? 'stock',
+                side: thesis.bias === 'BEARISH' ? 'short' : 'long',
+                quantity: qty,
+                entryPrice: ep,
+                targetPrice: thesis.takeProfit1.level,
+                stopLoss: thesis.invalidationZone.level,
+                thesis: thesis.thesisSummary,
+                thesisHealth: thesis.thesisHealthScore,
+              });
+            }}
+            className={`w-full py-2 text-xs font-semibold rounded-lg transition-all disabled:opacity-50 flex items-center justify-center gap-1.5 ${
+              thesis.bias === 'BEARISH'
+                ? 'bg-red-500/20 border border-red-500/30 text-red-300 hover:bg-red-500/30'
+                : 'bg-emerald-500/20 border border-emerald-500/30 text-emerald-300 hover:bg-emerald-500/30'
+            }`}
+          >
+            {tradeMutation.isPending
+              ? <><RefreshCw className="h-3.5 w-3.5 animate-spin" />Opening...</>
+              : <><Plus className="h-3.5 w-3.5" />Open {thesis.bias === 'BEARISH' ? 'SHORT' : 'LONG'} Position</>
+            }
+          </button>
+        </div>
+      )}
 
       {showDetail && (
         <div className="space-y-4 border-t border-surface-border pt-4">

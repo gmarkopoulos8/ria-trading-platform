@@ -307,21 +307,23 @@ model Portfolio {
 }
 
 model PaperPosition {
-  id           String         @id @default(cuid())
-  portfolioId  String
-  userId       String
-  symbol       String
-  name         String
-  side         PositionSide
-  quantity     Float
-  entryPrice   Float
-  currentPrice Float?
-  targetPrice  Float?
-  stopLoss     Float?
-  thesis       String
-  tags         String[]
-  status       PositionStatus @default(OPEN)
-  openedAt     DateTime       @default(now())
+  id                   String         @id @default(cuid())
+  portfolioId          String
+  userId               String
+  symbol               String
+  name                 String
+  assetClass           String         @default("stock")
+  side                 PositionSide
+  quantity             Float
+  entryPrice           Float
+  currentPrice         Float?
+  targetPrice          Float?
+  stopLoss             Float?
+  thesis               String
+  thesisHealth         Float?
+  tags                 String[]
+  status               PositionStatus @default(OPEN)
+  openedAt             DateTime       @default(now())
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
@@ -335,22 +337,27 @@ model PaperPosition {
 }
 
 model ClosedPosition {
-  id               String       @id @default(cuid())
-  portfolioId      String
-  userId           String
-  symbol           String
-  name             String
-  side             PositionSide
-  quantity         Float
-  entryPrice       Float
-  exitPrice        Float
-  pnl              Float
-  pnlPercent       Float
-  thesis           String
-  tags             String[]
-  notes            String?
-  openedAt         DateTime
-  closedAt         DateTime     @default(now())
+  id                String       @id @default(cuid())
+  portfolioId       String
+  userId            String
+  symbol            String
+  name              String
+  assetClass        String       @default("stock")
+  side              PositionSide
+  quantity          Float
+  entryPrice        Float
+  exitPrice         Float
+  targetPrice       Float?
+  stopLoss          Float?
+  pnl               Float
+  pnlPercent        Float
+  thesis            String
+  thesisOutcome     String?
+  tags              String[]
+  notes             String?
+  closeReason       String?
+  openedAt          DateTime
+  closedAt          DateTime     @default(now())
   holdingPeriodDays Int?
 
   createdAt DateTime @default(now())

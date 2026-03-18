@@ -119,7 +119,9 @@ export const api = {
     open: (body: unknown) => post('/paper-positions/open', body),
     close: (body: unknown) => post('/paper-positions/close', body),
     get: (id: string) => get(`/paper-positions/${id}`),
+    update: (id: string, body: unknown) => put(`/paper-positions/${id}`, body),
     delete: (id: string) => del(`/paper-positions/${id}`),
+    closed: (params?: Record<string, unknown>) => get('/paper-positions/closed', params),
   },
 
   alerts: {

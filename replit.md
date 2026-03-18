@@ -40,6 +40,8 @@ Full-stack AI paper trading research simulator. Premium dark-mode terminal UI fo
 3. **Technical Analysis Engine** — 9 indicators (SMA, EMA, RSI, MACD, ATR, Volume, Levels, Trend, RelativeStrength), 15 chart patterns, orchestrator, 2 endpoints
 4. **Symbol Intelligence** — Full RSI gauge, MACD histogram, trend card, ATR/volatility, S/R levels, volume/RS gauges, pattern grid, catalyst panel
 5. **Catalyst Intelligence Engine** — News service (generator, sentiment, classifier, explainer), market-wide feed, symbol catalyst analysis, sentiment scoring, event classification (17 types), urgency levels, DB persistence, 4 API endpoints
+6. **Multi-Agent Thesis Engine** — MarketStructure + Catalyst + Risk + Thesis agents, conviction/confidence/health scoring, entry/exit/invalidation zones, recommended actions, 3 API endpoints
+7. **Paper Trading System** — Full portfolio management: open/close positions, P&L computation (realized + unrealized), cash balance tracking, win rate, profit factor, audit logs, thesis-linked trades, "Paper Trade" button from ThesisPanel
 
 ### API Endpoints
 - `GET /api/news` — Market news feed or symbol-filtered feed
@@ -48,6 +50,28 @@ Full-stack AI paper trading research simulator. Premium dark-mode terminal UI fo
 - `GET /api/symbols/:symbol/catalysts` — Catalysts via symbols route
 - `GET /api/symbols/:symbol/technical` — Full technical analysis
 - `GET /api/symbols/:symbol/patterns` — Pattern detection
+- `GET /api/symbols/:symbol/analyze` — Full 4-agent thesis analysis
+- `GET /api/symbols/:symbol/thesis` — Thesis output only
+- `GET /api/market/scan` — Conviction-ranked opportunity scan
+- `GET /api/paper-positions` — Portfolio + open positions + recent closed
+- `POST /api/paper-positions/open` — Open paper position (deducts cash)
+- `POST /api/paper-positions/close` — Close position (realize P&L, add cash)
+- `GET /api/paper-positions/closed` — Paginated closed trade history
+- `GET /api/paper-positions/:id` — Single position with live price
+- `PUT /api/paper-positions/:id` — Update stop/target/thesis
+- `DELETE /api/paper-positions/:id` — Delete position (refunds cash if open)
+
+### Schema Changes (latest)
+- `PaperPosition` — Added: `assetClass`, `thesisHealth`
+- `ClosedPosition` — Added: `assetClass`, `thesisOutcome`, `closeReason`, `targetPrice`, `stopLoss`
+
+### Paper Trading Business Logic
+- `getOrCreatePortfolio(userId)` — auto-creates $100k portfolio on first open
+- Position cost deducted from cashBalance on open; exit value added on close
+- P&L = (exitPrice − entryPrice) × quantity × direction (1 for LONG, −1 for SHORT)
+- thesisOutcome: `TARGET_HIT` | `PARTIAL_WIN` | `STOPPED_OUT` | `INVALIDATED` | `BREAKEVEN`
+- closeReason: `HIT_TARGET` | `HIT_STOP` | `MANUAL` | `THESIS_INVALIDATED` | `TIME_EXIT`
+- Audit log written for every open, close, update, delete event
 
 ## Key Files
 - `client/vite.config.ts` — Vite config with /api proxy to Express port 3001

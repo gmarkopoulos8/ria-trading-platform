@@ -14,12 +14,15 @@ export const RegisterSchema = z.object({
 
 export const OpenPositionSchema = z.object({
   symbol: z.string().min(1).max(20).toUpperCase(),
+  name: z.string().max(100).optional().default(''),
+  assetClass: z.enum(['stock', 'crypto', 'etf']).optional().default('stock'),
   side: z.enum(['long', 'short']),
   quantity: z.number().positive('Quantity must be positive'),
   entryPrice: z.number().positive('Entry price must be positive'),
   targetPrice: z.number().positive().optional(),
   stopLoss: z.number().positive().optional(),
-  thesis: z.string().min(1, 'Thesis is required').max(1000),
+  thesis: z.string().min(1, 'Thesis is required').max(2000),
+  thesisHealth: z.number().min(0).max(100).optional(),
   tags: z.array(z.string()).optional(),
 });
 
