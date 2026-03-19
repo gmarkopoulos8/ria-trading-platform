@@ -203,6 +203,16 @@ export const api = {
     orderHistory:     (limit?: number)           => get('/hyperliquid/order-history', limit ? { limit } : {}),
   },
 
+  autotrader: {
+    status: () => get('/autotrader/status'),
+    enable: () => post('/autotrader/enable'),
+    disable: () => post('/autotrader/disable'),
+    updateConfig: (body: unknown) => put('/autotrader/config', body),
+    runCycle: () => post('/autotrader/run-cycle'),
+    logs: (params?: Record<string, unknown>) => get('/autotrader/logs', params),
+    signalsPreview: () => get('/autotrader/signals/preview'),
+  },
+
   scans: {
     trigger: (body?: {
       runType?: string;

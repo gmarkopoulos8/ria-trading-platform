@@ -16,9 +16,11 @@ import dailyScansRouter from './routes/daily-scans';
 import stocksRouter from './routes/stocks';
 import hyperliquidRouter from './routes/hyperliquid';
 import tosRouter from './routes/tos';
+import autotraderRouter from './routes/autotrader';
 import { errorHandler, notFoundHandler } from './middleware/errorHandler';
 import { monitorAllOpenPositions } from './services/monitoring/PositionMonitor';
 import { startDailyScanScheduler } from './services/scans/dailyScanScheduler';
+import { startIntradayMonitor } from './services/autotrader/IntradayMonitorLoop';
 
 const app = express();
 const PORT = process.env.PORT ?? 3001;
@@ -106,6 +108,7 @@ app.use('/api/daily-scans', dailyScansRouter);
 app.use('/api/stocks', stocksRouter);
 app.use('/api/hyperliquid', hyperliquidRouter);
 app.use('/api/tos', tosRouter);
+app.use('/api/autotrader', autotraderRouter);
 
 app.use('/api/*', notFoundHandler);
 app.use(errorHandler);
@@ -126,6 +129,7 @@ app.listen(PORT, () => {
   }, 15_000);
 
   startDailyScanScheduler();
+  startIntradayMonitor();
 
   setInterval(() => {
     monitorAllOpenPositions().catch((err) => {

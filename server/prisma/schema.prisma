@@ -46,11 +46,14 @@ model UserSettings {
   stocksApiKey         String?
   cryptoApiKey         String?
   preferences          Json?
+  autoTradeEnabled     Boolean  @default(false)
+  autoTradeConfig      Json?
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
-  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+  user       User           @relation(fields: [userId], references: [id], onDelete: Cascade)
+  autoTradeLogs AutoTradeLog[]
 
   @@map("user_settings")
 }
@@ -689,6 +692,45 @@ model DailyMarketReport {
 
   @@index([reportDate])
   @@map("daily_market_reports")
+}
+
+// ─── Auto Trader ──────────────────────────────────────────────────
+
+model AutoTradeLog {
+  id                    String   @id @default(cuid())
+  userSettingsId        String
+  sessionId             String
+  phase                 String
+  exchange              String
+  symbol                String
+  assetClass            String   @default("stock")
+  action                String
+  status                String   @default("PENDING")
+  dryRun                Boolean  @default(true)
+  quantity              Float?
+  entryPrice            Float?
+  exitPrice             Float?
+  pnl                   Float?
+  reason                String?
+  stopLoss              Float?
+  takeProfit            Float?
+  circuitBreakerTripped Boolean  @default(false)
+  circuitBreakerReason  String?
+  positionSizePct       Float?
+  convictionScore       Float?
+  metadata              Json?
+  executedAt            DateTime @default(now())
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  userSettings UserSettings @relation(fields: [userSettingsId], references: [id], onDelete: Cascade)
+
+  @@index([userSettingsId, executedAt])
+  @@index([symbol, executedAt])
+  @@index([sessionId])
+  @@index([status])
+  @@map("auto_trade_logs")
 }
 
 // ─── Enums ───────────────────────────────────────────────────────

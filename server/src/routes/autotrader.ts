@@ -1,0 +1,198 @@
+import { Router, type Request, type Response } from 'express';
+import { requireAuth } from '../middleware/requireAuth';
+import { prisma } from '../lib/prisma';
+import { runTradingCycle, DEFAULT_AUTO_TRADE_CONFIG, type AutoTradeConfig } from '../services/autotrader/AutoTradeExecutor';
+import { buildSignalsFromLatestScan } from '../services/scans/dynamicUniverseService';
+import { getPortfolioState } from '../services/portfolio/PortfolioStateService';
+import { checkCircuitBreakers } from '../services/autotrader/CircuitBreaker';
+
+const router = Router();
+router.use(requireAuth);
+
+async function getUserSettings(userId: string) {
+  let settings = await prisma.userSettings.findUnique({ where: { userId } });
+  if (!settings) {
+    settings = await prisma.userSettings.create({ data: { userId } });
+  }
+  return settings;
+}
+
+function parseConfig(settings: { autoTradeConfig: unknown; autoTradeEnabled: boolean }): AutoTradeConfig {
+  const raw = typeof settings.autoTradeConfig === 'object' && settings.autoTradeConfig !== null
+    ? (settings.autoTradeConfig as Partial<AutoTradeConfig>)
+    : {};
+  return { ...DEFAULT_AUTO_TRADE_CONFIG, ...raw, enabled: settings.autoTradeEnabled };
+}
+
+router.get('/status', async (req: Request, res: Response) => {
+  try {
+    const userId = req.session!.userId as string;
+    const settings = await getUserSettings(userId);
+    const config = parseConfig(settings);
+    const portfolioState = await getPortfolioState();
+
+    const todayStart = new Date();
+    todayStart.setHours(0, 0, 0, 0);
+    const todayStats = await prisma.autoTradeLog.aggregate({
+      where: { userSettingsId: settings.id, executedAt: { gte: todayStart } },
+      _count: { id: true },
+      _sum: { pnl: true },
+    });
+
+    const activeCount = await prisma.autoTradeLog.count({
+      where: { userSettingsId: settings.id, status: { in: ['FILLED', 'DRY_RUN'] }, phase: 'ENTRY' },
+    });
+
+    const cbResult = await checkCircuitBreakers({
+      exchange: config.exchange,
+      dailyLossLimit: config.dailyLossLimit,
+      maxDrawdownPct: config.maxDrawdownPct,
+      maxOpenPositions: config.maxOpenPositions,
+      currentOpenPositions: portfolioState.openPositionCount,
+      currentEquity: portfolioState.totalEquity,
+    }, settings.id);
+
+    res.json({
+      success: true,
+      data: {
+        enabled: settings.autoTradeEnabled,
+        config,
+        portfolioState,
+        todayTradeCount: todayStats._count.id,
+        todayPnl: todayStats._sum.pnl ?? 0,
+        activePositionCount: activeCount,
+        circuitBreaker: cbResult,
+      },
+    });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err instanceof Error ? err.message : 'Status error' });
+  }
+});
+
+router.post('/enable', async (req: Request, res: Response) => {
+  try {
+    const userId = req.session!.userId as string;
+    const settings = await getUserSettings(userId);
+    await prisma.userSettings.update({ where: { id: settings.id }, data: { autoTradeEnabled: true } });
+    res.json({ success: true, data: { enabled: true } });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err instanceof Error ? err.message : 'Enable error' });
+  }
+});
+
+router.post('/disable', async (req: Request, res: Response) => {
+  try {
+    const userId = req.session!.userId as string;
+    const settings = await getUserSettings(userId);
+    await prisma.userSettings.update({ where: { id: settings.id }, data: { autoTradeEnabled: false } });
+    res.json({ success: true, data: { enabled: false } });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err instanceof Error ? err.message : 'Disable error' });
+  }
+});
+
+router.put('/config', async (req: Request, res: Response) => {
+  try {
+    const userId = req.session!.userId as string;
+    const settings = await getUserSettings(userId);
+    const current = parseConfig(settings);
+    const updated: AutoTradeConfig = { ...current, ...req.body };
+    updated.maxPositionPct = Math.min(10, Math.max(0.5, updated.maxPositionPct));
+    await prisma.userSettings.update({
+      where: { id: settings.id },
+      data: { autoTradeConfig: updated as object },
+    });
+    res.json({ success: true, data: { config: updated } });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err instanceof Error ? err.message : 'Config error' });
+  }
+});
+
+router.post('/run-cycle', async (req: Request, res: Response) => {
+  try {
+    const userId = req.session!.userId as string;
+    const settings = await getUserSettings(userId);
+    const config = parseConfig(settings);
+
+    if (!config.enabled) {
+      return res.status(400).json({ success: false, error: 'Auto-trading is disabled. Enable it first.' });
+    }
+
+    const signals = await buildSignalsFromLatestScan({
+      minConvictionScore: config.minConvictionScore,
+      minConfidenceScore: config.minConfidenceScore,
+      allowedBiases: config.allowedBiases,
+      maxSymbols: config.maxOpenPositions,
+    });
+
+    if (signals.length === 0) {
+      return res.json({ success: true, data: { message: 'No qualifying signals from latest scan', results: [] } });
+    }
+
+    const results = await runTradingCycle(settings.id, config, signals);
+    const filled = results.filter((r) => r.status === 'FILLED' || r.status === 'DRY_RUN');
+    const blocked = results.filter((r) => r.status === 'BLOCKED' || r.status === 'REJECTED');
+    const errors = results.filter((r) => r.status === 'ERROR');
+
+    res.json({
+      success: true,
+      data: {
+        signalCount: signals.length,
+        results,
+        summary: {
+          filled: filled.length,
+          blocked: blocked.length,
+          errors: errors.length,
+          dryRun: config.dryRun,
+        },
+      },
+    });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err instanceof Error ? err.message : 'Cycle run error' });
+  }
+});
+
+router.get('/logs', async (req: Request, res: Response) => {
+  try {
+    const userId = req.session!.userId as string;
+    const settings = await getUserSettings(userId);
+    const limit = Math.min(100, parseInt(String(req.query.limit ?? '50'), 10));
+    const status = req.query.status as string | undefined;
+    const phase = req.query.phase as string | undefined;
+
+    const where: Record<string, unknown> = { userSettingsId: settings.id };
+    if (status) where.status = status;
+    if (phase) where.phase = phase;
+
+    const logs = await prisma.autoTradeLog.findMany({
+      where,
+      orderBy: { executedAt: 'desc' },
+      take: limit,
+    });
+
+    res.json({ success: true, data: { logs, count: logs.length } });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err instanceof Error ? err.message : 'Logs error' });
+  }
+});
+
+router.get('/signals/preview', async (req: Request, res: Response) => {
+  try {
+    const userId = req.session!.userId as string;
+    const settings = await getUserSettings(userId);
+    const config = parseConfig(settings);
+
+    const signals = await buildSignalsFromLatestScan({
+      minConvictionScore: config.minConvictionScore,
+      minConfidenceScore: config.minConfidenceScore,
+      allowedBiases: config.allowedBiases,
+      maxSymbols: 20,
+    });
+
+    res.json({ success: true, data: { signals, count: signals.length } });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err instanceof Error ? err.message : 'Signals error' });
+  }
+});
+
+export default router;

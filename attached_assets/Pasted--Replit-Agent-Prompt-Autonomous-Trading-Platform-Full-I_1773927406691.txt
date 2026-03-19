@@ -1,0 +1,445 @@
+# Replit Agent Prompt — Autonomous Trading Platform (Full Implementation)
+
+Paste this entire prompt into Replit Agent. It references your existing codebase and tells the agent exactly what to build, file by file, without breaking anything that already works.
+
+-----
+
+## CONTEXT
+
+This is an existing full-stack TypeScript trading platform (“RIA BOT”) with:
+
+- **Frontend**: React + Vite + TailwindCSS, React Router v6, TanStack Query
+- **Backend**: Node.js + Express + Prisma (PostgreSQL)
+- **Exchange integrations**: Hyperliquid (crypto perps) and Schwab/ThinkorSwim (equities/options)
+- **AI Analysis**: Multi-agent ThesisEngine (MarketStructure → Catalyst → Risk → Thesis agents)
+- **Existing tabs/pages**: Dashboard, Daily Scan, Stock Health, Hyperliquid, Thinkorswim, Opportunity Scanner, Symbol Intelligence, Paper Portfolio, Alert Center, Catalyst Intelligence, Risk Console, Performance Lab, Settings
+
+The platform currently performs analysis and paper trading. The goal is to make it **fully autonomous** — meaning the system scans markets, scores opportunities, decides position sizing, executes live trades on both exchanges, monitors open positions, and auto-exits based on thesis health — all without manual intervention.
+
+**Do NOT remove, rename, or restructure any existing pages, routes, components, or nav items. All existing functionality must continue to work.**
+
+-----
+
+## WHAT TO BUILD
+
+### PHASE 1 — Core Autonomous Engine (Backend)
+
+-----
+
+#### 1A. Portfolio State Service
+
+**File**: `server/src/services/portfolio/PortfolioStateService.ts`
+
+Create a unified service that aggregates live state from both exchanges:
+
+```typescript
+interface LivePortfolioState {
+  tos: {
+    buyingPower: number;
+    equity: number;
+    openPositions: Array<{ symbol: string; quantity: number; averagePrice: number; currentPnl: number; assetType: string }>;
+    openOrderSymbols: string[];
+    isConnected: boolean;
+  };
+  hl: {
+    accountValue: number;
+    availableMargin: number;
+    openPositions: Array<{ asset: string; size: number; entryPrice: number; unrealizedPnl: number; side: 'long' | 'short' }>;
+    openOrderAssets: string[];
+    isConnected: boolean;
+  };
+  combinedExposure: Map<string, number>; // ticker → notional USD exposure
+  totalEquity: number;
+  dailyPnl: number;
+}
+```
+
+- Call `getPrimaryAccount()` from `tosInfoService` to get TOS state
+- Call `getUserState()` from `hyperliquidInfoService` to get HL state
+- Implement `getPortfolioState(): Promise<LivePortfolioState>`
+- Implement `isAlreadyHolding(ticker: string): Promise<boolean>` — checks both exchanges
+- Implement `hasOpenOrder(ticker: string): Promise<boolean>` — checks order logs in DB and live exchange
+- Implement `getTotalExposurePct(ticker: string): Promise<number>` — current position notional / total equity
+- Cache state for 30 seconds to avoid hammering exchange APIs
+
+-----
+
+#### 1B. Position Sizer
+
+**File**: `server/src/services/portfolio/PositionSizer.ts`
+
+```typescript
+interface SizingInput {
+  exchange: 'tos' | 'hyperliquid';
+  ticker: string;
+  entryPrice: number;
+  stopLossPrice: number; // invalidation zone level from ThesisEngine
+  convictionScore: number; // 0–100
+  riskMode: 'CONSERVATIVE' | 'MODERATE' | 'AGGRESSIVE';
+  portfolioState: LivePortfolioState;
+}
+
+interface SizingOutput {
+  quantity: number; // shares for TOS, contracts/units for HL
+  notionalValue: number;
+  riskAmount: number; // dollars at risk if stop hit
+  riskPct: number; // % of portfolio at risk
+  leverageUsed: number; // for HL
+  reasoning: string;
+}
+```
+
+Implement `calculatePositionSize(input: SizingInput): SizingOutput`:
+
+- Base risk per trade: 1% of portfolio equity for CONSERVATIVE, 2% for MODERATE, 3% for AGGRESSIVE
+- Scale risk by conviction: multiply base risk by `convictionScore / 100` (so conviction=80 at MODERATE = 1.6% risk)
+- `riskAmount = portfolioEquity × riskPct`
+- `quantity = riskAmount / (entryPrice - stopLossPrice)` (absolute distance)
+- For Hyperliquid: clamp leverage to max 5x, calculate contract size in USD
+- Hard limits: never exceed 10% portfolio in a single position; never risk more than 5% in one trade regardless of conviction
+- Return quantity = 0 with reasoning if stop is wider than 15% (too risky)
+- Round to nearest whole share for TOS; use HL’s `szDecimals` precision for crypto
+
+-----
+
+#### 1C. Auto Trade Executor
+
+**File**: `server/src/services/autotrader/AutoTradeExecutor.ts`
+
+This is the central bridge between scan results and order execution.
+
+```typescript
+interface AutoTradeConfig {
+  enabled: boolean;
+  minConvictionScore: number; // default 78
+  maxConcurrentPositions: number; // default 5 total, across both exchanges
+  maxPositionsPerExchange: number; // default 3
+  riskMode: 'CONSERVATIVE' | 'MODERATE' | 'AGGRESSIVE';
+  allowedBias: Array<'BULLISH' | 'BEARISH'>; // default ['BULLISH']
+  allowedActions: string[]; // default ['STRONG_BUY', 'BUY']
+  stocksEnabled: boolean;
+  cryptoEnabled: boolean;
+  dryRun: boolean; // mirrors exchange dry run setting
+}
+```
+
+Implement `evaluateAndExecute(scanRunId: string, config: AutoTradeConfig): Promise<ExecutionSummary>`:
+
+1. Load ranked results from `DailyScanResult` for the given `scanRunId`
+1. Filter by: `convictionScore >= config.minConvictionScore`, `bias in config.allowedBias`, `recommendedAction in config.allowedActions`
+1. Sort by `compositeScore` descending — best opportunities first
+1. Load `portfolioState` from `PortfolioStateService`
+1. Count current open positions across both exchanges — skip if already at `maxConcurrentPositions`
+1. For each candidate (up to the open slot count):
+- Skip if `isAlreadyHolding(ticker)` returns true
+- Skip if `hasOpenOrder(ticker)` returns true
+- Skip if `getTotalExposurePct(ticker) > 5%`
+- Determine exchange: use `hyperliquid` if assetClass is `crypto`, use `tos` if `stock` or `etf`
+- Check exchange-specific position count against `maxPositionsPerExchange`
+- Extract `entryZone.low` as entry price, `invalidationZone.level` as stop loss, `takeProfit1.level` as target
+- Call `PositionSizer.calculatePositionSize()` — skip if quantity = 0
+- Place bracket order via `tosExchangeService.placeOrder()` (orderType: ‘BRACKET’, takeProfitPct and stopLossPct derived from levels) or `hyperliquidExchangeService.placeOrder()`
+- Log outcome to new `AutoTradeLog` DB table (see Phase 2)
+1. Return summary: `{ evaluated: n, skipped: n, placed: n, errors: n, positions: [...] }`
+
+Implement `getExecutorConfig(userId: string): Promise<AutoTradeConfig>` — loads from `UserSettings.autoTradeConfig` JSON field (add field in migration)
+
+Implement `saveExecutorConfig(userId: string, config: Partial<AutoTradeConfig>): Promise<void>`
+
+-----
+
+#### 1D. Intraday Monitoring Loop
+
+**File**: `server/src/services/autotrader/IntradayMonitorLoop.ts`
+
+Implement a loop that runs during market hours and triggers auto-exits:
+
+```typescript
+export function startIntradayMonitor(): void
+export function stopIntradayMonitor(): void
+export function getMonitorStatus(): { running: boolean; lastRun: Date | null; nextRun: Date | null; actionsToday: number }
+```
+
+- Poll every 10 minutes during market hours (9:30 AM – 4:00 PM ET weekdays), and every 30 minutes 24/7 for crypto-only positions
+- Call `monitorAllOpenPositions()` from existing `PositionMonitor`
+- After monitoring, query DB for any `MonitoringAlert` with `isRead = false` and `severity IN ('WARNING', 'CRITICAL')` created in the last 15 minutes
+- For each alert matching `alertType IN ('SETUP_INVALIDATED', 'INVALIDATION_THREATENED')`:
+  - Check if `autoTradeConfig.enabled` is true for the position’s owner
+  - If `alertType === 'SETUP_INVALIDATED'`: call `closePosition()` on the appropriate exchange immediately
+  - If `alertType === 'INVALIDATION_THREATENED'` and thesis health < 35: call `closePosition()`
+- For `alertType === 'TARGET_APPROACHED'` (thesis health > 80, proximity < 3%):
+  - Place a reduce-only limit sell/close at the take-profit level
+- Mark acted-upon alerts as read
+- Log all auto-actions to `AutoTradeLog`
+
+-----
+
+#### 1E. Dynamic Universe Expander
+
+**File**: `server/src/services/scans/dynamicUniverseService.ts`
+
+Augment `scanUniverseService.ts` with dynamic discovery (do NOT modify the existing static lists — add on top):
+
+- For crypto: call `getMeta()` from `hyperliquidInfoService` to get all available HL perp markets. Filter to coins with >$10M daily volume (use `getAllMids()` + stored candle data as proxy). Merge with the static crypto list, deduplicating by ticker.
+- For stocks: add a function `getVolumeMovers()` that calls Yahoo Finance’s trending endpoint (`https://query2.finance.yahoo.com/v1/finance/trending/US?count=20`) to get today’s high-volume movers. Parse and add to the scan universe for that run only.
+- Export `buildDynamicUniverse(scope, riskMode): Promise<CandidateAsset[]>` — same signature as existing `buildUniverse` but async and includes dynamic additions
+- In `dailyScanOrchestrator.ts`, replace the call to `buildUniverse()` with `buildDynamicUniverse()` — keep the synchronous fallback if the async call fails
+
+-----
+
+#### 1F. Market Circuit Breaker
+
+**File**: `server/src/services/autotrader/CircuitBreaker.ts`
+
+```typescript
+interface CircuitBreakerState {
+  active: boolean;
+  reason: string | null;
+  triggeredAt: Date | null;
+  autoResetAt: Date | null;
+}
+```
+
+Implement:
+
+- `checkMarketConditions(): Promise<CircuitBreakerState>` — called before any `AutoTradeExecutor.evaluateAndExecute()`:
+  - Fetch SPY quote from market service; if intraday change < -2.5%, activate breaker with reason “SPY_DROP_2PCT”
+  - Check if daily loss from `PerformanceService` exceeds 3% of starting equity; activate with reason “DAILY_LOSS_LIMIT”
+  - Auto-reset at next market open (9:30 AM ET)
+- `activateBreaker(reason: string): void`
+- `resetBreaker(): void`
+- `getBreakerState(): CircuitBreakerState`
+- When circuit breaker is active: block `AutoTradeExecutor`, log a system alert via existing `Alert` model with `type = 'PRICE_ALERT'` and a clear message
+
+-----
+
+### PHASE 2 — Database Schema Updates
+
+Add to `server/prisma/schema.prisma`:
+
+```prisma
+model AutoTradeLog {
+  id              String   @id @default(cuid())
+  userId          String
+  scanRunId       String?
+  ticker          String
+  exchange        String   // 'tos' | 'hyperliquid'
+  action          String   // 'BUY' | 'SELL' | 'CLOSE' | 'SKIP'
+  skipReason      String?
+  convictionScore Float?
+  quantity        Float?
+  entryPrice      Float?
+  stopLoss        Float?
+  takeProfit      Float?
+  notionalValue   Float?
+  riskAmount      Float?
+  orderId         String?
+  isDryRun        Boolean  @default(true)
+  status          String   @default("pending") // 'pending' | 'submitted' | 'failed' | 'skipped'
+  errorMessage    String?
+  metadata        Json?
+  createdAt       DateTime @default(now())
+
+  @@index([userId])
+  @@index([ticker])
+  @@index([createdAt])
+}
+```
+
+Also add `autoTradeConfig Json?` field to the `UserSettings` model.
+
+Run `npx prisma migrate dev --name add_auto_trade_log` after schema changes.
+
+-----
+
+### PHASE 3 — New API Routes
+
+**File**: `server/src/routes/autotrader.ts`
+
+```
+GET  /api/autotrader/status         → executor config + circuit breaker state + monitor status + today's AutoTradeLogs summary
+GET  /api/autotrader/config         → load user's AutoTradeConfig
+PUT  /api/autotrader/config         → save user's AutoTradeConfig  
+POST /api/autotrader/run            → manually trigger evaluateAndExecute() against latest scan run
+GET  /api/autotrader/logs           → paginated AutoTradeLog for user (?limit=50&offset=0)
+GET  /api/autotrader/logs/today     → today's logs only
+POST /api/autotrader/circuit-breaker/reset  → manually reset circuit breaker
+GET  /api/autotrader/portfolio      → getPortfolioState() combined view
+```
+
+Register this router in `server/src/index.ts` under `/api/autotrader`.
+
+Also add `autotrader` routes to existing `client/src/api/client.ts` API client.
+
+-----
+
+### PHASE 4 — Integrate with Daily Scan Scheduler
+
+In `server/src/services/scans/dailyScanScheduler.ts`, after a successful scan run completes, automatically call `AutoTradeExecutor.evaluateAndExecute(scanRunId, config)` if:
+
+- The user’s `autoTradeConfig.enabled` is `true`
+- `CircuitBreaker.getBreakerState().active` is `false`
+- The scan type is `'SCHEDULED'` or `'PREMARKET'` (not manual)
+
+Also add a **mid-day scan** trigger at 12:00 PM ET and a **pre-close scan** at 3:30 PM ET using the existing `schedulerTick` pattern.
+
+For crypto: add a separate 30-minute interval for crypto-only scans that runs 24/7 (not just market hours), scoped to `assetScope: 'CRYPTO_ONLY'`.
+
+-----
+
+### PHASE 5 — Frontend: Auto Trader Control Center
+
+Add a **new page** for the autonomous trading controls. This is a new tab added to the sidebar.
+
+**File**: `client/src/pages/AutoTrader.tsx`
+
+Design it as a dark terminal-style dashboard consistent with the existing app design (dark backgrounds, accent-blue/green/red colors, monospace fonts for numbers). It should have these sections:
+
+#### Section 1 — Master Control Panel
+
+- Large prominent toggle: **“Autonomous Trading: ON / OFF”** — calls `PUT /api/autotrader/config` with `{ enabled: true/false }`. When ON, show a pulsing green indicator. When OFF, show grey.
+- “DRY RUN MODE” badge — shows whether orders are simulated or live. Toggle via config update.
+- Circuit Breaker status card — shows active/inactive with reason and reset button if active
+- “Run Now” button — manually triggers `POST /api/autotrader/run` against the latest scan
+
+#### Section 2 — Configuration Panel (collapsible)
+
+Form fields for AutoTradeConfig:
+
+- Min Conviction Score (slider 50–95, default 78)
+- Risk Mode (radio: Conservative / Moderate / Aggressive)
+- Max Concurrent Positions (number input 1–10)
+- Max Per Exchange (number input 1–5)
+- Stocks Enabled (toggle)
+- Crypto Enabled (toggle)
+- Allowed Bias (checkboxes: Bullish / Bearish)
+- Save Config button
+
+#### Section 3 — Live Portfolio State (two-column: TOS | Hyperliquid)
+
+Pulled from `GET /api/autotrader/portfolio`. For each exchange show:
+
+- Account equity / buying power
+- Number of open positions
+- Each open position as a row: symbol, size, entry price, current P&L (green/red)
+- Connection status badge (Connected / Not Configured)
+- Refresh button
+
+#### Section 4 — Today’s Auto Trade Activity
+
+Table of today’s `AutoTradeLog` entries with columns:
+
+- Time, Ticker, Exchange, Action, Conviction, Quantity, Entry, Stop, Target, Status, Dry Run badge
+- Color code rows: green for BUY submitted, red for CLOSE, yellow for SKIP, grey for failed
+- Auto-refresh every 60 seconds via TanStack Query
+
+#### Section 5 — Monitor Status
+
+- Shows `IntradayMonitorLoop` status: running/stopped, last run time, next run time, actions taken today
+- List of any circuit breaker events from today
+
+Add the new route to `client/src/App.tsx`:
+
+```tsx
+<Route path="autotrader" element={<AutoTrader />} />
+```
+
+Add to the sidebar in `client/src/components/layout/Sidebar.tsx` — insert after the “Thinkorswim” nav item:
+
+```typescript
+{ path: '/autotrader', label: 'Auto Trader', icon: Bot, description: 'Autonomous execution · live' }
+```
+
+Import `Bot` from `lucide-react`.
+
+-----
+
+### PHASE 6 — Wire Everything Up at Startup
+
+In `server/src/index.ts`, after all routes are registered and the DB connection is verified:
+
+```typescript
+import { startIntradayMonitor } from './services/autotrader/IntradayMonitorLoop';
+import { startDailyScanScheduler } from './services/scans/dailyScanScheduler';
+
+// Start autonomous systems
+startDailyScanScheduler();
+startIntradayMonitor();
+```
+
+-----
+
+### PHASE 7 — Existing Page Enhancements (Non-Breaking)
+
+#### 7A. Daily Scan Page (`client/src/pages/DailyScan.tsx`)
+
+Add a small banner at the top that shows:
+
+- Whether Auto Trader is enabled/disabled
+- How many auto trades were placed from the last scan
+- A link to the Auto Trader page
+
+#### 7B. Paper Portfolio Page (`client/src/pages/PaperPortfolio.tsx`)
+
+Add a toggle at the top to switch the view between “Paper Positions” (existing) and “Live Positions” (pulls from `GET /api/autotrader/portfolio`). The live positions view shows real TOS and HL positions side by side.
+
+#### 7C. Settings Page (`client/src/pages/Settings.tsx`)
+
+Add a new “Autonomous Trading” section with a link to the Auto Trader page and a quick-toggle for enabling/disabling.
+
+-----
+
+## IMPLEMENTATION NOTES
+
+- All new backend services must follow the existing pattern: class or exported functions, no default class exports where the file already uses named exports
+- Use existing `prisma` import from `../../lib/prisma`
+- All new routes must use `requireAuth` middleware (import from `../middleware/requireAuth`)
+- Follow existing error handling pattern: wrap in try/catch, return `{ success: false, error: message }` on failure
+- TypeScript strict mode is enabled — no `any` casts except where interfacing with external API responses
+- Do not install new npm packages unless absolutely necessary — prefer using packages already in `package.json`
+- The `DRY_RUN` flag on both exchanges should be respected by `AutoTradeExecutor` — when `dryRun: true` in config, log the would-be action but do not call `placeOrder()`
+- For the `AutoTrader.tsx` frontend page, use the same Tailwind classes and component patterns as existing pages (e.g., `bg-surface-1`, `border-surface-border`, `text-accent-blue`, `text-accent-green`)
+- Use TanStack Query (`useQuery`, `useMutation`) for all API calls in the frontend, matching existing patterns in `DailyScan.tsx` and `HyperliquidDashboard.tsx`
+- All monetary values displayed in the UI should use 2 decimal places; scores use 0 decimal places
+
+-----
+
+## SAFETY REQUIREMENTS (Non-Negotiable)
+
+- `AutoTradeExecutor` must check `CircuitBreaker.getBreakerState()` before every execution run
+- `AutoTradeExecutor` must check `isKillswitchActive()` on both `tosConfig` and `hyperliquidConfig` before routing to that exchange
+- If `autoTradeConfig.dryRun = true`, log the action with `isDryRun: true` but never call the actual exchange `placeOrder()` function
+- Position sizing must never return a quantity that would exceed 10% of portfolio equity as notional
+- All auto-placed orders must be logged to `AutoTradeLog` before the order is sent
+- The intraday monitor must never auto-close a position on a paper account (check `PaperPosition.status` — only act on real exchange positions via the live portfolio state)
+- If the circuit breaker is active, the “Run Now” button in the UI should be disabled with a tooltip explaining why
+
+-----
+
+## SUMMARY OF NEW FILES TO CREATE
+
+```
+server/src/services/portfolio/PortfolioStateService.ts
+server/src/services/portfolio/PositionSizer.ts
+server/src/services/autotrader/AutoTradeExecutor.ts
+server/src/services/autotrader/IntradayMonitorLoop.ts
+server/src/services/autotrader/CircuitBreaker.ts
+server/src/services/scans/dynamicUniverseService.ts
+server/src/routes/autotrader.ts
+client/src/pages/AutoTrader.tsx
+```
+
+## SUMMARY OF FILES TO MODIFY (carefully, non-breaking)
+
+```
+server/prisma/schema.prisma              → add AutoTradeLog model, autoTradeConfig field
+server/src/index.ts                      → register /api/autotrader route, start monitor
+server/src/services/scans/dailyScanScheduler.ts  → add mid-day/pre-close/crypto scans + post-scan executor trigger
+server/src/services/scans/dailyScanOrchestrator.ts → swap buildUniverse → buildDynamicUniverse
+client/src/App.tsx                       → add /autotrader route
+client/src/components/layout/Sidebar.tsx → add Auto Trader nav item
+client/src/api/client.ts                 → add autotrader API methods
+client/src/pages/DailyScan.tsx           → add auto trader status banner
+client/src/pages/PaperPortfolio.tsx      → add live positions toggle
+client/src/pages/Settings.tsx            → add autonomous trading section
+```

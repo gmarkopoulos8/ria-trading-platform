@@ -17,6 +17,7 @@ import TosDashboard from './pages/tos/TosDashboard';
 import StockHealthAnalyzer from './pages/StockHealthAnalyzer';
 import ScanReport from './pages/ScanReport';
 import ScanHistory from './pages/ScanHistory';
+import AutoTrader from './pages/AutoTrader';
 import Login from './pages/Login';
 import Register from './pages/Register';
 
@@ -52,6 +53,7 @@ export default function App() {
           <Route path="scan-history" element={<ScanHistory />} />
           <Route path="hyperliquid" element={<HyperliquidDashboard />} />
           <Route path="tos" element={<TosDashboard />} />
+          <Route path="autotrader" element={<AutoTrader />} />
         </Route>
 
         <Route path="*" element={<Navigate to="/dashboard" replace />} />

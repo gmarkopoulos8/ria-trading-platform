@@ -15,6 +15,7 @@ import {
   HeartPulse,
   Activity,
   BarChart2,
+  Bot,
 } from 'lucide-react';
 import { cn } from '../../lib/utils';
 import { api } from '../../api/client';
@@ -26,6 +27,7 @@ const navItems = [
   { path: '/stock-health', label: 'Stock Health', icon: HeartPulse, description: 'NYSE health analyzer' },
   { path: '/hyperliquid', label: 'Hyperliquid', icon: Activity, description: 'Perpetual DEX · live trading' },
   { path: '/tos', label: 'Thinkorswim', icon: BarChart2, description: 'Schwab API · equities · options · futures' },
+  { path: '/autotrader', label: 'Auto Trader', icon: Bot, description: 'Autonomous AI order execution' },
   { path: '/scanner', label: 'Opportunity Scanner', icon: ScanSearch, description: 'AI-scored picks' },
   { path: '/symbol', label: 'Symbol Intelligence', icon: LineChart, description: 'Deep dive' },
   { path: '/portfolio', label: 'Paper Portfolio', icon: Briefcase, description: 'Active positions' },
