@@ -1,0 +1,330 @@
+# Replit Agent Prompt — Fix Alpaca Tab Mobile Disappearing Bug
+
+This is a targeted bug fix. Do not change anything outside the files listed below.
+
+-----
+
+## ROOT CAUSES
+
+There are three bugs working together to cause the Alpaca tab to flash and disappear on mobile:
+
+**Bug 1 — AppShell double-close on mobile nav tap**
+In `client/src/components/layout/AppShell.tsx`, the mobile sidebar closes via `useEffect` on route change AND via the backdrop overlay `onClick`. On mobile, tapping a nav link inside the open sidebar can fire the backdrop `onClick` before the route change completes, causing a visual race condition where the new page renders for a frame then gets wiped.
+
+**Bug 2 — AlpacaDashboard fires 6 parallel API queries on mount with no error boundary**
+`AlpacaDashboard` simultaneously fires queries for status, positions, orders, portfolioHistory, orderLog, and scanRuns the moment it mounts. On a slow mobile connection, if any single query throws an unhandled error, React unmounts the entire component with no fallback — the tab “disappears.” There is no error boundary wrapping the component.
+
+**Bug 3 — scanRuns data shape mismatch crashes StrategyReplayCard**
+In `AlpacaDashboard`, the scan runs query does:
+
+```typescript
+api.scans.runs({ limit: 20, status: 'COMPLETED' }).then((r: any) => r.data ?? [])
+```
+
+But `GET /daily-scans/runs` returns `{ success: true, data: { items: [...], total: N, page: N } }` — a paginated object, not an array. So `r.data` is `{ items: [...] }`, not `[]`. The `?? []` fallback never triggers because `r.data` is truthy. `StrategyReplayCard` then receives an object, calls `.map()` on it, and throws — crashing the component tree on mobile where errors are less forgiving.
+
+-----
+
+## FIX 1 — AppShell Mobile Sidebar
+
+**File**: `client/src/components/layout/AppShell.tsx`
+
+The `useEffect` that closes the sidebar on route change is correct — keep it. The problem is the backdrop overlay also fires `onClick` when the user taps a nav link (the tap event bubbles). Fix this by adding a small delay to the `useEffect` close so it doesn’t race with the backdrop, and by preventing the backdrop from firing when the sidebar is already in the process of closing due to navigation.
+
+Replace the existing `AppShell` component with this updated version:
+
+```tsx
+import { useState, useEffect, useRef } from 'react';
+import { Outlet, useLocation } from 'react-router-dom';
+import Sidebar from './Sidebar';
+import TopNav from './TopNav';
+import { cn } from '../../lib/utils';
+
+export default function AppShell() {
+  const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
+  const [mobileSidebarOpen, setMobileSidebarOpen] = useState(false);
+  const location = useLocation();
+  const closingRef = useRef(false);
+
+  useEffect(() => {
+    // Mark as closing so backdrop onClick doesn't double-fire
+    closingRef.current = true;
+    setMobileSidebarOpen(false);
+    // Reset after animation completes
+    const t = setTimeout(() => { closingRef.current = false; }, 300);
+    return () => clearTimeout(t);
+  }, [location.pathname]);
+
+  const handleBackdropClick = () => {
+    // Don't double-close if already closing due to navigation
+    if (!closingRef.current) {
+      setMobileSidebarOpen(false);
+    }
+  };
+
+  return (
+    <div className="flex h-screen overflow-hidden bg-surface-0">
+      <div className="hidden lg:flex flex-shrink-0">
+        <Sidebar collapsed={sidebarCollapsed} />
+      </div>
+
+      {mobileSidebarOpen && (
+        <>
+          <div
+            className="fixed inset-0 z-40 bg-black/60 backdrop-blur-sm lg:hidden"
+            onClick={handleBackdropClick}
+          />
+          <div className={cn(
+            'fixed inset-y-0 left-0 z-50 flex lg:hidden',
+            'animate-in slide-in-from-left duration-200',
+          )}>
+            <Sidebar onClose={() => setMobileSidebarOpen(false)} />
+          </div>
+        </>
+      )}
+
+      <div className="flex-1 flex flex-col min-w-0 overflow-hidden">
+        <TopNav
+          onToggleSidebar={() => {
+            if (window.innerWidth >= 1024) {
+              setSidebarCollapsed(!sidebarCollapsed);
+            } else {
+              setMobileSidebarOpen(!mobileSidebarOpen);
+            }
+          }}
+        />
+        <main className="flex-1 overflow-y-auto p-4 lg:p-6">
+          <div className="max-w-screen-2xl mx-auto animate-fade-in">
+            <Outlet />
+          </div>
+        </main>
+      </div>
+    </div>
+  );
+}
+```
+
+-----
+
+## FIX 2 — Alpaca Dashboard Error Boundary + Query Stabilization
+
+**File**: `client/src/pages/alpaca/AlpacaDashboard.tsx`
+
+Make three targeted changes:
+
+### Change A — Fix the scanRuns data shape
+
+Find this query in the `AlpacaDashboard` component:
+
+```typescript
+const { data: scanRuns } = useQuery({
+  queryKey: ['alpaca-scan-runs'],
+  queryFn: () => api.scans.runs({ limit: 20, status: 'COMPLETED' }).then((r: any) => r.data ?? []),
+  enabled: !!status.hasCredentials,
+});
+```
+
+Replace it with:
+
+```typescript
+const { data: scanRuns } = useQuery({
+  queryKey: ['alpaca-scan-runs'],
+  queryFn: async () => {
+    try {
+      const r: any = await api.scans.runs({ limit: 20, status: 'COMPLETED' });
+      // Handle both paginated { items: [] } and direct array responses
+      const data = r?.data;
+      if (Array.isArray(data)) return data;
+      if (Array.isArray(data?.items)) return data.items;
+      if (Array.isArray(data?.runs)) return data.runs;
+      return [];
+    } catch {
+      return [];
+    }
+  },
+  enabled: !!status.hasCredentials,
+  retry: false,  // don't retry on mobile — fail fast and show empty state
+});
+```
+
+### Change B — Stagger and stabilize the heavy queries
+
+The `portfolioHistory` query fires immediately on mount and is slow on mobile. Add `staleTime` and delay it:
+
+Find:
+
+```typescript
+const { data: histData } = useQuery({
+  queryKey: ['alpaca-portfolio-history'],
+  queryFn: () => api.alpaca.portfolioHistory('1M', '1D').then((r: any) => r.data),
+  enabled: !!status.hasCredentials,
+  refetchInterval: 60_000,
+});
+```
+
+Replace with:
+
+```typescript
+const { data: histData } = useQuery({
+  queryKey: ['alpaca-portfolio-history'],
+  queryFn: () => api.alpaca.portfolioHistory('1M', '1D').then((r: any) => r.data ?? null),
+  enabled: !!status.hasCredentials,
+  refetchInterval: 60_000,
+  staleTime: 5 * 60_000,   // don't refetch if data is less than 5 min old
+  retry: 1,
+});
+```
+
+Also add `retry: false` and `staleTime` to the orderLog query — it’s not critical and shouldn’t block render:
+
+Find:
+
+```typescript
+const { data: orderLog } = useQuery({
+  queryKey: ['alpaca-order-log'],
+  queryFn: () => api.alpaca.orderLog().then((r: any) => r.data ?? []),
+  refetchInterval: 10_000,
+});
+```
+
+Replace with:
+
+```typescript
+const { data: orderLog } = useQuery({
+  queryKey: ['alpaca-order-log'],
+  queryFn: async () => {
+    try {
+      const r: any = await api.alpaca.orderLog();
+      return Array.isArray(r?.data) ? r.data : [];
+    } catch {
+      return [];
+    }
+  },
+  refetchInterval: 30_000,   // slow down — not critical
+  staleTime: 15_000,
+  retry: false,
+});
+```
+
+### Change C — Wrap the entire dashboard in an error boundary
+
+Add this error boundary class at the top of `AlpacaDashboard.tsx`, before the `ConnectPanel` function:
+
+```tsx
+import React from 'react';
+
+class AlpacaErrorBoundary extends React.Component<
+  { children: React.ReactNode },
+  { hasError: boolean; error: string }
+> {
+  constructor(props: any) {
+    super(props);
+    this.state = { hasError: false, error: '' };
+  }
+
+  static getDerivedStateFromError(error: Error) {
+    return { hasError: true, error: error.message };
+  }
+
+  componentDidCatch(error: Error) {
+    console.error('[AlpacaDashboard] Error boundary caught:', error.message);
+  }
+
+  render() {
+    if (this.state.hasError) {
+      return (
+        <div className="flex flex-col items-center justify-center min-h-[40vh] gap-4 p-6">
+          <FlaskConical className="w-10 h-10 text-zinc-600" />
+          <div className="text-center">
+            <p className="text-white font-semibold mb-1">Alpaca Dashboard Error</p>
+            <p className="text-sm text-zinc-400 max-w-sm">{this.state.error || 'Something went wrong loading the Alpaca dashboard.'}</p>
+          </div>
+          <button
+            onClick={() => this.setState({ hasError: false, error: '' })}
+            className="px-4 py-2 bg-violet-600 hover:bg-violet-700 text-white text-sm rounded-lg"
+          >
+            Try Again
+          </button>
+        </div>
+      );
+    }
+    return this.props.children;
+  }
+}
+```
+
+Then wrap the default export. Find the current export:
+
+```typescript
+export default function AlpacaDashboard() {
+```
+
+Change it to an inner function and wrap it:
+
+```typescript
+function AlpacaDashboardInner() {
+  // ... all existing component code unchanged ...
+}
+
+export default function AlpacaDashboard() {
+  return (
+    <AlpacaErrorBoundary>
+      <AlpacaDashboardInner />
+    </AlpacaErrorBoundary>
+  );
+}
+```
+
+Everything inside `AlpacaDashboard()` — all the state, queries, and JSX — moves into `AlpacaDashboardInner()` unchanged. Only the export wrapper changes.
+
+-----
+
+## FIX 3 — Safe Array Rendering in StrategyReplayCard
+
+In `AlpacaDashboard.tsx`, find the `StrategyReplayCard` component where it renders scan runs:
+
+```tsx
+{scanRuns.map((r: any) => (
+  <option key={r.id} value={r.id}>{r.runType} — {new Date(r.createdAt).toLocaleDateString()}</option>
+))}
+```
+
+Add a safety guard so it never calls `.map()` on a non-array:
+
+```tsx
+{(Array.isArray(scanRuns) ? scanRuns : []).map((r: any) => (
+  <option key={r.id} value={r.id}>{r.runType} — {new Date(r.createdAt).toLocaleDateString()}</option>
+))}
+```
+
+-----
+
+## WHAT NOT TO CHANGE
+
+- Do not modify any backend files
+- Do not modify any other frontend pages
+- Do not change the Sidebar component
+- Do not change the TopNav component
+- Do not change the routing in App.tsx
+- Only touch: `AppShell.tsx` and `AlpacaDashboard.tsx`
+
+-----
+
+## SUMMARY OF CHANGES
+
+**`client/src/components/layout/AppShell.tsx`**:
+
+- Add `useRef` import
+- Add `closingRef` to track navigation-triggered closes
+- Replace backdrop `onClick` with `handleBackdropClick` that checks `closingRef`
+- Add 300ms reset timeout after route-change close
+
+**`client/src/pages/alpaca/AlpacaDashboard.tsx`**:
+
+- Add `AlpacaErrorBoundary` class component before `ConnectPanel`
+- Add `React` import (needed for class component)
+- Fix `scanRuns` query to handle paginated `{ items: [] }` response shape
+- Add `staleTime` and `retry: false` to `portfolioHistory` query
+- Slow `orderLog` refetch from 10s to 30s, add try/catch
+- Wrap default export in `AlpacaErrorBoundary`
+- Guard `scanRuns.map()` with `Array.isArray()` check in `StrategyReplayCard`

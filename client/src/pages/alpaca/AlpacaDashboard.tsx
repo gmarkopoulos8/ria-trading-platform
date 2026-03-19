@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import React, { useState } from 'react';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { toast } from 'sonner';
 import {
@@ -32,6 +32,47 @@ function relTime(s: string) {
 const CONTROL_LEVEL_COLOR: Record<string, string> = {
   ACTIVE: 'text-emerald-400', PAUSE: 'text-yellow-400', HARD_STOP: 'text-red-400',
 };
+
+// ─── Error Boundary ──────────────────────────────────────────────────────────
+
+class AlpacaErrorBoundary extends React.Component<
+  { children: React.ReactNode },
+  { hasError: boolean; error: string }
+> {
+  constructor(props: any) {
+    super(props);
+    this.state = { hasError: false, error: '' };
+  }
+
+  static getDerivedStateFromError(error: Error) {
+    return { hasError: true, error: error.message };
+  }
+
+  componentDidCatch(error: Error) {
+    console.error('[AlpacaDashboard] Error boundary caught:', error.message);
+  }
+
+  render() {
+    if (this.state.hasError) {
+      return (
+        <div className="flex flex-col items-center justify-center min-h-[40vh] gap-4 p-6">
+          <FlaskConical className="w-10 h-10 text-zinc-600" />
+          <div className="text-center">
+            <p className="text-white font-semibold mb-1">Alpaca Dashboard Error</p>
+            <p className="text-sm text-zinc-400 max-w-sm">{this.state.error || 'Something went wrong loading the Alpaca dashboard.'}</p>
+          </div>
+          <button
+            onClick={() => this.setState({ hasError: false, error: '' })}
+            className="px-4 py-2 bg-violet-600 hover:bg-violet-700 text-white text-sm rounded-lg"
+          >
+            Try Again
+          </button>
+        </div>
+      );
+    }
+    return this.props.children;
+  }
+}
 
 // ─── Connect Form ────────────────────────────────────────────────────────────
 
@@ -470,7 +511,7 @@ function StrategyReplayCard({ scanRuns }: { scanRuns: any[] }) {
             onChange={e => setSelectedRun(e.target.value)}
           >
             <option value="">Select a scan run…</option>
-            {scanRuns.map((r: any) => (
+            {(Array.isArray(scanRuns) ? scanRuns : []).map((r: any) => (
               <option key={r.id} value={r.id}>{r.runType} — {new Date(r.createdAt).toLocaleDateString()}</option>
             ))}
           </select>
@@ -800,7 +841,7 @@ function DisconnectButton({ onDisconnected }: { onDisconnected: () => void }) {
 
 // ─── Main Dashboard ───────────────────────────────────────────────────────────
 
-export default function AlpacaDashboard() {
+function AlpacaDashboardInner() {
   const qc = useQueryClient();
   const [activeTab, setActiveTab] = useState<'overview' | 'orders' | 'log'>('overview');
 
@@ -828,21 +869,44 @@ export default function AlpacaDashboard() {
 
   const { data: histData } = useQuery({
     queryKey: ['alpaca-portfolio-history'],
-    queryFn: () => api.alpaca.portfolioHistory('1M', '1D').then((r: any) => r.data),
+    queryFn: () => api.alpaca.portfolioHistory('1M', '1D').then((r: any) => r.data ?? null),
     enabled: !!status.hasCredentials,
     refetchInterval: 60_000,
+    staleTime: 5 * 60_000,
+    retry: 1,
   });
 
   const { data: orderLog } = useQuery({
     queryKey: ['alpaca-order-log'],
-    queryFn: () => api.alpaca.orderLog().then((r: any) => r.data ?? []),
-    refetchInterval: 10_000,
+    queryFn: async () => {
+      try {
+        const r: any = await api.alpaca.orderLog();
+        return Array.isArray(r?.data) ? r.data : [];
+      } catch {
+        return [];
+      }
+    },
+    refetchInterval: 30_000,
+    staleTime: 15_000,
+    retry: false,
   });
 
   const { data: scanRuns } = useQuery({
     queryKey: ['alpaca-scan-runs'],
-    queryFn: () => api.scans.runs({ limit: 20, status: 'COMPLETED' }).then((r: any) => r.data ?? []),
+    queryFn: async () => {
+      try {
+        const r: any = await api.scans.runs({ limit: 20, status: 'COMPLETED' });
+        const data = r?.data;
+        if (Array.isArray(data)) return data;
+        if (Array.isArray(data?.items)) return data.items;
+        if (Array.isArray(data?.runs)) return data.runs;
+        return [];
+      } catch {
+        return [];
+      }
+    },
     enabled: !!status.hasCredentials,
+    retry: false,
   });
 
   if (isLoading) return <LoadingState message="Loading Alpaca dashboard…" />;
@@ -1017,4 +1081,12 @@ export default function AlpacaDashboard() {
 
 function Minus({ className }: { className?: string }) {
   return <span className={cn('inline-block w-3.5 h-3.5 text-center leading-none', className)}>—</span>;
+}
+
+export default function AlpacaDashboard() {
+  return (
+    <AlpacaErrorBoundary>
+      <AlpacaDashboardInner />
+    </AlpacaErrorBoundary>
+  );
 }

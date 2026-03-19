@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useRef } from 'react';
 import { Outlet, useLocation } from 'react-router-dom';
 import Sidebar from './Sidebar';
 import TopNav from './TopNav';
@@ -8,10 +8,20 @@ export default function AppShell() {
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
   const [mobileSidebarOpen, setMobileSidebarOpen] = useState(false);
   const location = useLocation();
+  const closingRef = useRef(false);
 
   useEffect(() => {
+    closingRef.current = true;
     setMobileSidebarOpen(false);
+    const t = setTimeout(() => { closingRef.current = false; }, 300);
+    return () => clearTimeout(t);
   }, [location.pathname]);
+
+  const handleBackdropClick = () => {
+    if (!closingRef.current) {
+      setMobileSidebarOpen(false);
+    }
+  };
 
   return (
     <div className="flex h-screen overflow-hidden bg-surface-0">
@@ -23,7 +33,7 @@ export default function AppShell() {
         <>
           <div
             className="fixed inset-0 z-40 bg-black/60 backdrop-blur-sm lg:hidden"
-            onClick={() => setMobileSidebarOpen(false)}
+            onClick={handleBackdropClick}
           />
           <div className={cn(
             'fixed inset-y-0 left-0 z-50 flex lg:hidden',
