@@ -20,13 +20,13 @@ function fmtUsd(n: number): string {
 function fmtCash(n: number): string {
   if (n >= 1_000_000) return `$${(n / 1_000_000).toFixed(2)}M`;
   if (n >= 1_000) return `$${(n / 1_000).toFixed(1)}k`;
-  return `$${n.toFixed(0)}`;
+  return `$${n.toFixed(2)}`;
 }
 
 export default function Dashboard() {
   const navigate = useNavigate();
 
-  const { data: overview, isLoading: ovLoading, isError: ovError, refetch: refetchOverview } = useQuery({
+  const { data: overview, isLoading: ovLoading, refetch: refetchOverview } = useQuery({
     queryKey: ['market-overview'],
     queryFn: api.market.overview,
     refetchInterval: 60_000,
@@ -50,12 +50,44 @@ export default function Dashboard() {
     staleTime: 5 * 60_000,
   });
 
+  const { data: hlData } = useQuery({
+    queryKey: ['hl-status'],
+    queryFn: () => api.hyperliquid.status(),
+    staleTime: 30_000,
+    refetchInterval: 60_000,
+  });
+
+  const { data: tosData } = useQuery({
+    queryKey: ['tos-status'],
+    queryFn: () => api.tos.status(),
+    staleTime: 30_000,
+    refetchInterval: 60_000,
+  });
+
   const portfolio = (portfolioData as any)?.data?.portfolio;
   const openPositions: any[] = (portfolioData as any)?.data?.positions ?? [];
   const recentClosed: any[] = ((portfolioData as any)?.data?.closed ?? []).slice(0, 5);
   const unreadAlerts = (alertData as any)?.data?.count ?? 0;
   const opps = (oppsData as any)?.data?.opportunities ?? [];
   const movers = (overview as any)?.data?.movers ?? [];
+
+  const hlStatus = (hlData as any)?.data;
+  const tosStatus = (tosData as any)?.data;
+
+  const hlAccountValue   = parseFloat(hlStatus?.userState?.marginSummary?.accountValue  ?? '0') || 0;
+  const hlUnrealizedPnl  = hlStatus?.userState
+    ? (hlStatus.userState.assetPositions ?? []).reduce((s: number, ap: any) => s + parseFloat(ap.position.unrealizedPnl ?? '0'), 0)
+    : 0;
+
+  const tosEquity        = tosStatus?.balances?.equity ?? 0;
+  const tosUnrealizedPnl = tosStatus?.unrealizedPnl    ?? 0;
+
+  const combinedValue    = hlAccountValue + tosEquity;
+  const combinedPnl      = hlUnrealizedPnl + tosUnrealizedPnl;
+
+  const hlConnected  = !!(hlStatus?.hasCredentials);
+  const tosConnected = !!(tosStatus?.hasCredentials);
+  const anyConnected = hlConnected || tosConnected;
 
   const isLoading = ovLoading || portLoading;
 
@@ -64,11 +96,16 @@ export default function Dashboard() {
       <div className="flex items-start justify-between flex-wrap gap-3">
         <div>
           <h1 className="text-xl font-bold text-white">Market Dashboard</h1>
-          <p className="text-sm text-slate-500 font-mono mt-0.5">AI Intelligence Terminal · Paper Trading Mode</p>
+          <p className="text-sm text-slate-500 font-mono mt-0.5">
+            {anyConnected
+              ? `Live Accounts · ${hlConnected ? 'Hyperliquid' : ''}${hlConnected && tosConnected ? ' + ' : ''}${tosConnected ? 'Thinkorswim' : ''}`
+              : 'AI Intelligence Terminal · Connect accounts to see live balances'}
+          </p>
         </div>
         <div className="flex items-center gap-2 flex-wrap">
           <Badge variant="success" dot>Live Data</Badge>
-          <Badge variant="warning">Paper Mode</Badge>
+          {hlConnected  && <Badge variant="info">Hyperliquid</Badge>}
+          {tosConnected && <Badge variant="info">Thinkorswim</Badge>}
           <button
             onClick={() => refetchOverview()}
             className="p-1.5 rounded-lg text-slate-500 hover:text-white hover:bg-surface-3 transition-colors"
@@ -79,22 +116,38 @@ export default function Dashboard() {
         </div>
       </div>
 
-      <div className="grid grid-cols-2 md:grid-cols-3 xl:grid-cols-6 gap-3">
+      {/* ── Live Account Value row ── */}
+      <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
         <StatCard
-          label="Portfolio Value"
-          value={portfolio ? fmtCash(portfolio.portfolioValue) : '$100k'}
+          label="Combined Portfolio"
+          value={anyConnected ? fmtCash(combinedValue) : '—'}
           icon={<DollarSign className="h-4 w-4" />}
           color="blue"
         />
         <StatCard
-          label="Total P&L"
-          value={portfolio ? fmtUsd(portfolio.totalPnl) : '$0'}
-          change={portfolio?.totalPnlPct ?? 0}
+          label="Unrealized P&L"
+          value={anyConnected ? fmtUsd(combinedPnl) : '—'}
           icon={<TrendingUp className="h-4 w-4" />}
-          color={portfolio?.totalPnl >= 0 ? 'green' : 'red'}
+          color={combinedPnl >= 0 ? 'green' : 'red'}
         />
         <StatCard
-          label="Open Positions"
+          label="Hyperliquid"
+          value={hlConnected ? fmtCash(hlAccountValue) : 'Not connected'}
+          icon={<Activity className="h-4 w-4" />}
+          color={hlConnected ? 'purple' : 'amber'}
+        />
+        <StatCard
+          label="Thinkorswim"
+          value={tosConnected ? fmtCash(tosEquity) : 'Not connected'}
+          icon={<BarChart2 className="h-4 w-4" />}
+          color={tosConnected ? 'cyan' : 'amber'}
+        />
+      </div>
+
+      {/* ── Secondary stats ── */}
+      <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
+        <StatCard
+          label="Research Positions"
           value={portfolio?.openCount ?? 0}
           icon={<Target className="h-4 w-4" />}
           color="amber"
@@ -119,11 +172,34 @@ export default function Dashboard() {
         />
       </div>
 
+      {/* ── Connection prompt if no accounts ── */}
+      {!anyConnected && (
+        <div className="p-4 rounded-xl bg-amber-500/5 border border-amber-500/20">
+          <div className="flex items-start gap-3">
+            <AlertTriangle className="h-4 w-4 text-amber-400 flex-shrink-0 mt-0.5" />
+            <div>
+              <p className="text-sm font-semibold text-amber-400">No trading accounts connected</p>
+              <p className="text-xs text-amber-400/70 mt-1">
+                Set your Hyperliquid or Schwab/Thinkorswim credentials in Replit Secrets to see live portfolio values here.
+              </p>
+              <div className="flex gap-3 mt-2">
+                <button onClick={() => navigate('/hyperliquid')} className="text-xs text-accent-blue hover:underline flex items-center gap-1">
+                  Hyperliquid setup <ArrowRight className="h-3 w-3" />
+                </button>
+                <button onClick={() => navigate('/tos')} className="text-xs text-accent-blue hover:underline flex items-center gap-1">
+                  Thinkorswim setup <ArrowRight className="h-3 w-3" />
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
         <Card className="lg:col-span-2">
           <CardHeader
-            title="Open Positions"
-            subtitle="Active paper trades"
+            title="Research Positions"
+            subtitle="Tracked paper trades"
             icon={<Target className="h-4 w-4" />}
             action={
               <button
@@ -139,7 +215,7 @@ export default function Dashboard() {
           ) : openPositions.length === 0 ? (
             <div className="flex flex-col items-center justify-center h-32 border border-dashed border-surface-border rounded-lg gap-2">
               <Target className="h-8 w-8 text-slate-700" />
-              <p className="text-slate-600 text-sm">No open positions · Start paper trading</p>
+              <p className="text-slate-600 text-sm">No research trades · Start tracking</p>
               <button
                 onClick={() => navigate('/scanner')}
                 className="text-xs text-accent-blue hover:text-accent-blue/70 transition-colors flex items-center gap-1"
@@ -295,7 +371,7 @@ export default function Dashboard() {
         <Card>
           <CardHeader
             title="Recent Closed Trades"
-            subtitle="Performance history"
+            subtitle="Research history"
             icon={<BarChart2 className="h-4 w-4" />}
             action={
               <button
@@ -348,10 +424,10 @@ export default function Dashboard() {
 
       {portfolio && portfolio.closedCount > 0 && (
         <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
-          <StatCard label="Cash Balance" value={fmtCash(portfolio.cashBalance)} icon={<DollarSign className="h-4 w-4" />} color="blue" />
           <StatCard label="Profit Factor" value={portfolio.profitFactor >= 99 ? '∞' : portfolio.profitFactor.toFixed(2)} icon={<Activity className="h-4 w-4" />} color="amber" />
-          <StatCard label="Total Wins" value={portfolio.wins} icon={<TrendingUp className="h-4 w-4" />} color="green" />
-          <StatCard label="Total Losses" value={portfolio.losses} icon={<TrendingDown className="h-4 w-4" />} color="red" />
+          <StatCard label="Total Wins"    value={portfolio.wins}   icon={<TrendingUp   className="h-4 w-4" />} color="green" />
+          <StatCard label="Total Losses"  value={portfolio.losses} icon={<TrendingDown className="h-4 w-4" />} color="red" />
+          <StatCard label="Closed Trades" value={portfolio.closedCount} icon={<BarChart2 className="h-4 w-4" />} color="blue" />
         </div>
       )}
     </div>
