@@ -53,7 +53,20 @@ export async function refreshAccessToken(): Promise<string> {
   };
 
   if (data.refresh_token) {
-    console.info('[TOS-Auth] Received new refresh token — update SCHWAB_REFRESH_TOKEN in Secrets');
+    console.info('[TOS-Auth] Received new refresh token — persisting to database');
+    try {
+      const { prisma } = await import('../../lib/prisma');
+      const { encryptIfPresent } = await import('../../lib/encryption');
+      const firstUser = await prisma.user.findFirst({ orderBy: { createdAt: 'asc' } });
+      if (firstUser) {
+        await prisma.exchangeCredential.updateMany({
+          where: { userId: firstUser.id, exchange: 'tos' },
+          data: { encryptedRefreshToken: encryptIfPresent(data.refresh_token) },
+        });
+      }
+    } catch (persistErr) {
+      console.warn('[TOS-Auth] Could not persist refresh token:', (persistErr as Error).message);
+    }
   }
 
   console.info('[TOS-Auth] Access token refreshed, valid for ~30m');

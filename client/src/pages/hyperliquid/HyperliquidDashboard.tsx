@@ -5,6 +5,7 @@ import {
   Activity, TrendingUp, TrendingDown, ShieldAlert, AlertTriangle,
   Settings2, RefreshCw, CheckCircle2, XCircle, Minus, ChevronDown,
   ChevronUp, Clock, DollarSign, Lock, BarChart3, Zap, Power, PowerOff, X,
+  Eye, EyeOff,
 } from 'lucide-react';
 import {
   LineChart, Line, XAxis, YAxis, Tooltip, ResponsiveContainer, ReferenceLine,
@@ -549,12 +550,126 @@ function HLAutoConfigPanel() {
   );
 }
 
+// ─── Connect Card ─────────────────────────────────────────────────
+
+function HyperliquidConnectCard({ onConnected }: { onConnected: () => void }) {
+  const [walletAddress, setWalletAddress] = useState('');
+  const [agentKey, setAgentKey] = useState('');
+  const [isMainnet, setIsMainnet] = useState(true);
+  const [showKey, setShowKey] = useState(false);
+  const [isConnecting, setIsConnecting] = useState(false);
+  const [error, setError] = useState('');
+
+  const handleConnect = async () => {
+    setError('');
+    setIsConnecting(true);
+    try {
+      await (api.credentials as any).hlConnect({ walletAddress, agentPrivateKey: agentKey, isMainnet });
+      toast.success('Hyperliquid connected successfully!');
+      onConnected();
+    } catch (err: any) {
+      setError(err?.response?.data?.error ?? 'Connection failed. Check your credentials.');
+    } finally {
+      setIsConnecting(false);
+    }
+  };
+
+  return (
+    <div className="flex items-center justify-center min-h-[60vh]">
+      <div className="w-full max-w-md p-6 bg-surface-2 border border-surface-border rounded-xl">
+        <div className="flex items-center gap-3 mb-6">
+          <div className="w-10 h-10 rounded-xl bg-accent-blue/20 border border-accent-blue/30 flex items-center justify-center">
+            <Activity className="h-5 w-5 text-accent-blue" />
+          </div>
+          <div>
+            <h2 className="text-base font-bold text-white">Connect Hyperliquid</h2>
+            <p className="text-xs text-slate-500">Mainnet perpetuals trading</p>
+          </div>
+        </div>
+
+        <div className="space-y-4">
+          <div className="flex items-center justify-between p-3 rounded-lg bg-surface-3 border border-surface-border">
+            <span className="text-sm text-slate-300">Network</span>
+            <div className="flex gap-2">
+              <button onClick={() => setIsMainnet(true)}
+                className={cn('px-3 py-1 rounded text-xs font-mono', isMainnet ? 'bg-accent-green text-black font-bold' : 'text-slate-500 hover:text-white')}>
+                Mainnet
+              </button>
+              <button onClick={() => setIsMainnet(false)}
+                className={cn('px-3 py-1 rounded text-xs font-mono', !isMainnet ? 'bg-amber-500 text-black font-bold' : 'text-slate-500 hover:text-white')}>
+                Testnet
+              </button>
+            </div>
+          </div>
+
+          <div>
+            <label className="text-xs text-slate-500 font-mono uppercase tracking-wider mb-1.5 block">Main Wallet Address</label>
+            <input type="text" value={walletAddress} onChange={(e) => setWalletAddress(e.target.value)}
+              placeholder="0x..."
+              className="w-full bg-surface-3 border border-surface-border rounded-lg px-3 py-2.5 text-sm font-mono text-white placeholder-slate-600 focus:outline-none focus:border-accent-blue" />
+            <p className="text-xs text-slate-600 mt-1">Your main wallet address (public — not sensitive)</p>
+          </div>
+
+          <div>
+            <label className="text-xs text-slate-500 font-mono uppercase tracking-wider mb-1.5 block">Agent Wallet Private Key</label>
+            <div className="relative">
+              <input type={showKey ? 'text' : 'password'} value={agentKey} onChange={(e) => setAgentKey(e.target.value)}
+                placeholder="0x..."
+                className="w-full bg-surface-3 border border-surface-border rounded-lg px-3 py-2.5 pr-10 text-sm font-mono text-white placeholder-slate-600 focus:outline-none focus:border-accent-blue" />
+              <button type="button" onClick={() => setShowKey(!showKey)}
+                className="absolute right-3 top-1/2 -translate-y-1/2 text-slate-500 hover:text-white">
+                {showKey ? <EyeOff className="h-4 w-4" /> : <Eye className="h-4 w-4" />}
+              </button>
+            </div>
+            <p className="text-xs text-slate-600 mt-1">
+              Agent key only — your main wallet key is never needed.{' '}
+              <a href="https://app.hyperliquid.xyz/settings" target="_blank" rel="noopener noreferrer" className="text-accent-blue hover:underline">
+                Create agent wallet →
+              </a>
+            </p>
+          </div>
+
+          {error && (
+            <div className="flex items-start gap-2 p-3 rounded-lg bg-red-500/10 border border-red-500/30">
+              <AlertTriangle className="h-4 w-4 text-red-400 flex-shrink-0 mt-0.5" />
+              <p className="text-xs text-red-400">{error}</p>
+            </div>
+          )}
+
+          <div className="flex items-start gap-2 p-3 rounded-lg bg-accent-blue/5 border border-accent-blue/20">
+            <Lock className="h-4 w-4 text-accent-blue flex-shrink-0 mt-0.5" />
+            <p className="text-xs text-slate-400">
+              Your agent key is encrypted with AES-256 before storage. It is never logged or transmitted in plaintext.
+            </p>
+          </div>
+
+          <button onClick={handleConnect} disabled={!walletAddress || !agentKey || isConnecting}
+            className="w-full py-2.5 rounded-lg bg-accent-blue text-white text-sm font-semibold disabled:opacity-40 disabled:cursor-not-allowed hover:bg-accent-blue/90 transition-colors flex items-center justify-center gap-2">
+            {isConnecting
+              ? <><RefreshCw className="h-4 w-4 animate-spin" /> Verifying connection...</>
+              : <><CheckCircle2 className="h-4 w-4" /> Connect & Verify</>}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 // ─── Main Dashboard ───────────────────────────────────────────────
 
 export default function HyperliquidDashboard() {
   const qc = useQueryClient();
   const [showKillConfirm, setShowKillConfirm] = useState(false);
   const [killReason, setKillReason] = useState('');
+
+  const { data: credStatus, refetch: refetchCredStatus } = useQuery({
+    queryKey: ['credential-status'],
+    queryFn: () => (api.credentials as any).status(),
+    refetchInterval: 30_000,
+    staleTime: 15_000,
+  });
+
+  const hlConnected = (credStatus as any)?.data?.hyperliquid?.isConnected ?? false;
 
   const { data: statusData, isLoading: sLoading, refetch: refetchStatus } = useQuery({
     queryKey: ['hl-status'],
@@ -640,6 +755,22 @@ export default function HyperliquidDashboard() {
           </div>
 
           <div className="flex items-center gap-2">
+            {hlConnected && (
+              <button
+                onClick={() => {
+                  if (confirm('Disconnect Hyperliquid? This will stop all autonomous trading on this exchange.')) {
+                    (api.credentials as any).hlDisconnect().then(() => {
+                      refetchCredStatus();
+                      qc.invalidateQueries({ queryKey: ['hl-status'] });
+                      toast.success('Hyperliquid disconnected');
+                    });
+                  }
+                }}
+                className="text-xs text-red-400 hover:text-red-300 flex items-center gap-1 px-2 py-1 rounded hover:bg-red-500/10 transition-colors"
+              >
+                <PowerOff className="h-3 w-3" /> Disconnect
+              </button>
+            )}
             <button onClick={() => refetchStatus()} className="p-2 text-slate-500 hover:text-white transition-colors rounded-lg hover:bg-surface-2">
               <RefreshCw className="h-4 w-4" />
             </button>
@@ -659,7 +790,10 @@ export default function HyperliquidDashboard() {
       </div>
 
       <div className="flex-1 overflow-y-auto">
-        {ksActive && (
+        {!hlConnected && !sLoading && (
+          <HyperliquidConnectCard onConnected={() => { refetchCredStatus(); refetchStatus(); }} />
+        )}
+        {ksActive && hlConnected && (
           <div className="mx-6 mt-4 p-4 bg-red-500/10 border border-red-500/40 rounded-xl">
             <div className="flex items-center gap-2 mb-1">
               <PowerOff className="h-4 w-4 text-red-400" />
@@ -670,21 +804,6 @@ export default function HyperliquidDashboard() {
           </div>
         )}
 
-        {!status?.hasCredentials && !sLoading && (
-          <div className="mx-6 mt-4 p-4 bg-amber-500/10 border border-amber-500/30 rounded-xl">
-            <div className="flex items-center gap-2 mb-1">
-              <Lock className="h-4 w-4 text-amber-400" />
-              <p className="text-sm font-bold text-amber-400">Wallet not configured</p>
-            </div>
-            <p className="text-xs text-amber-400/70 mb-2">Set these Replit Secrets to enable full account features:</p>
-            <div className="grid grid-cols-1 sm:grid-cols-3 gap-2">
-              {['HL_WALLET_ADDRESS', 'HL_PRIVATE_KEY', 'HL_AGENT_PRIVATE_KEY (optional)'].map((k) => (
-                <code key={k} className="text-[10px] bg-surface-2 border border-surface-border px-2 py-1 rounded text-amber-300 font-mono">{k}</code>
-              ))}
-            </div>
-            <p className="text-[10px] text-amber-400/50 mt-2">Set HL_DRY_RUN=false to enable live order execution. Default is dry-run (simulated).</p>
-          </div>
-        )}
 
         <div className="p-6 space-y-6">
           {sLoading ? (

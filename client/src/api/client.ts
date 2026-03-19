@@ -49,6 +49,11 @@ export async function del<T>(path: string): Promise<T> {
   return data;
 }
 
+export async function patch<T>(path: string, body?: unknown): Promise<T> {
+  const { data } = await apiClient.patch<T>(path, body);
+  return data;
+}
+
 export interface User {
   id: string;
   email: string;
@@ -219,6 +224,22 @@ export const api = {
       startSession: (exchange: string) => post(`/autotrader/exchange-config/${exchange}/session/start`, {}),
       pauseSession: (exchange: string, reason?: string) => post(`/autotrader/exchange-config/${exchange}/session/pause`, { reason }),
     },
+  },
+
+  credentials: {
+    status: () => get('/credentials/status'),
+    hlConnect: (data: { walletAddress: string; agentPrivateKey: string; isMainnet: boolean; dryRun?: boolean; maxDrawdownPct?: number; defaultLeverage?: number }) =>
+      post('/credentials/hl/connect', data),
+    hlDisconnect: () => del('/credentials/hl/disconnect'),
+    hlUpdateSettings: (data: { dryRun?: boolean; maxDrawdownPct?: number; defaultLeverage?: number }) =>
+      patch('/credentials/hl/settings', data),
+    tosAuthUrl: (data: { clientId: string; clientSecret: string; redirectUri: string }) =>
+      post('/credentials/tos/auth-url', data),
+    tosConnect: (data: { authorizationCode: string; accountNumber: string }) =>
+      post('/credentials/tos/connect', data),
+    tosDisconnect: () => del('/credentials/tos/disconnect'),
+    tosUpdateSettings: (data: { dryRun?: boolean; maxDrawdownPct?: number }) =>
+      patch('/credentials/tos/settings', data),
   },
 
   scans: {

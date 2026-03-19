@@ -1,7 +1,26 @@
 # RIA BOT — Project Architecture
 
 ## Overview
-Full-stack AI paper trading research simulator. Premium dark-mode terminal UI for market intelligence, opportunity discovery, and paper portfolio management.
+Full-stack AI paper trading research simulator. Premium dark-mode terminal UI for market intelligence, opportunity discovery, paper portfolio management, and exchange credential management.
+
+## Major Features (Recently Added)
+
+### Full Market Universe Scanner
+- `FinnhubProvider` + `FullUniverseScanner` — two-phase NYSE/NASDAQ scanning (5000+ tickers)
+- `scanProgressStore` — in-memory SSE progress tracking
+- `GET /api/daily-scans/progress` SSE endpoint
+- `DailyScan.tsx` — Quick/Full mode toggle + live progress panel
+- `OpportunityScanner.tsx` — universe stats banner, watchlist integration
+
+### Exchange Credential Management
+- `server/src/lib/encryption.ts` — AES-256-GCM encrypt/decrypt helpers
+- `server/src/services/credentials/CredentialService.ts` — DB-first with env-var fallback
+- `server/src/services/credentials/CredentialLoader.ts` — startup credential injection
+- `server/src/routes/credentials.ts` — 9 REST endpoints (HL connect/disconnect/settings, TOS auth-url/connect/disconnect/settings, status)
+- `HyperliquidConnectCard` in `HyperliquidDashboard.tsx` — inline connect wizard
+- `TOSConnectCard` in `TosDashboard.tsx` — 3-step OAuth wizard (credentials → authorize → connect)
+- `Dashboard.tsx` — exchange connection status cards + encryption warning banner
+- **ENCRYPTION_KEY** secret (64 hex chars) required for encrypted storage. Without it, credential storage is disabled (graceful fallback to env vars).
 
 ## Architecture
 

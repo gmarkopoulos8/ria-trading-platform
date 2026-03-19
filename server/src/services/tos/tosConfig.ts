@@ -1,5 +1,24 @@
 // ─── Schwab / ThinkorSwim Configuration ──────────────────────────
-// All tunable parameters. Source values from Replit Secrets.
+// All tunable parameters. DB credentials override env vars at runtime.
+
+let _runtimeCreds: {
+  clientId?: string;
+  clientSecret?: string;
+  redirectUri?: string;
+  refreshToken?: string;
+  accountNumber?: string;
+  dryRun?: boolean;
+  maxDrawdownPct?: number;
+} | null = null;
+
+export function setTOSRuntimeCredentials(creds: typeof _runtimeCreds): void {
+  _runtimeCreds = creds;
+  console.info('[TOS-Config] Runtime credentials loaded from database');
+}
+
+export function clearTOSRuntimeCredentials(): void {
+  _runtimeCreds = null;
+}
 
 export const TOS_CONFIG = {
   BASE_URL:     'https://api.schwabapi.com',
@@ -8,31 +27,32 @@ export const TOS_CONFIG = {
   MARKET_URL:   'https://api.schwabapi.com/marketdata/v1',
 
   get CLIENT_ID(): string {
-    return process.env.SCHWAB_CLIENT_ID ?? '';
+    return _runtimeCreds?.clientId ?? process.env.SCHWAB_CLIENT_ID ?? '';
   },
 
   get CLIENT_SECRET(): string {
-    return process.env.SCHWAB_CLIENT_SECRET ?? '';
+    return _runtimeCreds?.clientSecret ?? process.env.SCHWAB_CLIENT_SECRET ?? '';
   },
 
   get REDIRECT_URI(): string {
-    return process.env.SCHWAB_REDIRECT_URI ?? 'https://127.0.0.1';
+    return _runtimeCreds?.redirectUri ?? process.env.SCHWAB_REDIRECT_URI ?? 'https://127.0.0.1';
   },
 
   get REFRESH_TOKEN(): string {
-    return process.env.SCHWAB_REFRESH_TOKEN ?? '';
+    return _runtimeCreds?.refreshToken ?? process.env.SCHWAB_REFRESH_TOKEN ?? '';
   },
 
   get ACCOUNT_NUMBER(): string {
-    return process.env.SCHWAB_ACCOUNT_NUMBER ?? '';
+    return _runtimeCreds?.accountNumber ?? process.env.SCHWAB_ACCOUNT_NUMBER ?? '';
   },
 
   get DRY_RUN(): boolean {
+    if (_runtimeCreds?.dryRun !== undefined) return _runtimeCreds.dryRun;
     return process.env.SCHWAB_DRY_RUN !== 'false';
   },
 
   get MAX_DRAWDOWN_PCT(): number {
-    return parseFloat(process.env.SCHWAB_MAX_DRAWDOWN_PCT ?? '5');
+    return _runtimeCreds?.maxDrawdownPct ?? parseFloat(process.env.SCHWAB_MAX_DRAWDOWN_PCT ?? '5');
   },
 
   get DEFAULT_QUANTITY(): number {

@@ -1,20 +1,38 @@
 // ─── Hyperliquid Configuration ────────────────────────────────────
-// All tunable parameters. Source values from Replit Secrets.
+// All tunable parameters. DB credentials override env vars at runtime.
+
+let _runtimeCreds: {
+  walletAddress?: string;
+  agentPrivateKey?: string;
+  isMainnet?: boolean;
+  dryRun?: boolean;
+  maxDrawdownPct?: number;
+  defaultLeverage?: number;
+} | null = null;
+
+export function setHLRuntimeCredentials(creds: typeof _runtimeCreds): void {
+  _runtimeCreds = creds;
+  console.info('[HL-Config] Runtime credentials loaded from database');
+}
+
+export function clearHLRuntimeCredentials(): void {
+  _runtimeCreds = null;
+}
 
 export const HL_CONFIG = {
   MAINNET_API: 'https://api.hyperliquid.xyz',
   TESTNET_API: 'https://api.hyperliquid-testnet.xyz',
 
   get API_URL() {
-    return process.env.HL_TESTNET === 'true' ? this.TESTNET_API : this.MAINNET_API;
+    return this.IS_MAINNET ? this.MAINNET_API : this.TESTNET_API;
   },
 
   get IS_MAINNET() {
-    return process.env.HL_TESTNET !== 'true';
+    return _runtimeCreds?.isMainnet ?? (process.env.HL_TESTNET !== 'true');
   },
 
   get WALLET_ADDRESS(): string {
-    return (process.env.HL_WALLET_ADDRESS ?? '').toLowerCase();
+    return (_runtimeCreds?.walletAddress ?? process.env.HL_WALLET_ADDRESS ?? '').toLowerCase();
   },
 
   get PRIVATE_KEY(): string | null {
@@ -22,18 +40,22 @@ export const HL_CONFIG = {
   },
 
   get AGENT_PRIVATE_KEY(): string | null {
-    return process.env.HL_AGENT_PRIVATE_KEY ?? null;
+    return _runtimeCreds?.agentPrivateKey ?? process.env.HL_AGENT_PRIVATE_KEY ?? null;
   },
 
   get DRY_RUN(): boolean {
+    if (_runtimeCreds?.dryRun !== undefined) return _runtimeCreds.dryRun;
     return process.env.HL_DRY_RUN !== 'false';
   },
 
   get MAX_DRAWDOWN_PCT(): number {
-    return parseFloat(process.env.HL_MAX_DRAWDOWN_PCT ?? '5');
+    return _runtimeCreds?.maxDrawdownPct ?? parseFloat(process.env.HL_MAX_DRAWDOWN_PCT ?? '5');
   },
 
-  DEFAULT_LEVERAGE:     parseInt(process.env.HL_DEFAULT_LEVERAGE ?? '3'),
+  get DEFAULT_LEVERAGE(): number {
+    return _runtimeCreds?.defaultLeverage ?? parseInt(process.env.HL_DEFAULT_LEVERAGE ?? '3');
+  },
+
   DEFAULT_SLIPPAGE_PCT: parseFloat(process.env.HL_SLIPPAGE_PCT ?? '0.3'),
   MAX_ORDER_VALUE_USD:  parseFloat(process.env.HL_MAX_ORDER_USD ?? '10000'),
   REQUEST_TIMEOUT_MS:   10_000,

@@ -17,10 +17,13 @@ import stocksRouter from './routes/stocks';
 import hyperliquidRouter from './routes/hyperliquid';
 import tosRouter from './routes/tos';
 import autotraderRouter from './routes/autotrader';
+import credentialRouter from './routes/credentials';
 import { errorHandler, notFoundHandler } from './middleware/errorHandler';
 import { monitorAllOpenPositions } from './services/monitoring/PositionMonitor';
 import { startDailyScanScheduler } from './services/scans/dailyScanScheduler';
 import { startIntradayMonitor } from './services/autotrader/IntradayMonitorLoop';
+import { isEncryptionConfigured } from './lib/encryption';
+import { loadDefaultCredentials } from './services/credentials/CredentialLoader';
 
 const app = express();
 const PORT = process.env.PORT ?? 3001;
@@ -109,18 +112,29 @@ app.use('/api/stocks', stocksRouter);
 app.use('/api/hyperliquid', hyperliquidRouter);
 app.use('/api/tos', tosRouter);
 app.use('/api/autotrader', autotraderRouter);
+app.use('/api/credentials', credentialRouter);
 
 app.use('/api/*', notFoundHandler);
 app.use(errorHandler);
 
 const MONITOR_INTERVAL_MS = 5 * 60 * 1000;
 
-app.listen(PORT, () => {
+if (!isEncryptionConfigured()) {
+  console.error('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
+  console.error('SETUP REQUIRED: ENCRYPTION_KEY is not set.');
+  console.error("Generate one with: node -e \"console.log(require('crypto').randomBytes(32).toString('hex'))\"");
+  console.error('Add it to Replit Secrets, then restart the server.');
+  console.error('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
+}
+
+app.listen(PORT, async () => {
   console.log(`✅ RIA BOT API running on port ${PORT}`);
   console.log(`   Environment : ${process.env.NODE_ENV ?? 'development'}`);
   console.log(`   Database    : ${process.env.DATABASE_URL ? 'connected' : 'not configured'}`);
   console.log(`   Sessions    : PostgreSQL (ria.sid)`);
   console.log(`   Monitor     : ${MONITOR_INTERVAL_MS / 1000}s interval (first run in 15s)`);
+
+  await loadDefaultCredentials();
 
   setTimeout(() => {
     monitorAllOpenPositions().catch((err) => {

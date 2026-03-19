@@ -4,7 +4,8 @@ import { toast } from 'sonner';
 import {
   TrendingUp, TrendingDown, RefreshCw, Clock, DollarSign, Lock,
   BarChart3, Power, PowerOff, ChevronDown, ChevronUp, Minus,
-  ShieldAlert, Zap, Activity, X, Settings2,
+  ShieldAlert, Zap, Activity, X, Settings2, Eye, EyeOff, ExternalLink,
+  CheckCircle2, AlertTriangle,
 } from 'lucide-react';
 import { cn } from '../../lib/utils';
 import { api } from '../../api/client';
@@ -682,12 +683,177 @@ function TOSAutoConfigPanel() {
   );
 }
 
+// ─── TOS Connect Wizard ───────────────────────────────────────────
+
+function TOSConnectCard({ onConnected }: { onConnected: () => void }) {
+  const [step, setStep] = useState<'credentials' | 'authorize'>('credentials');
+  const [clientId, setClientId] = useState('');
+  const [clientSecret, setClientSecret] = useState('');
+  const [redirectUri, setRedirectUri] = useState('https://127.0.0.1');
+  const [authUrl, setAuthUrl] = useState('');
+  const [authCode, setAuthCode] = useState('');
+  const [accountNumber, setAccountNumber] = useState('');
+  const [isLoading, setIsLoading] = useState(false);
+  const [error, setError] = useState('');
+  const [showSecret, setShowSecret] = useState(false);
+
+  const handleGenerateUrl = async () => {
+    setError('');
+    setIsLoading(true);
+    try {
+      const result = await (api.credentials as any).tosAuthUrl({ clientId, clientSecret, redirectUri });
+      setAuthUrl(result?.data?.authUrl ?? result?.data?.data?.authUrl ?? '');
+      setStep('authorize');
+    } catch (err: any) {
+      setError(err?.response?.data?.error ?? 'Failed to generate authorization URL');
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
+  const handleConnect = async () => {
+    setError('');
+    setIsLoading(true);
+    try {
+      await (api.credentials as any).tosConnect({ authorizationCode: authCode, accountNumber });
+      toast.success('ThinkorSwim connected successfully!');
+      onConnected();
+    } catch (err: any) {
+      setError(err?.response?.data?.error ?? 'Connection failed. Check your authorization code.');
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
+  const steps = ['credentials', 'authorize'];
+
+  return (
+    <div className="flex items-center justify-center min-h-[60vh]">
+      <div className="w-full max-w-md p-6 bg-surface-2 border border-surface-border rounded-xl">
+        <div className="flex items-center gap-3 mb-6">
+          <div className="w-10 h-10 rounded-xl bg-accent-purple/20 border border-accent-purple/30 flex items-center justify-center">
+            <BarChart3 className="h-5 w-5 text-accent-purple" />
+          </div>
+          <div>
+            <h2 className="text-base font-bold text-white">Connect ThinkorSwim</h2>
+            <p className="text-xs text-slate-500">Schwab API · equities & options</p>
+          </div>
+        </div>
+
+        <div className="flex items-center gap-2 mb-6">
+          {['App Credentials', 'Authorize & Connect'].map((label, i) => (
+            <div key={i} className="flex items-center gap-2 flex-1">
+              <div className={cn(
+                'w-6 h-6 rounded-full flex items-center justify-center text-xs font-bold flex-shrink-0',
+                i <= steps.indexOf(step)
+                  ? 'bg-accent-purple text-white'
+                  : 'bg-surface-3 text-slate-500 border border-surface-border'
+              )}>{i + 1}</div>
+              <span className={cn('text-xs flex-1', i <= steps.indexOf(step) ? 'text-slate-300' : 'text-slate-600')}>{label}</span>
+              {i < 1 && <div className="h-px w-4 bg-surface-border" />}
+            </div>
+          ))}
+        </div>
+
+        {step === 'credentials' && (
+          <div className="space-y-4">
+            <div>
+              <label className="text-xs text-slate-500 font-mono uppercase tracking-wider mb-1.5 block">App Key (Client ID)</label>
+              <input type="text" value={clientId} onChange={(e) => setClientId(e.target.value)}
+                placeholder="Your Schwab app key"
+                className="w-full bg-surface-3 border border-surface-border rounded-lg px-3 py-2.5 text-sm font-mono text-white placeholder-slate-600 focus:outline-none focus:border-accent-purple" />
+              <p className="text-xs text-slate-600 mt-1">From developer.schwab.com → your app</p>
+            </div>
+            <div>
+              <label className="text-xs text-slate-500 font-mono uppercase tracking-wider mb-1.5 block">App Secret (Client Secret)</label>
+              <div className="relative">
+                <input type={showSecret ? 'text' : 'password'} value={clientSecret} onChange={(e) => setClientSecret(e.target.value)}
+                  placeholder="Your Schwab app secret"
+                  className="w-full bg-surface-3 border border-surface-border rounded-lg px-3 py-2.5 pr-10 text-sm font-mono text-white placeholder-slate-600 focus:outline-none focus:border-accent-purple" />
+                <button type="button" onClick={() => setShowSecret(!showSecret)} className="absolute right-3 top-1/2 -translate-y-1/2 text-slate-500 hover:text-white">
+                  {showSecret ? <EyeOff className="h-4 w-4" /> : <Eye className="h-4 w-4" />}
+                </button>
+              </div>
+            </div>
+            <div>
+              <label className="text-xs text-slate-500 font-mono uppercase tracking-wider mb-1.5 block">Redirect URI</label>
+              <input type="text" value={redirectUri} onChange={(e) => setRedirectUri(e.target.value)}
+                className="w-full bg-surface-3 border border-surface-border rounded-lg px-3 py-2.5 text-sm font-mono text-white focus:outline-none focus:border-accent-purple" />
+              <p className="text-xs text-slate-600 mt-1">Must match exactly what's registered in your Schwab app</p>
+            </div>
+            {error && <div className="p-3 rounded-lg bg-red-500/10 border border-red-500/30 text-xs text-red-400 flex gap-2"><AlertTriangle className="h-3.5 w-3.5 flex-shrink-0 mt-0.5" />{error}</div>}
+            <button onClick={handleGenerateUrl} disabled={!clientId || !clientSecret || isLoading}
+              className="w-full py-2.5 rounded-lg bg-accent-purple text-white text-sm font-semibold disabled:opacity-40 hover:bg-accent-purple/90 transition-colors flex items-center justify-center gap-2">
+              {isLoading ? <><RefreshCw className="h-4 w-4 animate-spin" /> Generating...</> : 'Generate Authorization URL →'}
+            </button>
+          </div>
+        )}
+
+        {step === 'authorize' && (
+          <div className="space-y-4">
+            <div className="p-4 rounded-lg bg-surface-3 border border-surface-border space-y-3">
+              <p className="text-sm text-white font-medium">Click below to open Schwab login</p>
+              <p className="text-xs text-slate-400">Log in with your Schwab account, then copy the full redirect URL and paste it below.</p>
+              <a href={authUrl} target="_blank" rel="noopener noreferrer"
+                className="flex items-center justify-center gap-2 w-full py-2.5 rounded-lg bg-accent-purple text-white text-sm font-semibold hover:bg-accent-purple/90 transition-colors">
+                <ExternalLink className="h-4 w-4" /> Open Schwab Authorization
+              </a>
+            </div>
+            <div>
+              <label className="text-xs text-slate-500 font-mono uppercase tracking-wider mb-1.5 block">Paste the full redirect URL here</label>
+              <input type="text" value={authCode}
+                onChange={(e) => {
+                  const val = e.target.value;
+                  const match = val.match(/[?&]code=([^&]+)/);
+                  setAuthCode(match ? decodeURIComponent(match[1]) : val);
+                }}
+                placeholder="https://127.0.0.1/?code=..."
+                className="w-full bg-surface-3 border border-surface-border rounded-lg px-3 py-2.5 text-sm font-mono text-white placeholder-slate-600 focus:outline-none focus:border-accent-purple" />
+              <p className="text-xs text-slate-600 mt-1">Paste the entire redirect URL — the code will be extracted automatically</p>
+            </div>
+            <div>
+              <label className="text-xs text-slate-500 font-mono uppercase tracking-wider mb-1.5 block">Schwab Account Number</label>
+              <input type="text" value={accountNumber} onChange={(e) => setAccountNumber(e.target.value)}
+                placeholder="Your brokerage account number"
+                className="w-full bg-surface-3 border border-surface-border rounded-lg px-3 py-2.5 text-sm font-mono text-white placeholder-slate-600 focus:outline-none focus:border-accent-purple" />
+            </div>
+            {error && <div className="p-3 rounded-lg bg-red-500/10 border border-red-500/30 text-xs text-red-400 flex gap-2"><AlertTriangle className="h-3.5 w-3.5 flex-shrink-0 mt-0.5" />{error}</div>}
+            <div className="flex gap-2">
+              <button onClick={() => setStep('credentials')} className="flex-1 py-2.5 rounded-lg border border-surface-border text-slate-400 text-sm hover:text-white hover:border-slate-500 transition-colors">
+                ← Back
+              </button>
+              <button onClick={handleConnect} disabled={!authCode || !accountNumber || isLoading}
+                className="flex-1 py-2.5 rounded-lg bg-accent-purple text-white text-sm font-semibold disabled:opacity-40 hover:bg-accent-purple/90 transition-colors flex items-center justify-center gap-2">
+                {isLoading ? <><RefreshCw className="h-4 w-4 animate-spin" /> Connecting...</> : <><CheckCircle2 className="h-4 w-4" /> Connect & Verify</>}
+              </button>
+            </div>
+          </div>
+        )}
+
+        <div className="mt-4 flex items-start gap-2 p-3 rounded-lg bg-surface-3 border border-surface-border">
+          <Lock className="h-4 w-4 text-slate-500 flex-shrink-0 mt-0.5" />
+          <p className="text-xs text-slate-500">App secret and refresh tokens are encrypted with AES-256 before storage. Never logged or stored in plaintext.</p>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 // ─── Main Dashboard ───────────────────────────────────────────────
 
 export default function TosDashboard() {
   const qc = useQueryClient();
   const [showKillConfirm, setShowKillConfirm] = useState(false);
   const [killReason, setKillReason]           = useState('');
+
+  const { data: credStatus, refetch: refetchCredStatus } = useQuery({
+    queryKey: ['credential-status'],
+    queryFn: () => (api.credentials as any).status(),
+    refetchInterval: 30_000,
+    staleTime: 15_000,
+  });
+
+  const tosConnected = (credStatus as any)?.data?.tos?.isConnected ?? false;
 
   const { data: statusData, isLoading: sLoading, refetch: refetchStatus } = useQuery({
     queryKey: ['tos-status'],
@@ -701,7 +867,7 @@ export default function TosDashboard() {
     queryFn:  () => api.tos.account(),
     staleTime: 20_000,
     refetchInterval: 60_000,
-    enabled: !!(statusData as any)?.data?.hasCredentials,
+    enabled: !!(statusData as any)?.data?.hasCredentials || tosConnected,
   });
 
   const { data: historyData } = useQuery({
@@ -771,6 +937,22 @@ export default function TosDashboard() {
           </div>
 
           <div className="flex items-center gap-2">
+            {tosConnected && (
+              <button
+                onClick={() => {
+                  if (confirm('Disconnect ThinkorSwim? This will stop all autonomous trading on this exchange.')) {
+                    (api.credentials as any).tosDisconnect().then(() => {
+                      refetchCredStatus();
+                      qc.invalidateQueries({ queryKey: ['tos-status'] });
+                      toast.success('ThinkorSwim disconnected');
+                    });
+                  }
+                }}
+                className="text-xs text-red-400 hover:text-red-300 flex items-center gap-1 px-2 py-1 rounded hover:bg-red-500/10 transition-colors"
+              >
+                <PowerOff className="h-3 w-3" /> Disconnect
+              </button>
+            )}
             <button onClick={() => refetchStatus()} className="p-2 text-slate-500 hover:text-white transition-colors rounded-lg hover:bg-surface-2">
               <RefreshCw className="h-4 w-4" />
             </button>
@@ -790,7 +972,10 @@ export default function TosDashboard() {
       </div>
 
       <div className="flex-1 overflow-y-auto">
-        {ksActive && (
+        {!tosConnected && !status?.hasCredentials && !sLoading && (
+          <TOSConnectCard onConnected={() => { refetchCredStatus(); refetchStatus(); }} />
+        )}
+        {ksActive && tosConnected && (
           <div className="mx-6 mt-4 p-4 bg-red-500/10 border border-red-500/40 rounded-xl">
             <div className="flex items-center gap-2 mb-1">
               <PowerOff className="h-4 w-4 text-red-400" />
@@ -801,21 +986,6 @@ export default function TosDashboard() {
           </div>
         )}
 
-        {!status?.hasCredentials && !sLoading && (
-          <div className="mx-6 mt-4 p-4 bg-amber-500/10 border border-amber-500/30 rounded-xl">
-            <div className="flex items-center gap-2 mb-2">
-              <Lock className="h-4 w-4 text-amber-400" />
-              <p className="text-sm font-bold text-amber-400">Schwab API not configured</p>
-            </div>
-            <p className="text-xs text-amber-400/70 mb-3">Set these Replit Secrets, then complete the one-time OAuth flow:</p>
-            <div className="grid grid-cols-1 sm:grid-cols-2 gap-1.5 mb-3">
-              {['SCHWAB_CLIENT_ID', 'SCHWAB_CLIENT_SECRET', 'SCHWAB_REDIRECT_URI', 'SCHWAB_REFRESH_TOKEN', 'SCHWAB_ACCOUNT_NUMBER'].map((k) => (
-                <code key={k} className="text-[10px] bg-surface-2 border border-surface-border px-2 py-1 rounded text-amber-300 font-mono">{k}</code>
-              ))}
-            </div>
-            <p className="text-[10px] text-amber-400/50">Visit GET /api/tos/auth/url to start the OAuth flow. Set SCHWAB_DRY_RUN=false for live orders. SCHWAB_MAX_DRAWDOWN_PCT default is 5.</p>
-          </div>
-        )}
 
         <div className="p-6 space-y-6">
           {sLoading ? (

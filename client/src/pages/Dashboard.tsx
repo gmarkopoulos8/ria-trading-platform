@@ -2,7 +2,7 @@ import { useQuery } from '@tanstack/react-query';
 import { useNavigate } from 'react-router-dom';
 import {
   TrendingUp, TrendingDown, Activity, DollarSign, Zap, BarChart2,
-  Target, AlertTriangle, ArrowRight, RefreshCw,
+  Target, AlertTriangle, ArrowRight, RefreshCw, Lock, CheckCircle2, WifiOff,
 } from 'lucide-react';
 import { Card, CardHeader, StatCard } from '../components/ui/Card';
 import { Badge } from '../components/ui/Badge';
@@ -21,6 +21,17 @@ function fmtCash(n: number): string {
   if (n >= 1_000_000) return `$${(n / 1_000_000).toFixed(2)}M`;
   if (n >= 1_000) return `$${(n / 1_000).toFixed(1)}k`;
   return `$${n.toFixed(2)}`;
+}
+
+function relTime(iso?: string | null): string {
+  if (!iso) return 'Never';
+  const diff = Date.now() - new Date(iso).getTime();
+  const m = Math.floor(diff / 60_000);
+  if (m < 1) return 'Just now';
+  if (m < 60) return `${m}m ago`;
+  const h = Math.floor(m / 60);
+  if (h < 24) return `${h}h ago`;
+  return `${Math.floor(h / 24)}d ago`;
 }
 
 export default function Dashboard() {
@@ -63,6 +74,17 @@ export default function Dashboard() {
     staleTime: 30_000,
     refetchInterval: 60_000,
   });
+
+  const { data: credData } = useQuery({
+    queryKey: ['credential-status'],
+    queryFn: () => (api.credentials as any).status(),
+    refetchInterval: 60_000,
+    staleTime: 30_000,
+  });
+
+  const encryptionOk = (credData as any)?.data?.encryptionConfigured !== false;
+  const hlCred = (credData as any)?.data?.hyperliquid;
+  const tosCred = (credData as any)?.data?.tos;
 
   const portfolio = (portfolioData as any)?.data?.portfolio;
   const openPositions: any[] = (portfolioData as any)?.data?.positions ?? [];
@@ -171,6 +193,92 @@ export default function Dashboard() {
           color="blue"
         />
       </div>
+
+      {/* ── Encryption warning ── */}
+      {credData && !encryptionOk && (
+        <div className="p-3 rounded-xl bg-amber-500/10 border border-amber-500/30 flex items-start gap-3">
+          <Lock className="h-4 w-4 text-amber-400 flex-shrink-0 mt-0.5" />
+          <div>
+            <p className="text-sm font-semibold text-amber-400">Credential encryption not configured</p>
+            <p className="text-xs text-amber-400/70 mt-0.5">
+              Set the <code className="font-mono bg-amber-500/10 px-1 rounded">ENCRYPTION_KEY</code> secret (64 hex chars) to enable secure in-app exchange credential storage.
+            </p>
+          </div>
+        </div>
+      )}
+
+      {/* ── Exchange connection cards ── */}
+      {credData && (
+        <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+          {/* Hyperliquid card */}
+          <div
+            className={cn(
+              'p-4 rounded-xl border flex items-center justify-between cursor-pointer group hover:border-opacity-60 transition-all',
+              hlCred?.isConnected
+                ? 'bg-accent-blue/5 border-accent-blue/30'
+                : 'bg-surface-2 border-surface-border hover:border-slate-600',
+            )}
+            onClick={() => navigate('/hyperliquid')}
+          >
+            <div className="flex items-center gap-3">
+              <div className={cn('w-9 h-9 rounded-lg flex items-center justify-center',
+                hlCred?.isConnected ? 'bg-accent-blue/20' : 'bg-surface-3')}>
+                <Activity className={cn('h-4 w-4', hlCred?.isConnected ? 'text-accent-blue' : 'text-slate-500')} />
+              </div>
+              <div>
+                <p className="text-sm font-semibold text-white">Hyperliquid</p>
+                {hlCred?.isConnected ? (
+                  <p className="text-xs text-slate-400">
+                    {hlCred.walletAddress
+                      ? `${hlCred.walletAddress.slice(0, 6)}…${hlCred.walletAddress.slice(-4)}`
+                      : 'Connected'} · {relTime(hlCred.lastUpdatedAt)}
+                  </p>
+                ) : (
+                  <p className="text-xs text-slate-500">Not connected · click to set up</p>
+                )}
+              </div>
+            </div>
+            <div className="flex items-center gap-2">
+              {hlCred?.isConnected
+                ? <CheckCircle2 className="h-4 w-4 text-accent-green" />
+                : <WifiOff className="h-4 w-4 text-slate-600" />}
+              <ArrowRight className="h-4 w-4 text-slate-600 group-hover:text-slate-400 transition-colors" />
+            </div>
+          </div>
+
+          {/* ThinkorSwim card */}
+          <div
+            className={cn(
+              'p-4 rounded-xl border flex items-center justify-between cursor-pointer group hover:border-opacity-60 transition-all',
+              tosCred?.isConnected
+                ? 'bg-accent-purple/5 border-accent-purple/30'
+                : 'bg-surface-2 border-surface-border hover:border-slate-600',
+            )}
+            onClick={() => navigate('/thinkorswim')}
+          >
+            <div className="flex items-center gap-3">
+              <div className={cn('w-9 h-9 rounded-lg flex items-center justify-center',
+                tosCred?.isConnected ? 'bg-accent-purple/20' : 'bg-surface-3')}>
+                <BarChart2 className={cn('h-4 w-4', tosCred?.isConnected ? 'text-accent-purple' : 'text-slate-500')} />
+              </div>
+              <div>
+                <p className="text-sm font-semibold text-white">ThinkorSwim</p>
+                {tosCred?.isConnected ? (
+                  <p className="text-xs text-slate-400">Schwab API · {relTime(tosCred.lastUpdatedAt)}</p>
+                ) : (
+                  <p className="text-xs text-slate-500">Not connected · click to set up</p>
+                )}
+              </div>
+            </div>
+            <div className="flex items-center gap-2">
+              {tosCred?.isConnected
+                ? <CheckCircle2 className="h-4 w-4 text-accent-green" />
+                : <WifiOff className="h-4 w-4 text-slate-600" />}
+              <ArrowRight className="h-4 w-4 text-slate-600 group-hover:text-slate-400 transition-colors" />
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* ── Connection prompt if no accounts ── */}
       {!anyConnected && (
