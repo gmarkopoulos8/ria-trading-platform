@@ -55,8 +55,10 @@ export async function computeAdaptiveParameters(
     takeProfit = Math.min(takeProfit * 1.2,  bounds.takeProfit.max);
     reasoning.push('Elevated volatility → widened stops to avoid noise-outs, strict conviction');
   } else if (regime.regime === 'BULL_TREND') {
-    takeProfit = Math.min(takeProfit * 1.1,  bounds.takeProfit.max);
-    reasoning.push('Bull trend → extended take-profit targets');
+    takeProfit = Math.min(takeProfit * 1.25, bounds.takeProfit.max);
+    sizeMult   = Math.min(sizeMult   * 1.15, bounds.positionPct.max);
+    conviction = Math.max(conviction - 3,    bounds.conviction.min);
+    reasoning.push('Bull trend → extended targets (+25%), increased size (+15%), relaxed conviction threshold');
   }
 
   // ── 2. Recent Trade Performance ─────────────────────────────────────────────
@@ -67,7 +69,7 @@ export async function computeAdaptiveParameters(
       where: {
         userSettingsId: settings.id,
         exchange:       'PAPER',
-        status:         { in: ['FILLED'] },
+        status:         { in: ['FILLED', 'CLOSED'] },
         executedAt:     { gte: since },
       },
       orderBy: { executedAt: 'desc' },
@@ -94,15 +96,22 @@ export async function computeAdaptiveParameters(
         conviction = Math.min(conviction + 5,    bounds.conviction.max);
         sizeMult   = Math.max(sizeMult * 0.6,    bounds.positionPct.min);
         reasoning.push('3 consecutive losses → tightened stops, raised conviction bar, reduced size');
-      } else if (last3.every(l => (l.pnl ?? 0) > 0) && profitFactor > 1.8) {
-        takeProfit = Math.min(takeProfit * 1.1,  bounds.takeProfit.max);
-        sizeMult   = Math.min(sizeMult * 1.1,    bounds.positionPct.max);
-        reasoning.push('3 consecutive wins with strong profit factor → extended targets, slight size increase');
+      } else if (last3.every(l => (l.pnl ?? 0) > 0) && profitFactor > 1.5) {
+        takeProfit = Math.min(takeProfit * 1.2,  bounds.takeProfit.max);
+        sizeMult   = Math.min(sizeMult   * 1.2,  bounds.positionPct.max);
+        conviction = Math.max(conviction - 2,    bounds.conviction.min);
+        reasoning.push(`3 consecutive wins (profit factor ${profitFactor.toFixed(2)}) → extended targets +20%, size +20%, relaxed conviction`);
       }
 
-      if (profitFactor < 1.0 && withPnl.length >= 5) {
-        conviction = Math.min(conviction + 4, bounds.conviction.max);
-        reasoning.push(`Low profit factor (${profitFactor.toFixed(2)}) → raised conviction threshold`);
+      if (profitFactor < 1.3 && withPnl.length >= 4) {
+        const bump = profitFactor < 0.8 ? 7 : profitFactor < 1.0 ? 5 : 3;
+        conviction = Math.min(conviction + bump, bounds.conviction.max);
+        stopLoss   = Math.max(stopLoss * 0.9,    bounds.stopLoss.min);
+        reasoning.push(`Profit factor ${profitFactor.toFixed(2)} below 1.3 → raised conviction +${bump}, tightened stops`);
+      }
+      if (profitFactor > 2.5 && withPnl.length >= 4) {
+        conviction = Math.max(conviction - 3, bounds.conviction.min);
+        reasoning.push(`Strong profit factor ${profitFactor.toFixed(2)} → relaxed conviction to catch more setups`);
       }
     } else if (recentLogs.length === 0) {
       reasoning.push('No recent trades — using base parameters');
@@ -128,6 +137,21 @@ export async function computeAdaptiveParameters(
     }
   } catch {
     // position fetch can fail — ignore
+  }
+
+  // ── Stack: profitable open positions + bull trend = maximum aggression ───────
+  if (regime.regime === 'BULL_TREND') {
+    try {
+      const openPositions = await getPositions();
+      if (openPositions.length > 0) {
+        const avgPnlPct = openPositions.reduce((sum, p) => sum + parseFloat((p as any).unrealized_plpc ?? '0') * 100, 0) / openPositions.length;
+        if (avgPnlPct > 2.0) {
+          sizeMult   = Math.min(sizeMult   * 1.1, bounds.positionPct.max);
+          takeProfit = Math.min(takeProfit * 1.1, bounds.takeProfit.max);
+          reasoning.push(`Open positions running +${avgPnlPct.toFixed(1)}% avg in bull trend → stacking aggression`);
+        }
+      }
+    } catch { /* ignore */ }
   }
 
   // ── 4. Time of Day ──────────────────────────────────────────────────────────

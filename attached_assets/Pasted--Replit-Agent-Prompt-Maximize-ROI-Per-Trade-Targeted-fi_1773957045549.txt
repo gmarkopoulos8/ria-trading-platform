@@ -1,0 +1,463 @@
+# Replit Agent Prompt — Maximize ROI Per Trade
+
+Targeted fixes only. Every change below is a specific bug fix or ROI enhancement identified by auditing the live codebase. Do not modify anything not listed here.
+
+---
+
+## BUG 1 — Entry Price Uses TOS When Trading on Alpaca (Critical)
+
+**File**: `server/src/services/autotrader/AutoTradeExecutor.ts`
+
+`resolveEntryPrice()` falls back to `tosInfoService.getQuotes()` for stocks — but TOS may not be connected when running Alpaca paper trades. When TOS isn't connected this returns 0, and the trade is rejected with "Could not resolve entry price."
+
+Find the full `resolveEntryPrice` function and replace it:
+
+```typescript
+async function resolveEntryPrice(signal: AutoTradeSignal): Promise<number> {
+  // If the scan already gave us a price, use it
+  if (signal.entryPrice && signal.entryPrice > 0) return signal.entryPrice;
+
+  const exchange = signal.exchange ?? 'PAPER';
+
+  try {
+    if (signal.assetClass === 'crypto' || signal.assetClass === 'CRYPTO') {
+      const { getAssetPrice } = await import('../hyperliquid/hyperliquidInfoService');
+      const price = await getAssetPrice(signal.symbol);
+      if (price && price > 0) return price;
+    }
+
+    // For PAPER exchange, use Alpaca's own quote — never depend on TOS being connected
+    if (exchange === 'PAPER') {
+      try {
+        const { getLatestQuote } = await import('../alpaca/alpacaInfoService');
+        const quote = await getLatestQuote(signal.symbol);
+        if (quote && quote > 0) return quote;
+      } catch {
+        // fall through to Yahoo Finance
+      }
+    }
+
+    // For TOS exchange, use TOS quotes
+    if (exchange === 'TOS') {
+      try {
+        const { getQuotes } = await import('../tos/tosInfoService');
+        const quotes = await getQuotes([signal.symbol]);
+        const q = quotes[signal.symbol];
+        if (q) return q.lastPrice ?? q.mark ?? q.askPrice ?? 0;
+      } catch {
+        // fall through
+      }
+    }
+
+    // Universal fallback — Yahoo Finance via StocksService (always available, no auth needed)
+    const { stocksService } = await import('../market/stocks/StocksService');
+    const quote = await stocksService.quote(signal.symbol);
+    if (quote?.price && quote.price > 0) return quote.price;
+  } catch {
+    // last resort below
+  }
+
+  return 0;
+}
+```
+
+Also add `getLatestQuote` to `server/src/services/alpaca/alpacaInfoService.ts`. Add this function at the bottom:
+
+```typescript
+export async function getLatestQuote(symbol: string): Promise<number | null> {
+  // Alpaca data API provides real-time quotes
+  try {
+    const headers = authHeaders();
+    const url = `https://data.alpaca.markets/v2/stocks/${symbol}/quotes/latest`;
+    const { data } = await axios.get(url, { headers, timeout: 5000 });
+    const bid = parseFloat(data?.quote?.bp ?? '0');
+    const ask = parseFloat(data?.quote?.ap ?? '0');
+    if (bid > 0 && ask > 0) return (bid + ask) / 2; // mid price
+    return null;
+  } catch {
+    return null;
+  }
+}
+```
+
+---
+
+## BUG 2 — PnL Never Written Back to AutoTradeLog (Breaks Adaptive Engine)
+
+**File**: `server/src/routes/alpaca.ts`
+
+The `/auto/monitor` route closes positions but never updates the `autoTradeLog` with exit price or PnL. This means the `AdaptiveParameterEngine` has no closed-trade data to learn from — it always falls into "No recent trades" and can't adapt.
+
+Find the monitor route's position loop. Find this section:
+
+```typescript
+if (shouldClose && !dryRun) {
+  await closePosition((pos as any).symbol).catch((e: any) =>
+    console.warn(`[Alpaca Monitor] Close ${pos.symbol}:`, e?.message)
+  );
+}
+```
+
+Replace it with:
+
+```typescript
+if (shouldClose && !dryRun) {
+  await closePosition((pos as any).symbol).catch((e: any) =>
+    console.warn(`[Alpaca Monitor] Close ${pos.symbol}:`, e?.message)
+  );
+
+  // Write exit price and PnL back to the original AutoTradeLog entry
+  // so the AdaptiveParameterEngine can learn from this trade
+  try {
+    const exitPrice = current;
+    const dollarPnl = (exitPrice - entry) / entry * parseFloat((pos as any).market_value ?? '0');
+
+    // Find the most recent FILLED log for this symbol on PAPER exchange
+    await prisma.autoTradeLog.updateMany({
+      where: {
+        symbol:    (pos as any).symbol,
+        exchange:  'PAPER',
+        status:    'FILLED',
+        exitPrice: null,  // only update ones not yet closed
+      },
+      data: {
+        exitPrice,
+        pnl:    dollarPnl,
+        status: 'CLOSED',
+      },
+    });
+  } catch (writeErr: any) {
+    console.warn('[Alpaca Monitor] PnL writeback failed:', writeErr?.message);
+  }
+}
+```
+
+Also add `prisma` import to the top of `server/src/routes/alpaca.ts` if not already there:
+```typescript
+import { prisma } from '../lib/prisma';
+```
+
+---
+
+## BUG 3 — Circuit Breaker Doesn't Check Alpaca Killswitch for PAPER
+
+**File**: `server/src/services/autotrader/CircuitBreaker.ts`
+
+The circuit breaker checks TOS and Hyperliquid killswitches but not Alpaca's for `PAPER` exchange. Find the top of `checkCircuitBreakers` and add:
+
+```typescript
+// Add this import at top of file if not present:
+import { isKillswitchActive as isAlpacaKillswitchActive, isPauseActive as isAlpacaPauseActive } from '../alpaca/alpacaConfig';
+
+// Inside checkCircuitBreakers, after the HYPERLIQUID check, add:
+if (config.exchange === 'PAPER') {
+  const ksActive = isAlpacaKillswitchActive();
+  const paused   = isAlpacaPauseActive();
+  checks.push({ name: 'Alpaca Killswitch', passed: !ksActive, detail: ksActive ? 'Alpaca killswitch active' : undefined });
+  checks.push({ name: 'Alpaca Pause',      passed: !paused,   detail: paused   ? 'Alpaca trading paused'    : undefined });
+  if (ksActive || paused) return { allowed: false, reason: ksActive ? 'Alpaca killswitch active' : 'Alpaca trading paused', checks };
+}
+```
+
+---
+
+## ROI FIX 1 — Sort Signals by Composite Score Not Just Conviction
+
+**File**: `server/src/services/scans/dynamicUniverseService.ts`
+
+Currently signals are sorted by `convictionScore` only. The `compositeScore` is a better ranking — it incorporates reward:risk, liquidity, and volatility fit on top of conviction. Replace the orderBy:
+
+```typescript
+// FIND:
+orderBy: [
+  { convictionScore: 'desc' },
+  { confidenceScore: 'desc' },
+],
+
+// REPLACE WITH:
+orderBy: [
+  { compositeScore: 'desc' },
+  { convictionScore: 'desc' },
+  { confidenceScore: 'desc' },
+],
+```
+
+---
+
+## ROI FIX 2 — Aggressive Adaptive Engine in Bull Trend
+
+**File**: `server/src/services/alpaca/AdaptiveParameterEngine.ts`
+
+Currently in `BULL_TREND` the engine only extends take-profit by 10% but doesn't increase position size at all — the regime multiplier starts at 1.0 and never goes above. In a confirmed bull trend we want to push harder within bounds.
+
+Find the `BULL_TREND` block:
+
+```typescript
+} else if (regime.regime === 'BULL_TREND') {
+  takeProfit = Math.min(takeProfit * 1.1,  bounds.takeProfit.max);
+  reasoning.push('Bull trend → extended take-profit targets');
+}
+```
+
+Replace with:
+
+```typescript
+} else if (regime.regime === 'BULL_TREND') {
+  takeProfit = Math.min(takeProfit * 1.25, bounds.takeProfit.max);  // let winners run harder
+  sizeMult   = Math.min(sizeMult   * 1.15, bounds.positionPct.max); // deploy more per trade
+  conviction = Math.max(conviction - 3, bounds.conviction.min);     // slightly lower bar — more setups qualify
+  reasoning.push('Bull trend → extended targets (+25%), increased size (+15%), relaxed conviction threshold');
+}
+```
+
+Also increase the winning streak reward. Find:
+
+```typescript
+} else if (last3.every(l => (l.pnl ?? 0) > 0) && profitFactor > 1.8) {
+  takeProfit = Math.min(takeProfit * 1.1,  bounds.takeProfit.max);
+  sizeMult   = Math.min(sizeMult * 1.1,    bounds.positionPct.max);
+  reasoning.push('3 consecutive wins with strong profit factor → extended targets, slight size increase');
+}
+```
+
+Replace with:
+
+```typescript
+} else if (last3.every(l => (l.pnl ?? 0) > 0) && profitFactor > 1.5) {
+  takeProfit = Math.min(takeProfit * 1.2,  bounds.takeProfit.max);
+  sizeMult   = Math.min(sizeMult   * 1.2,  bounds.positionPct.max);
+  conviction = Math.max(conviction - 2, bounds.conviction.min);
+  reasoning.push('3 consecutive wins (profit factor ' + profitFactor.toFixed(2) + ') → extended targets +20%, size +20%, relaxed conviction');
+}
+```
+
+Also add a new check — if the open book is profitable AND bull trend, stack the aggression:
+
+After the existing "Open position P&L" block, add:
+
+```typescript
+// Stack: profitable open positions + bull trend = maximum aggression within bounds
+if (regime.regime === 'BULL_TREND') {
+  try {
+    const openPositions = await getPositions();
+    if (openPositions.length > 0) {
+      const avgPnlPct = openPositions.reduce((sum, p) => sum + parseFloat(p.unrealized_plpc ?? '0') * 100, 0) / openPositions.length;
+      if (avgPnlPct > 2.0) {
+        sizeMult   = Math.min(sizeMult   * 1.1, bounds.positionPct.max);
+        takeProfit = Math.min(takeProfit * 1.1, bounds.takeProfit.max);
+        reasoning.push(`Open positions running +${avgPnlPct.toFixed(1)}% avg in bull trend → stacking aggression`);
+      }
+    }
+  } catch { /* ignore */ }
+}
+```
+
+---
+
+## ROI FIX 3 — Auto-Monitor Runs Automatically Every 5 Minutes
+
+**File**: `server/src/index.ts`
+
+Currently exits only happen when you manually click "Check Exits". If a position hits its stop while you're away, it sits there bleeding. Add an automatic monitor loop.
+
+Add this import near the other service imports:
+```typescript
+import { getPositions, getAccount } from './services/alpaca/alpacaInfoService';
+import { closePosition } from './services/alpaca/alpacaExchangeService';
+import { getCurrentParams } from './services/alpaca/AdaptiveParameterEngine';
+import { hasAlpacaCredentials, isPauseActive, isKillswitchActive } from './services/alpaca/alpacaConfig';
+```
+
+Add this function and call it after `startAdaptiveLoop()`:
+
+```typescript
+// Auto-monitor: check stop/target every 5 minutes during market hours
+function startAlpacaAutoMonitor() {
+  setInterval(async () => {
+    try {
+      if (!hasAlpacaCredentials() || isPauseActive() || isKillswitchActive()) return;
+
+      const nyHour = parseInt(
+        new Date().toLocaleString('en-US', { timeZone: 'America/New_York', hour: 'numeric', hour12: false }), 10
+      );
+      if (nyHour < 9 || nyHour >= 16) return; // market hours only
+
+      const positions = await getPositions();
+      if (!positions || positions.length === 0) return;
+
+      // Use adaptive params if available, otherwise safe defaults
+      // We don't have userId here so use conservative defaults
+      // Individual user adaptive params are applied when they manually trigger
+      const defaultStop   = 4.0;
+      const defaultTarget = 8.0;
+
+      for (const pos of positions) {
+        const entry   = parseFloat((pos as any).avg_entry_price ?? '0');
+        const current = parseFloat((pos as any).current_price   ?? '0');
+        if (entry <= 0 || current <= 0) continue;
+
+        const pnlPct = ((current - entry) / entry) * 100;
+
+        if (pnlPct <= -defaultStop || pnlPct >= defaultTarget) {
+          const reason = pnlPct <= -defaultStop
+            ? `Auto stop-loss: ${pnlPct.toFixed(2)}%`
+            : `Auto take-profit: +${pnlPct.toFixed(2)}%`;
+
+          console.info(`[AutoMonitor] Closing ${(pos as any).symbol} — ${reason}`);
+
+          await closePosition((pos as any).symbol).catch((e: any) =>
+            console.warn(`[AutoMonitor] Close failed for ${(pos as any).symbol}:`, e?.message)
+          );
+
+          // Write PnL back
+          try {
+            const exitPrice = current;
+            const marketValue = parseFloat((pos as any).market_value ?? '0');
+            const dollarPnl   = pnlPct / 100 * Math.abs(marketValue);
+            await prisma.autoTradeLog.updateMany({
+              where: { symbol: (pos as any).symbol, exchange: 'PAPER', status: 'FILLED', exitPrice: null },
+              data:  { exitPrice, pnl: dollarPnl, status: 'CLOSED' },
+            });
+          } catch { /* ignore writeback errors */ }
+        }
+      }
+    } catch (err: any) {
+      // Swallow all errors — this is a background loop
+    }
+  }, 5 * 60_000); // every 5 minutes
+}
+
+startAlpacaAutoMonitor();
+```
+
+Also add the prisma import at the top of `index.ts` if not already there:
+```typescript
+import { prisma } from './lib/prisma';
+```
+
+---
+
+## ROI FIX 4 — Default Bounds Tuned for Maximum ROI
+
+**File**: `server/src/routes/alpaca.ts`
+
+The default bounds in `/auto/start` are conservative. Tune them to allow more aggression within safe limits:
+
+Find:
+```typescript
+const effectiveBounds: ParameterBounds = bounds ?? {
+  stopLoss:    { min: 1.5, max: 8.0 },
+  takeProfit:  { min: 3.0, max: 20.0 },
+  conviction:  { min: 65,  max: 92   },
+  positionPct: { min: 0.3, max: 1.0  },
+};
+```
+
+Replace with:
+```typescript
+const effectiveBounds: ParameterBounds = bounds ?? {
+  stopLoss:    { min: 1.5, max: 7.0  },  // never let stop get too wide
+  takeProfit:  { min: 4.0, max: 25.0 },  // let winners run further
+  conviction:  { min: 68,  max: 90   },  // never too loose or too strict
+  positionPct: { min: 0.5, max: 1.5  },  // allow up to 1.5x in bull conditions
+};
+```
+
+---
+
+## ROI FIX 5 — Pick More Candidates, Take Only the Best
+
+**File**: `server/src/routes/alpaca.ts`
+
+Currently we fetch `maxPositions * 3` signals then just take the first `maxPositions`. We should re-score them by composite score to ensure we're picking the absolute best setups.
+
+Find in `/auto/start`:
+```typescript
+const signals = rawSignals.slice(0, maxPositions).map((s: any) => ({
+  ...s,
+  exchange:          'PAPER' as const,
+  fixedDollarAmount: adjustedPerTrade,
+}));
+```
+
+Replace with:
+```typescript
+// Re-sort by composite score (most important metric) then conviction
+// compositeScore combines reward:risk, liquidity, volatility fit, catalyst strength
+const sortedSignals = [...rawSignals].sort((a: any, b: any) => {
+  const aScore = (a.compositeScore ?? 0) * 0.6 + (a.convictionScore ?? 0) * 0.4;
+  const bScore = (b.compositeScore ?? 0) * 0.6 + (b.convictionScore ?? 0) * 0.4;
+  return bScore - aScore;
+});
+
+const signals = sortedSignals.slice(0, maxPositions).map((s: any) => ({
+  ...s,
+  exchange:          'PAPER' as const,
+  fixedDollarAmount: adjustedPerTrade,
+}));
+```
+
+---
+
+## ROI FIX 6 — Fetch More Candidates From Scan
+
+**File**: `server/src/routes/alpaca.ts`
+
+In `/auto/start`, change the candidate pool from `maxPositions * 3` to `maxPositions * 5` so we have more to filter from:
+
+```typescript
+// FIND:
+maxSymbols: maxPositions * 3,
+
+// REPLACE WITH:
+maxSymbols: maxPositions * 5,
+```
+
+---
+
+## ROI FIX 7 — Adaptive Engine Checks Profit Factor More Aggressively
+
+**File**: `server/src/services/alpaca/AdaptiveParameterEngine.ts`
+
+Currently the profit factor threshold for raising conviction is `< 1.0` (losing money overall). That's too late. Raise it to catch mediocre setups earlier:
+
+Find:
+```typescript
+if (profitFactor < 1.0 && withPnl.length >= 5) {
+  conviction = Math.min(conviction + 4, bounds.conviction.max);
+  reasoning.push(`Low profit factor (${profitFactor.toFixed(2)}) → raised conviction threshold`);
+}
+```
+
+Replace with:
+```typescript
+if (profitFactor < 1.3 && withPnl.length >= 4) {
+  const bump = profitFactor < 0.8 ? 7 : profitFactor < 1.0 ? 5 : 3;
+  conviction = Math.min(conviction + bump, bounds.conviction.max);
+  stopLoss   = Math.max(stopLoss * 0.9,   bounds.stopLoss.min);   // also tighten stops
+  reasoning.push(`Profit factor ${profitFactor.toFixed(2)} below 1.3 → raised conviction +${bump}, tightened stops`);
+}
+// Reward genuinely good profit factors — loosen conviction to catch more setups
+if (profitFactor > 2.5 && withPnl.length >= 4) {
+  conviction = Math.max(conviction - 3, bounds.conviction.min);
+  reasoning.push(`Strong profit factor ${profitFactor.toFixed(2)} → relaxed conviction to catch more setups`);
+}
+```
+
+---
+
+## SUMMARY OF CHANGES
+
+### Bugs Fixed
+1. `resolveEntryPrice` — Alpaca now uses its own quote API, not TOS. Trades won't fail when TOS is disconnected.
+2. PnL writeback — when monitor closes a position, exit price and dollar PnL are now written to `autoTradeLog` so the adaptive engine has data.
+3. Circuit breaker — Alpaca killswitch and pause state now correctly block trades.
+
+### ROI Improvements
+4. Signal ranking — sorted by `compositeScore` (best overall setup quality) not just `convictionScore`
+5. Bull trend aggression — size +15%, target +25%, conviction bar -3 in confirmed bull markets
+6. Winning streak — now triggers at profit factor 1.5 (was 1.8), and rewards are larger (+20% each)
+7. Auto-monitor every 5 minutes — positions never sit past their stop/target unattended
+8. Default bounds tuned — max position size 1.5x, max target 25%, min target 4%
+9. 5x candidate pool — more signals to choose from, re-sorted by composite score
+10. Profit factor tracking — raises conviction sooner (1.3 threshold, not 1.0), lowers it on strong performance

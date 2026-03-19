@@ -321,10 +321,10 @@ router.post('/auto/start', requireAuth, requireAlpacaCredentials, async (req: Re
     }
 
     const effectiveBounds: ParameterBounds = bounds ?? {
-      stopLoss:    { min: 1.5, max: 8.0 },
-      takeProfit:  { min: 3.0, max: 20.0 },
-      conviction:  { min: 65,  max: 92   },
-      positionPct: { min: 0.3, max: 1.0  },
+      stopLoss:    { min: 1.5, max: 7.0  },
+      takeProfit:  { min: 4.0, max: 25.0 },
+      conviction:  { min: 68,  max: 90   },
+      positionPct: { min: 0.5, max: 1.5  },
     };
 
     let activeStop       = stopLossPct;
@@ -355,7 +355,7 @@ router.post('/auto/start', requireAuth, requireAlpacaCredentials, async (req: Re
       minConvictionScore:  activeConviction,
       minConfidenceScore:  60,
       allowedBiases:       ['BULLISH'],
-      maxSymbols:          maxPositions * 3,
+      maxSymbols:          maxPositions * 5,
     });
 
     if (!rawSignals || rawSignals.length === 0) {
@@ -365,7 +365,13 @@ router.post('/auto/start', requireAuth, requireAlpacaCredentials, async (req: Re
       });
     }
 
-    const signals = rawSignals.slice(0, maxPositions).map((s: any) => ({
+    const sortedSignals = [...rawSignals].sort((a: any, b: any) => {
+      const aScore = (a.compositeScore ?? 0) * 0.6 + (a.convictionScore ?? 0) * 0.4;
+      const bScore = (b.compositeScore ?? 0) * 0.6 + (b.convictionScore ?? 0) * 0.4;
+      return bScore - aScore;
+    });
+
+    const signals = sortedSignals.slice(0, maxPositions).map((s: any) => ({
       ...s,
       exchange:          'PAPER' as const,
       fixedDollarAmount: adjustedPerTrade,
@@ -455,6 +461,17 @@ router.post('/auto/monitor', requireAuth, requireAlpacaCredentials, async (req: 
         await closePosition((pos as any).symbol).catch((e: any) =>
           console.warn(`[Alpaca Monitor] Close ${(pos as any).symbol}:`, e?.message)
         );
+
+        try {
+          const exitPrice = current;
+          const dollarPnl = (exitPrice - entry) / entry * parseFloat((pos as any).market_value ?? '0');
+          await prisma.autoTradeLog.updateMany({
+            where: { symbol: (pos as any).symbol, exchange: 'PAPER', status: 'FILLED', exitPrice: null },
+            data:  { exitPrice, pnl: dollarPnl, status: 'CLOSED' },
+          });
+        } catch (writeErr: any) {
+          console.warn('[Alpaca Monitor] PnL writeback failed:', writeErr?.message);
+        }
       }
 
       actions.push({

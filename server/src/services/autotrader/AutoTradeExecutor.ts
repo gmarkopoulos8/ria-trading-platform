@@ -75,19 +75,47 @@ export interface AutoTradeResult {
 
 async function resolveEntryPrice(signal: AutoTradeSignal): Promise<number> {
   if (signal.entryPrice && signal.entryPrice > 0) return signal.entryPrice;
+
+  const exchange = signal.exchange ?? 'PAPER';
+
   try {
     if (signal.assetClass === 'crypto' || signal.assetClass === 'CRYPTO') {
       const { getAssetPrice } = await import('../hyperliquid/hyperliquidInfoService');
       const price = await getAssetPrice(signal.symbol);
-      if (price) return price;
-    } else {
-      const { getQuotes } = await import('../tos/tosInfoService');
-      const quotes = await getQuotes([signal.symbol]);
-      const q = quotes[signal.symbol];
-      if (q) return q.lastPrice ?? q.mark ?? q.askPrice ?? 0;
+      if (price && price > 0) return price;
     }
+
+    // For PAPER exchange, use Alpaca's own quote — never depend on TOS being connected
+    if (exchange === 'PAPER') {
+      try {
+        const { getLatestQuote } = await import('../alpaca/alpacaInfoService');
+        const quote = await getLatestQuote(signal.symbol);
+        if (quote && quote > 0) return quote;
+      } catch {
+        // fall through to Yahoo Finance
+      }
+    }
+
+    // For TOS exchange, use TOS quotes
+    if (exchange === 'TOS') {
+      try {
+        const { getQuotes } = await import('../tos/tosInfoService');
+        const quotes = await getQuotes([signal.symbol]);
+        const q = quotes[signal.symbol];
+        if (q) return q.lastPrice ?? q.mark ?? q.askPrice ?? 0;
+      } catch {
+        // fall through
+      }
+    }
+
+    // Universal fallback — Yahoo Finance via StocksService (always available, no auth needed)
+    const { stocksService } = await import('../market/stocks/StocksService');
+    const quote = await stocksService.quote(signal.symbol);
+    if (quote?.price && quote.price > 0) return quote.price;
   } catch {
+    // last resort below
   }
+
   return 0;
 }
 

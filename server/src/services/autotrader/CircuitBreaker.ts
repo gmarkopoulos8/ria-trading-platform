@@ -1,5 +1,6 @@
 import { isKillswitchActive as isTosKillswitchActive } from '../tos/tosConfig';
 import { isKillswitchActive as isHlKillswitchActive } from '../hyperliquid/hyperliquidConfig';
+import { isKillswitchActive as isAlpacaKillswitchActive, isPauseActive as isAlpacaPauseActive } from '../alpaca/alpacaConfig';
 import { prisma } from '../../lib/prisma';
 
 export interface CircuitBreakerConfig {
@@ -39,6 +40,14 @@ export async function checkCircuitBreakers(
   if (config.exchange === 'HYPERLIQUID') {
     const ksActive = isHlKillswitchActive();
     checks.push({ name: 'HL Killswitch', passed: !ksActive, detail: ksActive ? 'Hyperliquid killswitch is active' : undefined });
+  }
+
+  if (config.exchange === 'PAPER') {
+    const ksActive = isAlpacaKillswitchActive();
+    const paused   = isAlpacaPauseActive();
+    checks.push({ name: 'Alpaca Killswitch', passed: !ksActive, detail: ksActive ? 'Alpaca killswitch active' : undefined });
+    checks.push({ name: 'Alpaca Pause',      passed: !paused,   detail: paused   ? 'Alpaca trading paused'    : undefined });
+    if (ksActive || paused) return { allowed: false, reason: ksActive ? 'Alpaca killswitch active' : 'Alpaca trading paused', checks };
   }
 
   const nyHour = getNYHour();

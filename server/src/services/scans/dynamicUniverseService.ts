@@ -34,6 +34,7 @@ export async function buildSignalsFromLatestScan(
       confidenceScore: { gte: minConfidenceScore },
     },
     orderBy: [
+      { compositeScore: 'desc' },
       { convictionScore: 'desc' },
       { confidenceScore: 'desc' },
     ],
