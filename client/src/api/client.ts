@@ -211,6 +211,14 @@ export const api = {
     runCycle: () => post('/autotrader/run-cycle'),
     logs: (params?: Record<string, unknown>) => get('/autotrader/logs', params),
     signalsPreview: () => get('/autotrader/signals/preview'),
+    exchangeConfig: {
+      get: (exchange: string) => get(`/autotrader/exchange-config/${exchange}`),
+      save: (exchange: string, data: unknown) => put(`/autotrader/exchange-config/${exchange}`, data),
+      validate: (exchange: string, data: unknown) => post(`/autotrader/exchange-config/${exchange}/validate`, data),
+      sessionStatus: (exchange: string) => get(`/autotrader/exchange-config/${exchange}/session-status`),
+      startSession: (exchange: string) => post(`/autotrader/exchange-config/${exchange}/session/start`, {}),
+      pauseSession: (exchange: string, reason?: string) => post(`/autotrader/exchange-config/${exchange}/session/pause`, { reason }),
+    },
   },
 
   scans: {

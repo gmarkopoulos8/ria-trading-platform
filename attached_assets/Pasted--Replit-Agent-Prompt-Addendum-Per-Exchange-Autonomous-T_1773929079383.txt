@@ -1,0 +1,440 @@
+# Replit Agent Prompt — Addendum: Per-Exchange Autonomous Trading Parameters
+
+This is an addendum to the previous autonomous trading prompt. Apply these changes on top of everything already built. Do NOT re-implement anything from the previous prompt — only add and extend what’s described here.
+
+-----
+
+## OVERVIEW
+
+Each exchange integration (Hyperliquid and ThinkorSwim) needs its own independent parameter profile that controls exactly how the autonomous trader behaves on that platform. These parameters must be:
+
+1. **Stored per-user in the database** (not env vars — users configure them through the UI)
+1. **Validated on the backend** before any order is placed
+1. **Displayed and editable** on each exchange’s existing dashboard page (HyperliquidDashboard and TosDashboard) as a new collapsible “Autonomous Trading Parameters” panel
+1. **Enforced in AutoTradeExecutor** before routing to each exchange
+
+-----
+
+## PHASE A — Database Schema
+
+Add to `server/prisma/schema.prisma`:
+
+```prisma
+model ExchangeAutoConfig {
+  id        String   @id @default(cuid())
+  userId    String
+  exchange  String   // 'hyperliquid' | 'tos'
+
+  // ── Activation & Scheduling ──────────────────────────────────
+  enabled               Boolean  @default(false)
+  // How long to run autonomously before auto-pausing (null = indefinite)
+  sessionDurationHours  Float?
+  // Auto-pause after this wall-clock time each day (e.g. "16:00" ET = market close)
+  dailyCutoffTime       String?  // "HH:MM" in exchange's local timezone
+  // Days of week to trade (0=Sun … 6=Sat). Empty = all days
+  activeDays            Int[]    @default([1,2,3,4,5])
+  // Timestamp when current autonomous session started (null if not running)
+  sessionStartedAt      DateTime?
+  // Auto-pause triggered at this time (set when sessionDurationHours elapses)
+  sessionPausedAt       DateTime?
+
+  // ── Capital Allocation ───────────────────────────────────────
+  // Maximum total USD this integration is ever allowed to have deployed (hard cap)
+  capitalHardLimitUsd   Float    @default(5000)
+  // Target allocation — how much to actively deploy in open positions at once
+  capitalTargetUsd      Float    @default(2000)
+  // Max USD in any single trade/position
+  maxPositionSizeUsd    Float    @default(500)
+  // Min USD for a position to be worth placing (filters out tiny nano-positions)
+  minPositionSizeUsd    Float    @default(50)
+
+  // ── Risk Profile ─────────────────────────────────────────────
+  riskMode              String   @default("MODERATE") // CONSERVATIVE | MODERATE | AGGRESSIVE | CUSTOM
+  // Risk % per trade (only used when riskMode = CUSTOM)
+  customRiskPct         Float?
+  // Stop loss floor — never set a stop tighter than this % below entry
+  minStopDistancePct    Float    @default(1.0)
+  // Stop loss ceiling — if thesis invalidation is wider than this, skip the trade
+  maxStopDistancePct    Float    @default(12.0)
+  // Minimum reward:risk ratio required to take a trade (e.g. 1.5 = need 1.5:1)
+  minRewardRiskRatio    Float    @default(1.5)
+  // Maximum drawdown on THIS exchange before auto-pausing (independent of global circuit breaker)
+  maxDrawdownPct        Float    @default(5.0)
+  // Maximum daily loss in USD on this exchange before auto-pausing
+  maxDailyLossUsd       Float    @default(200)
+
+  // ── Position Limits ──────────────────────────────────────────
+  maxConcurrentPositions Int     @default(3)
+  // Max number of trades to place per scan cycle (throttle)
+  maxTradesPerScan      Int      @default(2)
+  // Max trades in a single calendar day
+  maxTradesPerDay       Int      @default(5)
+  // Cooldown between placing orders on this exchange (minutes)
+  orderCooldownMinutes  Int      @default(15)
+
+  // ── Signal Thresholds ────────────────────────────────────────
+  minConvictionScore    Float    @default(78)
+  minConfidenceScore    Float    @default(60)
+  // Only trade these biases ('BULLISH', 'BEARISH', or both)
+  allowedBias           String[] @default(["BULLISH"])
+  // Only act on these recommended actions
+  allowedActions        String[] @default(["STRONG_BUY", "BUY"])
+  // Minimum thesis health score for HOLDING — auto-exit if health drops below this
+  minHoldThesisHealth   Float    @default(35)
+
+  // ── Exchange-Specific (Hyperliquid only) ─────────────────────
+  // Default leverage for new positions (1 = spot-equivalent, no leverage)
+  defaultLeverage       Int      @default(2)
+  // Maximum leverage ever allowed regardless of conviction
+  maxLeverage           Int      @default(5)
+  // Use cross margin (true) or isolated margin (false)
+  useCrossMargin        Boolean  @default(true)
+  // Only trade these specific assets (empty = all assets in scan universe)
+  allowedAssets         String[] @default([])
+  // Never trade these assets even if scan recommends them
+  blockedAssets         String[] @default([])
+  // Enable short positions (false = long only)
+  allowShorts           Boolean  @default(false)
+
+  // ── Exchange-Specific (TOS / Schwab only) ───────────────────
+  // Asset types allowed to trade (EQUITY, OPTION, ETF)
+  allowedAssetTypes     String[] @default(["EQUITY", "ETF"])
+  // Order session: NORMAL | SEAMLESS (pre/after hours)
+  orderSession          String   @default("NORMAL")
+  // Default order duration
+  orderDuration         String   @default("DAY")
+  // Enable bracket orders (auto-attach TP and SL to every entry)
+  useBracketOrders      Boolean  @default(true)
+  // Sector blocklist — never buy stocks in these sectors
+  blockedSectors        String[] @default([])
+  // Min average daily volume (shares) — skip illiquid stocks
+  minAvgDailyVolume     Int      @default(500000)
+  // Min market cap in USD — skip micro/nano caps
+  minMarketCapUsd       Float    @default(1000000000) // $1B default
+
+  // ── Audit ────────────────────────────────────────────────────
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  @@unique([userId, exchange])
+  @@index([userId])
+}
+```
+
+Run `npx prisma migrate dev --name add_exchange_auto_config` after adding this model.
+
+-----
+
+## PHASE B — Backend Service
+
+**File**: `server/src/services/autotrader/ExchangeAutoConfigService.ts`
+
+```typescript
+export interface ExchangeAutoConfig { /* mirrors the Prisma model */ }
+
+export interface ConfigValidationResult {
+  valid: boolean;
+  errors: string[];
+  warnings: string[];
+}
+```
+
+Implement these functions:
+
+**`getConfig(userId: string, exchange: 'hyperliquid' | 'tos'): Promise<ExchangeAutoConfig>`**
+
+- Fetches from DB; if no record exists, creates one with all defaults and returns it
+- Merge with live exchange state for context (e.g., actual account equity to validate capital limits)
+
+**`saveConfig(userId: string, exchange: string, updates: Partial<ExchangeAutoConfig>): Promise<ExchangeAutoConfig>`**
+
+- Validate before saving (call `validateConfig`)
+- Strip fields that don’t belong to the exchange type (e.g., don’t save `defaultLeverage` for TOS)
+- Return the saved config
+
+**`validateConfig(config: Partial<ExchangeAutoConfig>, exchange: string): ConfigValidationResult`**
+
+- `capitalTargetUsd` must be ≤ `capitalHardLimitUsd`
+- `maxPositionSizeUsd` must be ≤ `capitalTargetUsd`
+- `minPositionSizeUsd` must be < `maxPositionSizeUsd`
+- `minStopDistancePct` must be < `maxStopDistancePct`
+- `minRewardRiskRatio` must be ≥ 1.0
+- `maxDailyLossUsd` must be ≤ `capitalHardLimitUsd × 0.5` (can’t risk losing more than half your cap in a day)
+- For HL: `defaultLeverage` ≤ `maxLeverage`, both ≤ 20
+- `minConvictionScore` must be between 50–99
+- Warnings (not errors): if `maxLeverage > 5`, warn “High leverage increases liquidation risk”; if `maxStopDistancePct > 10`, warn “Wide stops will reduce position sizes significantly”
+
+**`checkSessionActive(userId: string, exchange: string): Promise<{ active: boolean; reason?: string }>`**
+
+- Returns false with reason if: `enabled = false`, current time is outside `activeDays`, current time is past `dailyCutoffTime`, `sessionDurationHours` has elapsed since `sessionStartedAt`, daily trade count from `AutoTradeLog` has hit `maxTradesPerDay`, or daily loss from closed positions today has hit `maxDailyLossUsd`
+
+**`startSession(userId: string, exchange: string): Promise<void>`**
+
+- Sets `sessionStartedAt = now()`, clears `sessionPausedAt`
+
+**`pauseSession(userId: string, exchange: string, reason: string): Promise<void>`**
+
+- Sets `sessionPausedAt = now()`, logs reason to `AutoTradeLog` as action `'SESSION_PAUSED'`
+
+**`getTodayTradeCount(userId: string, exchange: string): Promise<number>`**
+
+- Count `AutoTradeLog` entries for today where `action IN ('BUY', 'SELL')` and `status = 'submitted'`
+
+**`getTodayLossUsd(userId: string, exchange: string): Promise<number>`**
+
+- Sum realized losses from `ClosedPosition` for today, filtered by exchange
+
+-----
+
+## PHASE C — Enforce Parameters in AutoTradeExecutor
+
+In `server/src/services/autotrader/AutoTradeExecutor.ts`, update `evaluateAndExecute()` to load and enforce per-exchange configs:
+
+Before routing any trade to an exchange:
+
+```typescript
+const exchangeConfig = await exchangeAutoConfigService.getConfig(userId, exchange);
+const sessionCheck = await exchangeAutoConfigService.checkSessionActive(userId, exchange);
+
+if (!sessionCheck.active) {
+  logSkip(ticker, `Exchange session inactive: ${sessionCheck.reason}`);
+  continue;
+}
+```
+
+Then enforce each parameter in order:
+
+1. **Capital hard limit**: fetch `PortfolioStateService` → sum notional of all open positions on this exchange. If already at or above `capitalHardLimitUsd`, skip with reason `'CAPITAL_HARD_LIMIT_REACHED'`
+1. **Capital target**: if current deployed capital + new position notional would exceed `capitalTargetUsd`, reduce position size to fit, or skip if it would be below `minPositionSizeUsd`
+1. **Max position size**: clamp `PositionSizer` output to `maxPositionSizeUsd`. If clamped quantity is below `minPositionSizeUsd`, skip.
+1. **Order cooldown**: check `AutoTradeLog` for this exchange — if any order was placed within the last `orderCooldownMinutes` minutes, skip with reason `'ORDER_COOLDOWN'`
+1. **Max trades per scan**: count how many trades have been placed in this `evaluateAndExecute()` call for this exchange. Stop if `maxTradesPerScan` reached.
+1. **Signal thresholds**: enforce `minConvictionScore`, `minConfidenceScore`, `allowedBias`, `allowedActions` (these may be stricter than the global AutoTradeConfig values — use the MORE restrictive of the two)
+1. **Stop distance check**: compute `stopDistancePct = abs(entryPrice - stopLoss) / entryPrice × 100`. Skip if < `minStopDistancePct` or > `maxStopDistancePct`
+1. **Reward:risk ratio**: compute `(takeProfit - entryPrice) / (entryPrice - stopLoss)`. Skip if < `minRewardRiskRatio`
+1. **HL-specific**: apply `defaultLeverage` (capped at `maxLeverage`); check `allowedAssets` / `blockedAssets`; if `allowShorts = false`, skip any `BEARISH` bias even if `allowedBias` includes it
+1. **TOS-specific**: check `allowedAssetTypes`; apply `orderSession` and `orderDuration` to order request; check `minAvgDailyVolume` and `minMarketCapUsd` from the thesis’s market structure data; check `blockedSectors` against the candidate’s sector
+
+-----
+
+## PHASE D — New API Routes
+
+Add to `server/src/routes/autotrader.ts` (the file created in the previous prompt):
+
+```
+GET  /api/autotrader/exchange-config/:exchange        → getConfig(userId, exchange)
+PUT  /api/autotrader/exchange-config/:exchange        → saveConfig(userId, exchange, body)
+POST /api/autotrader/exchange-config/:exchange/validate → validateConfig(body, exchange) — dry validate without saving
+GET  /api/autotrader/exchange-config/:exchange/session-status → checkSessionActive(userId, exchange)
+POST /api/autotrader/exchange-config/:exchange/session/start  → startSession
+POST /api/autotrader/exchange-config/:exchange/session/pause  → pauseSession
+```
+
+Add corresponding methods to `client/src/api/client.ts`:
+
+```typescript
+exchangeConfig: {
+  get: (exchange: string) => apiGet(`/autotrader/exchange-config/${exchange}`),
+  save: (exchange: string, data: unknown) => apiPut(`/autotrader/exchange-config/${exchange}`, data),
+  validate: (exchange: string, data: unknown) => apiPost(`/autotrader/exchange-config/${exchange}/validate`, data),
+  sessionStatus: (exchange: string) => apiGet(`/autotrader/exchange-config/${exchange}/session-status`),
+  startSession: (exchange: string) => apiPost(`/autotrader/exchange-config/${exchange}/session/start`, {}),
+  pauseSession: (exchange: string) => apiPost(`/autotrader/exchange-config/${exchange}/session/pause`, {}),
+}
+```
+
+-----
+
+## PHASE E — Frontend: Hyperliquid Parameters Panel
+
+In `client/src/pages/hyperliquid/HyperliquidDashboard.tsx`, add a new collapsible section **below** the existing killswitch/status section but **above** the positions table. Label it **“⚙ Autonomous Trading Parameters”**.
+
+Use a `useState(false)` for `showParams` and a chevron toggle button to expand/collapse. When collapsed, show a single summary line: `"Session: ON · Capital: $X / $Y hard cap · Conviction ≥ Z · 2x leverage"` using current config values.
+
+When expanded, render a two-column form grid with the following grouped sections:
+
+**Group 1 — Session Control**
+
+- `enabled` → large toggle labeled “Enable Autonomous Trading on Hyperliquid”
+  - When toggled ON, call `startSession('hyperliquid')`; when toggled OFF, call `pauseSession('hyperliquid')`
+  - Show session status: “Active since X” or “Paused · reason: Y” in small text below
+- `sessionDurationHours` → number input labeled “Auto-pause after (hours)” with placeholder “Leave blank for indefinite”. Show helper: “Session will automatically pause after this many hours of activity.”
+- `dailyCutoffTime` → time input labeled “Daily cutoff time (ET)” — after this time, no new trades are placed today
+- `activeDays` → multi-checkbox row: Mon / Tue / Wed / Thu / Fri / Sat / Sun (crypto trades 24/7 so all days are relevant here)
+
+**Group 2 — Capital Allocation**
+
+- `capitalHardLimitUsd` → dollar input labeled “Capital Hard Limit ($)” with red helper text: “Absolute maximum this integration can ever deploy. Orders are blocked if this is reached.”
+- `capitalTargetUsd` → dollar input labeled “Target Deployment ($)” with helper: “How much to actively keep deployed in positions.”
+- `maxPositionSizeUsd` → dollar input labeled “Max Single Position ($)”
+- `minPositionSizeUsd` → dollar input labeled “Min Position Size ($)” with helper: “Positions smaller than this are skipped.”
+- Show a live utilization bar: `Current deployed: $X / Hard limit: $Y` (fetch from `GET /api/autotrader/portfolio`)
+
+**Group 3 — Risk Profile**
+
+- `riskMode` → segmented button row: Conservative | Moderate | Aggressive | Custom
+  - When “Custom” selected, reveal `customRiskPct` number input labeled “Risk % per trade”
+- `maxDrawdownPct` → number input labeled “Max Drawdown (%) on this exchange”
+- `maxDailyLossUsd` → dollar input labeled “Max Daily Loss ($)”
+- `minRewardRiskRatio` → number input labeled “Min Reward:Risk Ratio” (step 0.1, min 1.0)
+- `minStopDistancePct` / `maxStopDistancePct` → two inputs side by side labeled “Stop Distance Range (%)” with a dash between them
+
+**Group 4 — Position Limits**
+
+- `maxConcurrentPositions` → number input (1–10)
+- `maxTradesPerScan` → number input (1–5) labeled “Max new trades per scan cycle”
+- `maxTradesPerDay` → number input (1–20)
+- `orderCooldownMinutes` → number input labeled “Cooldown between orders (min)”
+- Show today’s stats inline: “Today: X trades placed, Y remaining”
+
+**Group 5 — Signal Thresholds**
+
+- `minConvictionScore` → slider (50–99) with live numeric display
+- `minConfidenceScore` → slider (40–99)
+- `allowedBias` → checkboxes: Bullish / Bearish
+- `allowedActions` → multi-select checkboxes: STRONG_BUY / BUY / WATCH / SHORT / STRONG_SHORT
+- `minHoldThesisHealth` → slider (10–80) labeled “Auto-exit if thesis health drops below”
+
+**Group 6 — Hyperliquid-Specific**
+
+- `defaultLeverage` → slider (1–10) labeled “Default Leverage” with live display “Nx”. Show warning in orange if > 5: “⚠ High leverage significantly increases liquidation risk”
+- `maxLeverage` → number input labeled “Maximum Leverage Cap”
+- `useCrossMargin` → toggle labeled “Cross Margin” (off = Isolated)
+- `allowShorts` → toggle labeled “Allow Short Positions”
+- `allowedAssets` → tag input labeled “Allowed Assets (leave blank for all)” — user types a ticker and presses Enter to add it as a chip/tag; X to remove
+- `blockedAssets` → tag input labeled “Blocked Assets”
+
+**Save / Validation behavior:**
+
+- “Save Parameters” button calls `PUT /api/autotrader/exchange-config/hyperliquid`
+- Before saving, call `POST /api/autotrader/exchange-config/hyperliquid/validate` and display any errors inline (red text under the offending field) and warnings (yellow)
+- Show a green success toast on save, or red error toast if validation fails
+- Use TanStack Query `useMutation` for the save call
+
+-----
+
+## PHASE F — Frontend: ThinkorSwim Parameters Panel
+
+In `client/src/pages/tos/TosDashboard.tsx`, add the same collapsible **“⚙ Autonomous Trading Parameters”** panel below the existing auth/status section.
+
+Same collapsed summary line pattern as Hyperliquid.
+
+When expanded, render with the same group structure but TOS-specific fields:
+
+**Group 1 — Session Control** *(identical to HL but for TOS)*
+
+- `enabled`, `sessionDurationHours`, `dailyCutoffTime`
+- `activeDays` → Mon–Fri only (stocks don’t trade weekends — Sat/Sun should be disabled/greyed out)
+- Note: Show a helper “TOS trades Mon–Fri market hours only. Weekend days are automatically ignored.”
+
+**Group 2 — Capital Allocation** *(identical fields, TOS context)*
+
+- Same 4 fields. Helper text for `capitalHardLimitUsd`: “Hard cap on buying power this integration can deploy. Schwab buying power must exceed this for trades to execute.”
+- Show live: “Current buying power: $X · Positions deployed: $Y · Hard limit: $Z”
+
+**Group 3 — Risk Profile** *(identical to HL)*
+
+- `riskMode`, `customRiskPct`, `maxDrawdownPct`, `maxDailyLossUsd`, `minRewardRiskRatio`, `minStopDistancePct` / `maxStopDistancePct`
+
+**Group 4 — Position Limits** *(identical to HL)*
+
+- `maxConcurrentPositions`, `maxTradesPerScan`, `maxTradesPerDay`, `orderCooldownMinutes`
+
+**Group 5 — Signal Thresholds** *(identical to HL)*
+
+- `minConvictionScore`, `minConfidenceScore`, `allowedBias`, `allowedActions`, `minHoldThesisHealth`
+
+**Group 6 — TOS/Schwab-Specific**
+
+- `allowedAssetTypes` → checkboxes: Equity / ETF / Option (Option checkbox shows a yellow warning: “Options trading requires appropriate account permissions in Schwab”)
+- `orderSession` → segmented button: Normal | Seamless (Pre/After Hours). Seamless shows a yellow note: “After-hours trading has reduced liquidity and wider spreads.”
+- `orderDuration` → dropdown: DAY / GTC / FOK / IOC
+- `useBracketOrders` → toggle labeled “Attach Bracket Orders (auto TP + SL)” — when OFF, show note “Orders placed without automatic take-profit or stop-loss legs”
+- `minAvgDailyVolume` → number input labeled “Min Avg Daily Volume (shares)” with helper “Stocks below this volume threshold are skipped”
+- `minMarketCapUsd` → dollar input labeled “Min Market Cap ($)” with preset buttons: $500M / $1B / $5B / $10B that populate the field
+- `blockedSectors` → tag input labeled “Blocked Sectors” — autocomplete from: Technology / Healthcare / Financials / Energy / Consumer Discretionary / Consumer Staples / Industrials / Materials / Real Estate / Utilities / Communication Services
+- Show a note: “Blocked sectors apply to all autonomous stock picks regardless of conviction score.”
+
+**Save / Validation behavior:** identical to Hyperliquid panel.
+
+-----
+
+## PHASE G — Auto Trader Page: Per-Exchange Status Cards
+
+In `client/src/pages/AutoTrader.tsx` (from the previous prompt), add a **“Exchange Status”** section between the Master Control Panel and Configuration Panel. Show two side-by-side cards, one for each exchange:
+
+**Hyperliquid Card:**
+
+- Exchange logo area with “HYPERLIQUID” label
+- Session status indicator (green pulse = active, yellow = paused, grey = disabled)
+- Key stats in a compact grid:
+  - Deployed capital vs hard limit (with mini progress bar)
+  - Today’s trades: X / max Y
+  - Today’s P&L on this exchange
+  - Current leverage avg
+  - Session started / paused timestamp
+- “Configure” button → links to `/hyperliquid` page (scrolls to params panel)
+- Quick toggle to enable/disable this exchange’s autonomous trading
+
+**ThinkorSwim Card:**
+
+- Same structure as Hyperliquid card
+- Shows buying power utilization instead of margin
+- “Configure” button → links to `/tos`
+
+-----
+
+## PHASE H — Session Auto-Management
+
+In `server/src/services/autotrader/IntradayMonitorLoop.ts` (from the previous prompt), add session lifecycle checks on every tick:
+
+```typescript
+// For each exchange with a config:
+const hlCheck = await exchangeAutoConfigService.checkSessionActive(userId, 'hyperliquid');
+const tosCheck = await exchangeAutoConfigService.checkSessionActive(userId, 'tos');
+
+if (!hlCheck.active && hlConfig.sessionStartedAt && !hlConfig.sessionPausedAt) {
+  await exchangeAutoConfigService.pauseSession(userId, 'hyperliquid', hlCheck.reason ?? 'Auto-paused by monitor');
+}
+// same for TOS
+```
+
+Also check `maxDailyLossUsd`: after each monitoring cycle, compute today’s realized P&L on each exchange. If it crosses the `maxDailyLossUsd` threshold (as a loss), call `pauseSession()` with reason `'DAILY_LOSS_LIMIT_REACHED'` and create a critical system alert via the existing `Alert` model.
+
+-----
+
+## IMPLEMENTATION NOTES
+
+- The `ExchangeAutoConfig` record should be created with all defaults on first `GET` if none exists — never return 404 for a missing config
+- All dollar values stored in DB as `Float` in USD; display with `$` prefix and 2 decimal places in UI
+- The `allowedAssets` and `blockedAssets` tag inputs and `blockedSectors` should store as `String[]` in Prisma using PostgreSQL array type — or as JSON if PostgreSQL arrays aren’t available in the current setup
+- `activeDays` stored as `Int[]` (0 = Sunday, 1 = Monday … 6 = Saturday) — the UI checkboxes map to these integers
+- When `riskMode` is set to CONSERVATIVE, MODERATE, or AGGRESSIVE, the `customRiskPct` field is ignored even if set — only use it when `riskMode === 'CUSTOM'`
+- The preset market cap buttons ($500M/$1B/$5B/$10B) should visually highlight the currently selected tier but the underlying stored value is the raw float
+- The tag inputs for `allowedAssets`, `blockedAssets`, and `blockedSectors` should show entered values as small dismissible chips/badges styled with the app’s `bg-surface-3 text-xs rounded` pattern
+- Form state should be managed with `useState` initialized from the `useQuery` data; unsaved changes should show a yellow “Unsaved changes” banner near the Save button
+- All parameters in these panels are **per-exchange** and **per-user** — two different users on the same system have completely independent configs
+- When enforcing `minMarketCapUsd` and `minAvgDailyVolume` in TOS trades, use the market cap and volume data already present in the `ThesisSummary` / `RankedResult` from the scan — do not make additional API calls at execution time
+
+-----
+
+## SUMMARY OF NEW/MODIFIED FILES
+
+**New files:**
+
+```
+server/src/services/autotrader/ExchangeAutoConfigService.ts
+```
+
+**Modified files:**
+
+```
+server/prisma/schema.prisma                           → add ExchangeAutoConfig model
+server/src/routes/autotrader.ts                       → add 6 exchange-config endpoints
+server/src/services/autotrader/AutoTradeExecutor.ts   → enforce per-exchange params
+server/src/services/autotrader/IntradayMonitorLoop.ts → session lifecycle + daily loss check
+client/src/api/client.ts                              → add exchangeConfig API methods
+client/src/pages/hyperliquid/HyperliquidDashboard.tsx → add HL parameters panel
+client/src/pages/tos/TosDashboard.tsx                 → add TOS parameters panel
+client/src/pages/AutoTrader.tsx                       → add per-exchange status cards
+```

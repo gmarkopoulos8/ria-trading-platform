@@ -696,6 +696,66 @@ model DailyMarketReport {
 
 // ─── Auto Trader ──────────────────────────────────────────────────
 
+model ExchangeAutoConfig {
+  id        String   @id @default(cuid())
+  userId    String
+  exchange  String
+
+  enabled               Boolean  @default(false)
+  sessionDurationHours  Float?
+  dailyCutoffTime       String?
+  activeDays            Int[]    @default([1,2,3,4,5])
+  sessionStartedAt      DateTime?
+  sessionPausedAt       DateTime?
+  sessionPauseReason    String?
+
+  capitalHardLimitUsd   Float    @default(5000)
+  capitalTargetUsd      Float    @default(2000)
+  maxPositionSizeUsd    Float    @default(500)
+  minPositionSizeUsd    Float    @default(50)
+
+  riskMode              String   @default("MODERATE")
+  customRiskPct         Float?
+  minStopDistancePct    Float    @default(1.0)
+  maxStopDistancePct    Float    @default(12.0)
+  minRewardRiskRatio    Float    @default(1.5)
+  maxDrawdownPct        Float    @default(5.0)
+  maxDailyLossUsd       Float    @default(200)
+
+  maxConcurrentPositions Int     @default(3)
+  maxTradesPerScan      Int      @default(2)
+  maxTradesPerDay       Int      @default(5)
+  orderCooldownMinutes  Int      @default(15)
+
+  minConvictionScore    Float    @default(78)
+  minConfidenceScore    Float    @default(60)
+  allowedBias           String[] @default(["BULLISH"])
+  allowedActions        String[] @default(["STRONG_BUY", "BUY"])
+  minHoldThesisHealth   Float    @default(35)
+
+  defaultLeverage       Int      @default(2)
+  maxLeverage           Int      @default(5)
+  useCrossMargin        Boolean  @default(true)
+  allowedAssets         String[] @default([])
+  blockedAssets         String[] @default([])
+  allowShorts           Boolean  @default(false)
+
+  allowedAssetTypes     String[] @default(["EQUITY", "ETF"])
+  orderSession          String   @default("NORMAL")
+  orderDuration         String   @default("DAY")
+  useBracketOrders      Boolean  @default(true)
+  blockedSectors        String[] @default([])
+  minAvgDailyVolume     Int      @default(500000)
+  minMarketCapUsd       Float    @default(1000000000)
+
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  @@unique([userId, exchange])
+  @@index([userId])
+  @@map("exchange_auto_configs")
+}
+
 model AutoTradeLog {
   id                    String   @id @default(cuid())
   userSettingsId        String

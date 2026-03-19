@@ -6,6 +6,7 @@ import { placeOrder as tosPlaceOrder, type TosOrderRequest } from '../tos/tosExc
 import { placeOrder as hlPlaceOrder, type OrderRequest as HlOrderRequest } from '../hyperliquid/hyperliquidExchangeService';
 import { TOS_CONFIG } from '../tos/tosConfig';
 import { HL_CONFIG } from '../hyperliquid/hyperliquidConfig';
+import { getConfig, checkSessionActive } from './ExchangeAutoConfigService';
 
 export type AutoTradeExchange = 'TOS' | 'HYPERLIQUID' | 'PAPER';
 
@@ -94,6 +95,7 @@ export async function executeAutoTrade(
   config: AutoTradeConfig,
   userSettingsId: string,
   sessionId: string,
+  perScanTradeCount?: Map<string, number>,
 ): Promise<AutoTradeResult> {
   const exchange = signal.exchange ?? config.exchange;
 
@@ -101,6 +103,74 @@ export async function executeAutoTrade(
     return { success: false, status: 'BLOCKED', symbol: signal.symbol, exchange, reason: 'Auto-trading is disabled' };
   }
 
+  // ─── Per-Exchange Config Enforcement ─────────────────────────────────────
+  const exchangeKey = exchange === 'TOS' ? 'tos' : exchange === 'HYPERLIQUID' ? 'hyperliquid' : null;
+
+  if (exchangeKey) {
+    try {
+      const settings = await prisma.userSettings.findUnique({ where: { id: userSettingsId } });
+      const userId = settings?.userId;
+
+      if (userId) {
+        const exCfg = await getConfig(userId, exchangeKey as 'hyperliquid' | 'tos');
+
+        // Session active check
+        const sessionCheck = await checkSessionActive(userId, exchangeKey);
+        if (!sessionCheck.active) {
+          return { success: false, status: 'BLOCKED', symbol: signal.symbol, exchange, reason: `Exchange session inactive: ${sessionCheck.reason}` };
+        }
+
+        // Max trades per scan throttle
+        if (perScanTradeCount) {
+          const countForExchange = perScanTradeCount.get(exchange) ?? 0;
+          if (countForExchange >= exCfg.maxTradesPerScan) {
+            return { success: false, status: 'BLOCKED', symbol: signal.symbol, exchange, reason: `Max trades per scan (${exCfg.maxTradesPerScan}) reached for ${exchange}` };
+          }
+        }
+
+        // Order cooldown check
+        const cooldownCutoff = new Date(Date.now() - exCfg.orderCooldownMinutes * 60_000);
+        const recentOrder = await prisma.autoTradeLog.findFirst({
+          where: { userSettingsId, exchange, executedAt: { gte: cooldownCutoff } },
+          orderBy: { executedAt: 'desc' },
+        });
+        if (recentOrder) {
+          return { success: false, status: 'BLOCKED', symbol: signal.symbol, exchange, reason: `ORDER_COOLDOWN: must wait ${exCfg.orderCooldownMinutes}min between orders` };
+        }
+
+        // Signal threshold enforcement (use more restrictive of global vs per-exchange)
+        const effectiveMinConviction = Math.max(config.minConvictionScore, exCfg.minConvictionScore);
+        const effectiveMinConfidence = Math.max(config.minConfidenceScore, exCfg.minConfidenceScore);
+
+        if (signal.convictionScore < effectiveMinConviction) {
+          return { success: false, status: 'REJECTED', symbol: signal.symbol, exchange, reason: `Conviction ${signal.convictionScore} below exchange threshold ${effectiveMinConviction}` };
+        }
+        if (signal.confidenceScore < effectiveMinConfidence) {
+          return { success: false, status: 'REJECTED', symbol: signal.symbol, exchange, reason: `Confidence ${signal.confidenceScore} below exchange threshold ${effectiveMinConfidence}` };
+        }
+        if (!exCfg.allowedBias.includes(signal.bias)) {
+          return { success: false, status: 'REJECTED', symbol: signal.symbol, exchange, reason: `Bias ${signal.bias} not allowed on ${exchange}` };
+        }
+
+        // HL-specific checks
+        if (exchangeKey === 'hyperliquid') {
+          if (!exCfg.allowShorts && signal.bias === 'BEARISH') {
+            return { success: false, status: 'REJECTED', symbol: signal.symbol, exchange, reason: 'Short positions disabled on Hyperliquid' };
+          }
+          if (exCfg.allowedAssets.length > 0 && !exCfg.allowedAssets.includes(signal.symbol)) {
+            return { success: false, status: 'REJECTED', symbol: signal.symbol, exchange, reason: `${signal.symbol} not in Hyperliquid allowed assets list` };
+          }
+          if (exCfg.blockedAssets.includes(signal.symbol)) {
+            return { success: false, status: 'REJECTED', symbol: signal.symbol, exchange, reason: `${signal.symbol} is blocked on Hyperliquid` };
+          }
+        }
+      }
+    } catch (exCfgErr) {
+      console.warn(`[AutoTrader] Per-exchange config check failed for ${exchange}:`, exCfgErr instanceof Error ? exCfgErr.message : exCfgErr);
+    }
+  }
+
+  // ─── Global Signal Filters ──────────────────────────────────────────────
   if (!config.allowedBiases.includes(signal.bias)) {
     return { success: false, status: 'REJECTED', symbol: signal.symbol, exchange, reason: `Bias ${signal.bias} not in allowed list` };
   }
@@ -150,19 +220,71 @@ export async function executeAutoTrade(
     return { success: false, status: 'ERROR', symbol: signal.symbol, exchange, reason: 'Could not resolve entry price' };
   }
 
-  const sized = sizePosition({
+  const stopLoss = signal.stopLoss ?? computeStopLoss(entryPrice, 'LONG', config.stopLossPct);
+  const takeProfit = signal.takeProfit ?? computeTakeProfit(entryPrice, 'LONG', config.takeProfitPct);
+
+  // ─── Stop Distance & R:R Checks (using per-exchange config if available) ──
+  if (exchangeKey) {
+    try {
+      const settings = await prisma.userSettings.findUnique({ where: { id: userSettingsId } });
+      if (settings?.userId) {
+        const exCfg = await getConfig(settings.userId, exchangeKey as 'hyperliquid' | 'tos');
+        const stopDistPct = Math.abs(entryPrice - stopLoss) / entryPrice * 100;
+        if (stopDistPct < exCfg.minStopDistancePct) {
+          return { success: false, status: 'REJECTED', symbol: signal.symbol, exchange, reason: `Stop distance ${stopDistPct.toFixed(2)}% below minimum ${exCfg.minStopDistancePct}%` };
+        }
+        if (stopDistPct > exCfg.maxStopDistancePct) {
+          return { success: false, status: 'REJECTED', symbol: signal.symbol, exchange, reason: `Stop distance ${stopDistPct.toFixed(2)}% exceeds maximum ${exCfg.maxStopDistancePct}%` };
+        }
+        const rr = (takeProfit - entryPrice) / (entryPrice - stopLoss);
+        if (rr < exCfg.minRewardRiskRatio) {
+          return { success: false, status: 'REJECTED', symbol: signal.symbol, exchange, reason: `Reward:Risk ratio ${rr.toFixed(2)} below minimum ${exCfg.minRewardRiskRatio}` };
+        }
+
+        // Capital hard limit check
+        const openNotional = await prisma.autoTradeLog.aggregate({
+          where: { userSettingsId, exchange, phase: 'ENTRY', status: { in: ['FILLED', 'DRY_RUN'] } },
+          _sum: { quantity: true },
+        });
+        const approxDeployed = (openNotional._sum.quantity ?? 0) * entryPrice;
+        if (approxDeployed >= exCfg.capitalHardLimitUsd) {
+          return { success: false, status: 'BLOCKED', symbol: signal.symbol, exchange, reason: 'CAPITAL_HARD_LIMIT_REACHED' };
+        }
+      }
+    } catch {
+      // non-fatal
+    }
+  }
+
+  let sized = sizePosition({
     totalEquity,
     maxPositionPct: config.maxPositionPct,
     convictionScore: signal.convictionScore,
     riskScore: (signal.riskScore ?? 50) / 100,
   }, entryPrice);
 
+  // Clamp to per-exchange position size limits
+  if (exchangeKey) {
+    try {
+      const settings = await prisma.userSettings.findUnique({ where: { id: userSettingsId } });
+      if (settings?.userId) {
+        const exCfg = await getConfig(settings.userId, exchangeKey as 'hyperliquid' | 'tos');
+        if (sized.dollarAmount > exCfg.maxPositionSizeUsd) {
+          const clampedQty = exCfg.maxPositionSizeUsd / entryPrice;
+          sized = { ...sized, quantity: clampedQty, dollarAmount: exCfg.maxPositionSizeUsd };
+        }
+        if (sized.dollarAmount < exCfg.minPositionSizeUsd) {
+          return { success: false, status: 'REJECTED', symbol: signal.symbol, exchange, reason: `Position size $${sized.dollarAmount.toFixed(2)} below exchange minimum $${exCfg.minPositionSizeUsd}` };
+        }
+      }
+    } catch {
+      // non-fatal
+    }
+  }
+
   if (sized.quantity <= 0) {
     return { success: false, status: 'REJECTED', symbol: signal.symbol, exchange, reason: 'Position size too small' };
   }
-
-  const stopLoss = signal.stopLoss ?? computeStopLoss(entryPrice, 'LONG', config.stopLossPct);
-  const takeProfit = signal.takeProfit ?? computeTakeProfit(entryPrice, 'LONG', config.takeProfitPct);
 
   const log = await prisma.autoTradeLog.create({
     data: {
@@ -186,6 +308,11 @@ export async function executeAutoTrade(
     },
   });
 
+  // Increment per-scan counter
+  if (perScanTradeCount) {
+    perScanTradeCount.set(exchange, (perScanTradeCount.get(exchange) ?? 0) + 1);
+  }
+
   try {
     if (config.dryRun || exchange === 'PAPER') {
       await prisma.autoTradeLog.update({ where: { id: log.id }, data: { status: 'DRY_RUN' } });
@@ -202,17 +329,29 @@ export async function executeAutoTrade(
     }
 
     if (exchange === 'TOS') {
+      // Apply per-exchange TOS order settings
+      let duration: string = 'DAY';
+      let session: string = 'NORMAL';
+      try {
+        const settings = await prisma.userSettings.findUnique({ where: { id: userSettingsId } });
+        if (settings?.userId) {
+          const exCfg = await getConfig(settings.userId, 'tos');
+          duration = exCfg.orderDuration;
+          session = exCfg.orderSession;
+        }
+      } catch {}
+
       const orderReq: TosOrderRequest = {
         symbol: signal.symbol.toUpperCase(),
         instruction: 'BUY',
         quantity: Math.round(sized.quantity),
         orderType: 'MARKET',
-        duration: 'DAY',
-        session: 'NORMAL',
+        duration: duration as 'DAY' | 'GTC' | 'FOK' | 'IOC',
+        session: session as 'NORMAL' | 'SEAMLESS',
       };
       const result = await tosPlaceOrder(orderReq);
       const status = result.success ? 'FILLED' : 'ERROR';
-      await prisma.autoTradeLog.update({ where: { id: log.id }, data: { status, metadata: { signal, sized, result } as object } });
+      await prisma.autoTradeLog.update({ where: { id: log.id }, data: { status, metadata: JSON.parse(JSON.stringify({ signal, sized, result })) } });
       return {
         success: result.success,
         status: result.success ? 'FILLED' : 'ERROR',
@@ -227,9 +366,21 @@ export async function executeAutoTrade(
     }
 
     if (exchange === 'HYPERLIQUID') {
+      // Apply per-exchange HL settings
+      let leverage = 2;
+      let isBuy = true;
+      try {
+        const settings = await prisma.userSettings.findUnique({ where: { id: userSettingsId } });
+        if (settings?.userId) {
+          const exCfg = await getConfig(settings.userId, 'hyperliquid');
+          leverage = Math.min(exCfg.defaultLeverage, exCfg.maxLeverage);
+          isBuy = signal.bias !== 'BEARISH' || !exCfg.allowShorts;
+        }
+      } catch {}
+
       const hlReq: HlOrderRequest = {
         asset: signal.symbol,
-        isBuy: true,
+        isBuy,
         size: sized.quantity,
         price: entryPrice,
         orderType: 'limit',
@@ -238,7 +389,7 @@ export async function executeAutoTrade(
       };
       const result = await hlPlaceOrder(hlReq);
       const status = result.success ? 'FILLED' : 'ERROR';
-      await prisma.autoTradeLog.update({ where: { id: log.id }, data: { status, metadata: { signal, sized, result } as object } });
+      await prisma.autoTradeLog.update({ where: { id: log.id }, data: { status, metadata: JSON.parse(JSON.stringify({ signal, sized, result, leverage })) } });
       return {
         success: result.success,
         status: result.success ? 'FILLED' : 'ERROR',
@@ -267,11 +418,12 @@ export async function runTradingCycle(
 ): Promise<AutoTradeResult[]> {
   const sessionId = `session_${Date.now()}`;
   const results: AutoTradeResult[] = [];
+  const perScanTradeCount = new Map<string, number>();
 
   const sorted = [...signals].sort((a, b) => b.convictionScore - a.convictionScore);
 
   for (const signal of sorted) {
-    const result = await executeAutoTrade(signal, config, userSettingsId, sessionId);
+    const result = await executeAutoTrade(signal, config, userSettingsId, sessionId, perScanTradeCount);
     results.push(result);
     if (result.status === 'FILLED' || result.status === 'DRY_RUN') {
       await new Promise((r) => setTimeout(r, 200));

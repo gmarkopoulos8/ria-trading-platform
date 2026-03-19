@@ -1,5 +1,6 @@
 import { prisma } from '../../lib/prisma';
 import { DEFAULT_AUTO_TRADE_CONFIG, type AutoTradeConfig } from './AutoTradeExecutor';
+import { checkSessionActive, pauseSession } from './ExchangeAutoConfigService';
 
 let monitorInterval: NodeJS.Timeout | null = null;
 
@@ -62,23 +63,96 @@ async function monitorOpenAutoTrades(userSettingsId: string, config: AutoTradeCo
             exitPrice: currentPrice,
             pnl,
             reason: exitReason,
-            metadata: { entryLogId: log.id, currentPrice, hitTP, hitSL },
+            metadata: JSON.parse(JSON.stringify({ entryLogId: log.id, currentPrice, hitTP, hitSL })),
           },
         });
 
         await prisma.autoTradeLog.update({
           where: { id: log.id },
-          data: {
-            status: 'CLOSED',
-            exitPrice: currentPrice,
-            pnl,
-          },
+          data: { status: 'CLOSED', exitPrice: currentPrice, pnl },
         });
 
         console.log(`[AutoTrader] ${exitReason} for ${log.symbol} @ ${currentPrice} | PnL: $${pnl.toFixed(2)}`);
       }
     } catch (err) {
       console.error(`[AutoTrader] Monitor error for ${log.symbol}:`, err instanceof Error ? err.message : err);
+    }
+  }
+}
+
+async function runSessionLifecycleChecks(userId: string): Promise<void> {
+  const exchanges = ['hyperliquid', 'tos'] as const;
+
+  for (const exchange of exchanges) {
+    try {
+      const config = await prisma.exchangeAutoConfig.findUnique({
+        where: { userId_exchange: { userId, exchange } },
+      });
+
+      if (!config || !config.enabled) continue;
+      if (!config.sessionStartedAt || config.sessionPausedAt) continue;
+
+      const sessionCheck = await checkSessionActive(userId, exchange);
+      if (!sessionCheck.active) {
+        const reason = sessionCheck.reason ?? 'Auto-paused by intraday monitor';
+        console.log(`[AutoTrader] Pausing ${exchange} session for userId=${userId}: ${reason}`);
+        await pauseSession(userId, exchange, reason);
+
+        if (reason.includes('DAILY_LOSS') || reason.includes('daily loss')) {
+          const settings = await prisma.userSettings.findFirst({ where: { userId } });
+          if (settings) {
+            await prisma.alert.create({
+              data: {
+                userSettingsId: settings.id,
+                type: 'SYSTEM',
+                severity: 'CRITICAL',
+                title: `Daily Loss Limit Reached — ${exchange.toUpperCase()}`,
+                message: `Autonomous trading on ${exchange} has been paused: ${reason}`,
+                symbol: exchange.toUpperCase(),
+                metadata: JSON.parse(JSON.stringify({ exchange, reason, pausedAt: new Date().toISOString() })),
+              },
+            });
+          }
+        }
+      }
+
+      // Daily loss check after monitoring cycle
+      const startOfDay = new Date();
+      startOfDay.setHours(0, 0, 0, 0);
+      const settings = await prisma.userSettings.findFirst({ where: { userId } });
+      if (!settings) continue;
+
+      const exitLogs = await prisma.autoTradeLog.findMany({
+        where: {
+          userSettingsId: settings.id,
+          exchange: exchange.toUpperCase(),
+          phase: 'EXIT',
+          pnl: { lt: 0 },
+          executedAt: { gte: startOfDay },
+        },
+        select: { pnl: true },
+      });
+
+      const todayLoss = Math.abs(exitLogs.reduce((s, l) => s + (l.pnl ?? 0), 0));
+      if (todayLoss >= config.maxDailyLossUsd && config.sessionStartedAt && !config.sessionPausedAt) {
+        const reason = 'DAILY_LOSS_LIMIT_REACHED';
+        console.log(`[AutoTrader] Daily loss limit reached on ${exchange} for userId=${userId}. Loss: $${todayLoss.toFixed(2)}`);
+        await pauseSession(userId, exchange, reason);
+
+        await prisma.alert.create({
+          data: {
+            userSettingsId: settings.id,
+            type: 'SYSTEM',
+            severity: 'CRITICAL',
+            title: `Daily Loss Limit Reached — ${exchange.toUpperCase()}`,
+            message: `Autonomous trading paused. Today's loss: $${todayLoss.toFixed(2)} exceeded limit of $${config.maxDailyLossUsd.toFixed(2)}`,
+            symbol: exchange.toUpperCase(),
+            metadata: JSON.parse(JSON.stringify({ exchange, todayLoss, maxDailyLossUsd: config.maxDailyLossUsd })),
+          },
+        });
+      }
+    } catch (err) {
+      console.error(`[AutoTrader] Session lifecycle error for ${exchange}:`, err instanceof Error ? err.message : err);
     }
   }
 }
@@ -100,7 +174,12 @@ export async function runIntradayMonitor(): Promise<void> {
           : {}),
         enabled: settings.autoTradeEnabled,
       };
+
       await monitorOpenAutoTrades(settings.id, config);
+
+      if (settings.userId) {
+        await runSessionLifecycleChecks(settings.userId);
+      }
     }
   } catch (err) {
     console.error('[AutoTrader] Intraday monitor cycle error:', err instanceof Error ? err.message : err);

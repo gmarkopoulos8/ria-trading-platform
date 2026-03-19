@@ -4,7 +4,7 @@ import { toast } from 'sonner';
 import {
   Bot, Power, PowerOff, ShieldCheck, ShieldAlert, ShieldX, Zap, RefreshCw,
   PlayCircle, Settings2, TrendingUp, DollarSign, Activity, AlertTriangle,
-  CheckCircle2, XCircle, Clock, ChevronDown, ChevronUp, Info,
+  CheckCircle2, XCircle, Clock, ChevronDown, ChevronUp, Info, ExternalLink,
 } from 'lucide-react';
 import { cn } from '../lib/utils';
 import { api } from '../api/client';
@@ -431,6 +431,143 @@ function ConfigEditor({ config, onSave, saving }: {
   );
 }
 
+// ─── Exchange Status Section ──────────────────────────────────────
+
+function ExchangeStatusCard({ exchange, label, configPath }: { exchange: 'hyperliquid' | 'tos'; label: string; configPath: string }) {
+  const qc = useQueryClient();
+
+  const { data: configData } = useQuery({
+    queryKey: [`${exchange}-auto-config-card`],
+    queryFn: () => api.autotrader.exchangeConfig.get(exchange),
+    refetchInterval: 30_000,
+    staleTime: 15_000,
+  });
+  const { data: sessionData } = useQuery({
+    queryKey: [`${exchange}-session-status-card`],
+    queryFn: () => api.autotrader.exchangeConfig.sessionStatus(exchange),
+    refetchInterval: 30_000,
+  });
+
+  const toggleMut = useMutation({
+    mutationFn: (enable: boolean) => enable
+      ? api.autotrader.exchangeConfig.startSession(exchange)
+      : api.autotrader.exchangeConfig.pauseSession(exchange, 'Disabled from AutoTrader page'),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: [`${exchange}-auto-config-card`] });
+      qc.invalidateQueries({ queryKey: [`${exchange}-session-status-card`] });
+    },
+    onError: (err: any) => toast.error(err?.response?.data?.error ?? 'Failed'),
+  });
+
+  const cfg: any = (configData as any)?.data ?? null;
+  const session: any = (sessionData as any)?.data ?? null;
+
+  const isActive = session?.active && cfg?.enabled;
+  const isPaused = cfg?.enabled && !session?.active;
+  const dotColor = isActive ? 'bg-accent-green animate-pulse' : isPaused ? 'bg-amber-500' : 'bg-slate-600';
+  const statusText = isActive ? 'Active' : isPaused ? `Paused · ${session?.reason?.split(':')[0] ?? ''}` : 'Disabled';
+  const isHL = exchange === 'hyperliquid';
+  const accentColor = isHL ? 'text-accent-blue' : 'text-accent-green';
+  const borderColor = isHL ? 'border-accent-blue/20' : 'border-accent-green/20';
+
+  const todayTrades = 0;
+  const maxTrades = cfg?.maxTradesPerDay ?? 5;
+  const deployed = 0;
+  const hardLimit = cfg?.capitalHardLimitUsd ?? 5000;
+  const deployedPct = hardLimit > 0 ? Math.min(100, (deployed / hardLimit) * 100) : 0;
+
+  return (
+    <Card className={cn('border', borderColor)}>
+      <div className="flex items-start justify-between mb-4">
+        <div className="flex items-center gap-3">
+          <div className={cn('w-2 h-2 rounded-full flex-shrink-0', dotColor)} />
+          <div>
+            <p className="text-sm font-bold text-white">{label}</p>
+            <p className="text-xs text-slate-500">{statusText}</p>
+          </div>
+        </div>
+        <div className="flex items-center gap-2">
+          <a href={configPath} className="flex items-center gap-1 text-[10px] text-slate-500 hover:text-white border border-surface-border px-2 py-1 rounded transition-colors">
+            Configure <ExternalLink className="h-2.5 w-2.5" />
+          </a>
+          {cfg && (
+            <button
+              onClick={() => toggleMut.mutate(!cfg.enabled)}
+              disabled={toggleMut.isPending}
+              className={cn('relative w-9 h-5 rounded-full transition-colors flex-shrink-0', cfg.enabled ? (isHL ? 'bg-accent-blue' : 'bg-accent-green') : 'bg-surface-border')}
+            >
+              <span className={cn('absolute top-0.5 w-4 h-4 rounded-full bg-white transition-all', cfg.enabled ? 'left-4' : 'left-0.5')} />
+            </button>
+          )}
+        </div>
+      </div>
+
+      {cfg ? (
+        <div className="space-y-3">
+          <div>
+            <div className="flex justify-between text-xs mb-1">
+              <span className="text-slate-500">Capital deployed</span>
+              <span className="font-mono text-white">${deployed.toLocaleString()} / ${hardLimit.toLocaleString()}</span>
+            </div>
+            <div className="h-1.5 bg-surface-border rounded-full overflow-hidden">
+              <div className={cn('h-full rounded-full transition-all', isHL ? 'bg-accent-blue' : 'bg-accent-green')} style={{ width: `${deployedPct}%` }} />
+            </div>
+          </div>
+          <div className="grid grid-cols-2 gap-3 text-xs">
+            <div>
+              <p className="text-slate-500">Today's trades</p>
+              <p className="font-mono text-white">{todayTrades} / {maxTrades}</p>
+            </div>
+            <div>
+              <p className="text-slate-500">Conviction min</p>
+              <p className={cn('font-mono font-bold', accentColor)}>{cfg.minConvictionScore}</p>
+            </div>
+            {isHL && (
+              <div>
+                <p className="text-slate-500">Default leverage</p>
+                <p className="font-mono text-white">{cfg.defaultLeverage}x</p>
+              </div>
+            )}
+            {!isHL && (
+              <div>
+                <p className="text-slate-500">Order session</p>
+                <p className="font-mono text-white">{cfg.orderSession}</p>
+              </div>
+            )}
+            <div>
+              <p className="text-slate-500">Max daily loss</p>
+              <p className="font-mono text-red-400">${cfg.maxDailyLossUsd?.toLocaleString()}</p>
+            </div>
+          </div>
+          {cfg.sessionStartedAt && (
+            <p className="text-[10px] text-slate-600">Session started: {new Date(cfg.sessionStartedAt).toLocaleString()}</p>
+          )}
+        </div>
+      ) : (
+        <div className="flex items-center justify-center py-4 text-xs text-slate-600">Loading config…</div>
+      )}
+    </Card>
+  );
+}
+
+function ExchangeStatusSection() {
+  return (
+    <div>
+      <div className="flex items-center gap-2 mb-3">
+        <Activity className="h-4 w-4 text-slate-500" />
+        <h3 className="text-sm font-bold text-slate-300">Exchange Status</h3>
+        <span className="text-xs text-slate-600">Per-exchange autonomous trading sessions</span>
+      </div>
+      <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+        <ExchangeStatusCard exchange="hyperliquid" label="Hyperliquid" configPath="/hyperliquid" />
+        <ExchangeStatusCard exchange="tos" label="ThinkorSwim" configPath="/tos" />
+      </div>
+    </div>
+  );
+}
+
+// ─── Main Page ────────────────────────────────────────────────────
+
 export default function AutoTrader() {
   const qc = useQueryClient();
   const [showConfig, setShowConfig] = useState(false);
@@ -599,6 +736,8 @@ export default function AutoTrader() {
       </div>
 
       {cb && <CircuitBreakerPanel cb={cb} />}
+
+      <ExchangeStatusSection />
 
       {showConfig && config && (
         <Card>

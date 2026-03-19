@@ -1,10 +1,10 @@
-import { useState } from 'react';
+import { useState, useEffect } from 'react';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { toast } from 'sonner';
 import {
   TrendingUp, TrendingDown, RefreshCw, Clock, DollarSign, Lock,
   BarChart3, Power, PowerOff, ChevronDown, ChevronUp, Minus,
-  ShieldAlert, Zap, Activity,
+  ShieldAlert, Zap, Activity, X, Settings2,
 } from 'lucide-react';
 import { cn } from '../../lib/utils';
 import { api } from '../../api/client';
@@ -333,6 +333,355 @@ function PlaceOrderPanel({ onSuccess }: { onSuccess: () => void }) {
   );
 }
 
+// ─── TOS Autonomous Config Panel ─────────────────────────────────
+
+const SECTORS = ['Technology','Healthcare','Financials','Energy','Consumer Discretionary','Consumer Staples','Industrials','Materials','Real Estate','Utilities','Communication Services'];
+
+function SectorTagInput({ tags, onChange }: { tags: string[]; onChange: (t: string[]) => void }) {
+  const [input, setInput] = useState('');
+  const suggestions = SECTORS.filter((s) => s.toLowerCase().includes(input.toLowerCase()) && !tags.includes(s));
+  return (
+    <div>
+      <p className="text-xs text-slate-500 mb-1.5">Blocked Sectors</p>
+      <div className="flex flex-wrap gap-1.5 mb-1.5">
+        {tags.map((t) => (
+          <span key={t} className="flex items-center gap-1 bg-surface-3 border border-surface-border text-xs rounded px-2 py-0.5 text-slate-300">
+            {t}
+            <button onClick={() => onChange(tags.filter((x) => x !== t))} className="hover:text-red-400 transition-colors"><X className="h-2.5 w-2.5" /></button>
+          </span>
+        ))}
+      </div>
+      <div className="relative">
+        <input value={input} onChange={(e) => setInput(e.target.value)} placeholder="Type to search sectors…"
+          className="w-full bg-surface-2 border border-surface-border text-white text-xs rounded-lg px-3 py-1.5 focus:outline-none focus:border-accent-green/60 placeholder-slate-600" />
+        {input && suggestions.length > 0 && (
+          <div className="absolute z-10 top-full left-0 right-0 mt-1 bg-surface-2 border border-surface-border rounded-lg overflow-hidden shadow-lg">
+            {suggestions.slice(0, 5).map((s) => (
+              <button key={s} onClick={() => { onChange([...tags, s]); setInput(''); }}
+                className="w-full text-left px-3 py-2 text-xs text-slate-300 hover:bg-surface-3 transition-colors">{s}</button>
+            ))}
+          </div>
+        )}
+      </div>
+      <p className="text-[10px] text-slate-600 mt-1">Blocked sectors apply regardless of conviction score.</p>
+    </div>
+  );
+}
+
+function TOSTagInput({ label, tags, onChange }: { label: string; tags: string[]; onChange: (t: string[]) => void }) {
+  const [input, setInput] = useState('');
+  const add = () => { const v = input.trim().toUpperCase(); if (v && !tags.includes(v)) onChange([...tags, v]); setInput(''); };
+  return (
+    <div>
+      <p className="text-xs text-slate-500 mb-1.5">{label}</p>
+      <div className="flex flex-wrap gap-1.5 mb-1.5">
+        {tags.map((t) => (
+          <span key={t} className="flex items-center gap-1 bg-surface-3 border border-surface-border text-xs rounded px-2 py-0.5 text-slate-300">
+            {t}<button onClick={() => onChange(tags.filter((x) => x !== t))} className="hover:text-red-400 transition-colors"><X className="h-2.5 w-2.5" /></button>
+          </span>
+        ))}
+      </div>
+      <div className="flex gap-2">
+        <input value={input} onChange={(e) => setInput(e.target.value)} onKeyDown={(e) => e.key === 'Enter' && add()} placeholder="Type and press Enter…"
+          className="flex-1 bg-surface-2 border border-surface-border text-white text-xs rounded-lg px-3 py-1.5 focus:outline-none placeholder-slate-600" />
+        <button onClick={add} className="px-3 py-1.5 bg-surface-2 border border-surface-border text-xs text-slate-400 hover:text-white rounded-lg transition-colors">Add</button>
+      </div>
+    </div>
+  );
+}
+
+function TOSAutoConfigPanel() {
+  const qc = useQueryClient();
+  const [showParams, setShowParams] = useState(false);
+  const [form, setForm] = useState<Record<string, unknown> | null>(null);
+  const [unsaved, setUnsaved] = useState(false);
+  const [valErrors, setValErrors] = useState<string[]>([]);
+  const [valWarnings, setValWarnings] = useState<string[]>([]);
+
+  const { data: configData } = useQuery({ queryKey: ['tos-auto-config'], queryFn: () => api.autotrader.exchangeConfig.get('tos') });
+  const { data: sessionData, refetch: refetchSession } = useQuery({ queryKey: ['tos-session-status'], queryFn: () => api.autotrader.exchangeConfig.sessionStatus('tos'), refetchInterval: 30_000 });
+
+  const config: any = (configData as any)?.data ?? null;
+  const sessionStatus: any = (sessionData as any)?.data ?? null;
+
+  useEffect(() => { if (config && !form) setForm({ ...config }); }, [config]);
+
+  const upd = (k: string, v: unknown) => { setForm((f) => f ? { ...f, [k]: v } : { [k]: v }); setUnsaved(true); };
+
+  const toggleSession = useMutation({
+    mutationFn: (enable: boolean) => enable ? api.autotrader.exchangeConfig.startSession('tos') : api.autotrader.exchangeConfig.pauseSession('tos', 'Manually disabled'),
+    onSuccess: () => { refetchSession(); qc.invalidateQueries({ queryKey: ['tos-auto-config'] }); },
+    onError: (err: any) => toast.error(err?.response?.data?.error ?? 'Failed'),
+  });
+
+  const saveMutation = useMutation({
+    mutationFn: async (data: unknown) => {
+      const vRes: any = await api.autotrader.exchangeConfig.validate('tos', data);
+      const v = vRes?.data;
+      setValErrors(v?.errors ?? []); setValWarnings(v?.warnings ?? []);
+      if (!v?.valid) throw new Error(v?.errors?.[0] ?? 'Validation failed');
+      return api.autotrader.exchangeConfig.save('tos', data);
+    },
+    onSuccess: () => { toast.success('TOS parameters saved'); setUnsaved(false); qc.invalidateQueries({ queryKey: ['tos-auto-config'] }); },
+    onError: (err: any) => toast.error(err?.message ?? 'Save failed'),
+  });
+
+  if (!config || !form) return null;
+
+  const f = form as any;
+  const WEEKDAYS = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+  const summaryLine = `Session: ${f.enabled ? 'ON' : 'OFF'} · Capital: $${(f.capitalTargetUsd ?? 0).toLocaleString()} / $${(f.capitalHardLimitUsd ?? 0).toLocaleString()} · Conviction ≥ ${f.minConvictionScore ?? 78} · ${f.orderDuration ?? 'DAY'}`;
+  const inputCls = 'w-full bg-surface-2 border border-surface-border text-white text-xs rounded-lg px-3 py-2 focus:outline-none focus:border-accent-green/60';
+  const toggleBtn = (on: boolean, color = 'bg-accent-green') =>
+    <span className={cn('relative inline-flex w-9 h-5 rounded-full transition-colors flex-shrink-0', on ? color : 'bg-surface-border')}>
+      <span className={cn('absolute top-0.5 w-4 h-4 rounded-full bg-white transition-all', on ? 'left-4' : 'left-0.5')} />
+    </span>;
+  const MARKET_CAPS = [{ label: '$500M', val: 500_000_000 }, { label: '$1B', val: 1_000_000_000 }, { label: '$5B', val: 5_000_000_000 }, { label: '$10B', val: 10_000_000_000 }];
+
+  return (
+    <div className="border border-surface-border rounded-xl overflow-hidden">
+      <button onClick={() => setShowParams((v) => !v)} className="w-full flex items-center justify-between px-5 py-3.5 bg-surface-2 hover:bg-surface-3 transition-colors">
+        <div className="flex items-center gap-2">
+          <Settings2 className="h-4 w-4 text-accent-green" />
+          <span className="text-sm font-bold text-white">⚙ Autonomous Trading Parameters</span>
+          {f.enabled && <span className="text-[10px] bg-accent-green/15 text-accent-green px-1.5 py-0.5 rounded font-bold">ENABLED</span>}
+        </div>
+        <div className="flex items-center gap-3">
+          {!showParams && <span className="text-xs text-slate-500 font-mono hidden lg:block truncate max-w-xs">{summaryLine}</span>}
+          {showParams ? <ChevronUp className="h-4 w-4 text-slate-500" /> : <ChevronDown className="h-4 w-4 text-slate-500" />}
+        </div>
+      </button>
+
+      {showParams && (
+        <div className="p-5 space-y-6 bg-surface-1 border-t border-surface-border">
+          {unsaved && <div className="flex items-center px-3 py-2 bg-amber-500/10 border border-amber-500/30 rounded-lg"><span className="text-xs text-amber-400">⚠ Unsaved changes</span></div>}
+          {valErrors.length > 0 && <div className="px-3 py-2 bg-red-500/10 border border-red-500/30 rounded-lg space-y-1">{valErrors.map((e, i) => <p key={i} className="text-xs text-red-400">✗ {e}</p>)}</div>}
+          {valWarnings.length > 0 && <div className="px-3 py-2 bg-amber-500/10 border border-amber-500/30 rounded-lg space-y-1">{valWarnings.map((w, i) => <p key={i} className="text-xs text-amber-400">⚠ {w}</p>)}</div>}
+
+          {/* Group 1 — Session Control */}
+          <div>
+            <h3 className="text-xs font-bold text-slate-400 uppercase tracking-wider mb-3">Session Control</h3>
+            <p className="text-[10px] text-slate-500 mb-3">TOS trades Mon–Fri market hours only. Weekend days are automatically ignored.</p>
+            <div className="space-y-3">
+              <div className="flex items-start justify-between gap-4">
+                <div>
+                  <p className="text-sm font-medium text-white">Enable Autonomous Trading on ThinkorSwim</p>
+                  <p className="text-xs text-slate-500 mt-0.5">
+                    {sessionStatus?.active ? `Active since ${config.sessionStartedAt ? new Date(config.sessionStartedAt).toLocaleString() : '—'}` : config.sessionPausedAt ? `Paused · ${config.sessionPauseReason ?? 'manual'}` : 'Not started'}
+                  </p>
+                </div>
+                <button onClick={() => { upd('enabled', !f.enabled); toggleSession.mutate(!f.enabled); }}>{toggleBtn(f.enabled)}</button>
+              </div>
+              <div className="grid grid-cols-2 gap-3">
+                <div>
+                  <p className="text-xs text-slate-500 mb-1">Auto-pause after (hours)</p>
+                  <input type="number" placeholder="Indefinite" value={f.sessionDurationHours ?? ''} onChange={(e) => upd('sessionDurationHours', e.target.value ? parseFloat(e.target.value) : null)} className={inputCls} />
+                </div>
+                <div>
+                  <p className="text-xs text-slate-500 mb-1">Daily cutoff time (ET)</p>
+                  <input type="time" value={f.dailyCutoffTime ?? ''} onChange={(e) => upd('dailyCutoffTime', e.target.value || null)} className={inputCls} />
+                </div>
+              </div>
+              <div>
+                <p className="text-xs text-slate-500 mb-2">Active Trading Days</p>
+                <div className="flex gap-1.5 flex-wrap">
+                  {WEEKDAYS.map((d, i) => {
+                    const isWeekend = i === 0 || i === 6;
+                    const active = (f.activeDays ?? [1,2,3,4,5]).includes(i);
+                    return (
+                      <button key={d} disabled={isWeekend} onClick={() => { const cur: number[] = f.activeDays ?? [1,2,3,4,5]; upd('activeDays', active ? cur.filter((x: number) => x !== i) : [...cur, i].sort()); }}
+                        className={cn('px-2.5 py-1 rounded text-xs font-medium border transition-colors', isWeekend ? 'opacity-30 cursor-not-allowed bg-surface-2 border-surface-border text-slate-600' : active ? 'bg-accent-green/20 border-accent-green/40 text-accent-green' : 'bg-surface-2 border-surface-border text-slate-500')}>
+                        {d}
+                      </button>
+                    );
+                  })}
+                </div>
+              </div>
+            </div>
+          </div>
+
+          {/* Group 2 — Capital Allocation */}
+          <div>
+            <h3 className="text-xs font-bold text-slate-400 uppercase tracking-wider mb-3">Capital Allocation</h3>
+            <div className="grid grid-cols-2 gap-3">
+              <div>
+                <p className="text-xs text-slate-500 mb-1">Capital Hard Limit ($)</p>
+                <input type="number" value={f.capitalHardLimitUsd ?? 5000} onChange={(e) => upd('capitalHardLimitUsd', parseFloat(e.target.value))} className={inputCls} />
+                <p className="text-[10px] text-red-400/70 mt-1">Hard cap on buying power. Schwab buying power must exceed this for trades to execute.</p>
+              </div>
+              <div>
+                <p className="text-xs text-slate-500 mb-1">Target Deployment ($)</p>
+                <input type="number" value={f.capitalTargetUsd ?? 2000} onChange={(e) => upd('capitalTargetUsd', parseFloat(e.target.value))} className={inputCls} />
+              </div>
+              <div>
+                <p className="text-xs text-slate-500 mb-1">Max Single Position ($)</p>
+                <input type="number" value={f.maxPositionSizeUsd ?? 500} onChange={(e) => upd('maxPositionSizeUsd', parseFloat(e.target.value))} className={inputCls} />
+              </div>
+              <div>
+                <p className="text-xs text-slate-500 mb-1">Min Position Size ($)</p>
+                <input type="number" value={f.minPositionSizeUsd ?? 50} onChange={(e) => upd('minPositionSizeUsd', parseFloat(e.target.value))} className={inputCls} />
+              </div>
+            </div>
+          </div>
+
+          {/* Group 3 — Risk Profile */}
+          <div>
+            <h3 className="text-xs font-bold text-slate-400 uppercase tracking-wider mb-3">Risk Profile</h3>
+            <div className="space-y-3">
+              <div>
+                <p className="text-xs text-slate-500 mb-1.5">Risk Mode</p>
+                <div className="flex gap-1">
+                  {['CONSERVATIVE','MODERATE','AGGRESSIVE','CUSTOM'].map((m) => (
+                    <button key={m} onClick={() => upd('riskMode', m)}
+                      className={cn('flex-1 py-1.5 rounded-lg text-xs font-bold border transition-colors', f.riskMode === m ? 'bg-accent-green/20 border-accent-green/40 text-accent-green' : 'bg-surface-2 border-surface-border text-slate-500 hover:text-white')}>
+                      {m.charAt(0) + m.slice(1).toLowerCase()}
+                    </button>
+                  ))}
+                </div>
+              </div>
+              {f.riskMode === 'CUSTOM' && (
+                <div><p className="text-xs text-slate-500 mb-1">Risk % per trade</p><input type="number" step="0.1" value={f.customRiskPct ?? ''} onChange={(e) => upd('customRiskPct', parseFloat(e.target.value))} className="w-32 bg-surface-2 border border-surface-border text-white text-xs rounded-lg px-3 py-2 focus:outline-none" /></div>
+              )}
+              <div className="grid grid-cols-2 gap-3">
+                <div><p className="text-xs text-slate-500 mb-1">Max Drawdown (%) — this exchange</p><input type="number" step="0.1" value={f.maxDrawdownPct ?? 5} onChange={(e) => upd('maxDrawdownPct', parseFloat(e.target.value))} className={inputCls} /></div>
+                <div><p className="text-xs text-slate-500 mb-1">Max Daily Loss ($)</p><input type="number" value={f.maxDailyLossUsd ?? 200} onChange={(e) => upd('maxDailyLossUsd', parseFloat(e.target.value))} className={inputCls} /></div>
+                <div><p className="text-xs text-slate-500 mb-1">Min Reward:Risk Ratio</p><input type="number" step="0.1" min="1" value={f.minRewardRiskRatio ?? 1.5} onChange={(e) => upd('minRewardRiskRatio', parseFloat(e.target.value))} className={inputCls} /></div>
+                <div>
+                  <p className="text-xs text-slate-500 mb-1">Stop Distance Range (%)</p>
+                  <div className="flex items-center gap-2">
+                    <input type="number" step="0.1" value={f.minStopDistancePct ?? 1} onChange={(e) => upd('minStopDistancePct', parseFloat(e.target.value))} className="w-full bg-surface-2 border border-surface-border text-white text-xs rounded-lg px-2 py-2 focus:outline-none" />
+                    <span className="text-slate-500 text-xs">—</span>
+                    <input type="number" step="0.1" value={f.maxStopDistancePct ?? 12} onChange={(e) => upd('maxStopDistancePct', parseFloat(e.target.value))} className="w-full bg-surface-2 border border-surface-border text-white text-xs rounded-lg px-2 py-2 focus:outline-none" />
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          {/* Group 4 — Position Limits */}
+          <div>
+            <h3 className="text-xs font-bold text-slate-400 uppercase tracking-wider mb-3">Position Limits</h3>
+            <div className="grid grid-cols-2 gap-3">
+              <div><p className="text-xs text-slate-500 mb-1">Max Concurrent Positions</p><input type="number" min="1" max="10" value={f.maxConcurrentPositions ?? 3} onChange={(e) => upd('maxConcurrentPositions', parseInt(e.target.value))} className={inputCls} /></div>
+              <div><p className="text-xs text-slate-500 mb-1">Max new trades per scan cycle</p><input type="number" min="1" max="5" value={f.maxTradesPerScan ?? 2} onChange={(e) => upd('maxTradesPerScan', parseInt(e.target.value))} className={inputCls} /></div>
+              <div><p className="text-xs text-slate-500 mb-1">Max trades per day</p><input type="number" min="1" max="20" value={f.maxTradesPerDay ?? 5} onChange={(e) => upd('maxTradesPerDay', parseInt(e.target.value))} className={inputCls} /></div>
+              <div><p className="text-xs text-slate-500 mb-1">Cooldown between orders (min)</p><input type="number" min="0" value={f.orderCooldownMinutes ?? 15} onChange={(e) => upd('orderCooldownMinutes', parseInt(e.target.value))} className={inputCls} /></div>
+            </div>
+          </div>
+
+          {/* Group 5 — Signal Thresholds */}
+          <div>
+            <h3 className="text-xs font-bold text-slate-400 uppercase tracking-wider mb-3">Signal Thresholds</h3>
+            <div className="space-y-3">
+              <div><div className="flex justify-between mb-1"><p className="text-xs text-slate-500">Min Conviction Score</p><span className="text-xs font-bold text-accent-green">{f.minConvictionScore ?? 78}</span></div><input type="range" min="50" max="99" value={f.minConvictionScore ?? 78} onChange={(e) => upd('minConvictionScore', parseInt(e.target.value))} className="w-full" /></div>
+              <div><div className="flex justify-between mb-1"><p className="text-xs text-slate-500">Min Confidence Score</p><span className="text-xs font-bold text-accent-green">{f.minConfidenceScore ?? 60}</span></div><input type="range" min="40" max="99" value={f.minConfidenceScore ?? 60} onChange={(e) => upd('minConfidenceScore', parseInt(e.target.value))} className="w-full" /></div>
+              <div><div className="flex justify-between mb-1"><p className="text-xs text-slate-500">Auto-exit if thesis health drops below</p><span className="text-xs font-bold text-amber-400">{f.minHoldThesisHealth ?? 35}</span></div><input type="range" min="10" max="80" value={f.minHoldThesisHealth ?? 35} onChange={(e) => upd('minHoldThesisHealth', parseInt(e.target.value))} className="w-full" /></div>
+              <div className="grid grid-cols-2 gap-4">
+                <div>
+                  <p className="text-xs text-slate-500 mb-1.5">Allowed Bias</p>
+                  <div className="flex gap-3">
+                    {['BULLISH','BEARISH'].map((b) => { const on = (f.allowedBias ?? ['BULLISH']).includes(b); return (
+                      <label key={b} className="flex items-center gap-1.5 text-xs cursor-pointer">
+                        <input type="checkbox" checked={on} onChange={() => { const cur: string[] = f.allowedBias ?? ['BULLISH']; upd('allowedBias', on ? cur.filter((x: string) => x !== b) : [...cur, b]); }} className="w-3 h-3" />
+                        <span className={on ? (b === 'BULLISH' ? 'text-accent-green' : 'text-red-400') : 'text-slate-500'}>{b.charAt(0) + b.slice(1).toLowerCase()}</span>
+                      </label>
+                    ); })}
+                  </div>
+                </div>
+                <div>
+                  <p className="text-xs text-slate-500 mb-1.5">Allowed Actions</p>
+                  <div className="flex flex-col gap-1">
+                    {['STRONG_BUY','BUY','WATCH','SHORT','STRONG_SHORT'].map((a) => { const on = (f.allowedActions ?? ['STRONG_BUY','BUY']).includes(a); return (
+                      <label key={a} className="flex items-center gap-1.5 text-xs cursor-pointer">
+                        <input type="checkbox" checked={on} onChange={() => { const cur: string[] = f.allowedActions ?? ['STRONG_BUY','BUY']; upd('allowedActions', on ? cur.filter((x: string) => x !== a) : [...cur, a]); }} className="w-3 h-3" />
+                        <span className={on ? 'text-white' : 'text-slate-500'}>{a.replace('_', ' ')}</span>
+                      </label>
+                    ); })}
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          {/* Group 6 — TOS-Specific */}
+          <div>
+            <h3 className="text-xs font-bold text-slate-400 uppercase tracking-wider mb-3">ThinkorSwim Settings</h3>
+            <div className="space-y-3">
+              <div>
+                <p className="text-xs text-slate-500 mb-1.5">Allowed Asset Types</p>
+                <div className="flex gap-3">
+                  {['EQUITY','ETF','OPTION'].map((t) => { const on = (f.allowedAssetTypes ?? ['EQUITY','ETF']).includes(t); return (
+                    <label key={t} className="flex items-center gap-1.5 text-xs cursor-pointer">
+                      <input type="checkbox" checked={on} onChange={() => { const cur: string[] = f.allowedAssetTypes ?? ['EQUITY','ETF']; upd('allowedAssetTypes', on ? cur.filter((x: string) => x !== t) : [...cur, t]); }} className="w-3 h-3" />
+                      <span className={on ? 'text-white' : 'text-slate-500'}>{t}</span>
+                    </label>
+                  ); })}
+                </div>
+                {(f.allowedAssetTypes ?? []).includes('OPTION') && <p className="text-[10px] text-amber-400 mt-1">⚠ Options trading requires appropriate account permissions in Schwab</p>}
+              </div>
+              <div className="grid grid-cols-2 gap-3">
+                <div>
+                  <p className="text-xs text-slate-500 mb-1.5">Order Session</p>
+                  <div className="flex gap-1">
+                    {['NORMAL','SEAMLESS'].map((s) => (
+                      <button key={s} onClick={() => upd('orderSession', s)}
+                        className={cn('flex-1 py-1.5 rounded-lg text-xs font-bold border transition-colors', f.orderSession === s ? 'bg-accent-green/20 border-accent-green/40 text-accent-green' : 'bg-surface-2 border-surface-border text-slate-500 hover:text-white')}>
+                        {s === 'NORMAL' ? 'Normal' : 'Seamless (Pre/After)'}
+                      </button>
+                    ))}
+                  </div>
+                  {f.orderSession === 'SEAMLESS' && <p className="text-[10px] text-amber-400 mt-1">⚠ After-hours trading has reduced liquidity and wider spreads</p>}
+                </div>
+                <div>
+                  <p className="text-xs text-slate-500 mb-1">Order Duration</p>
+                  <select value={f.orderDuration ?? 'DAY'} onChange={(e) => upd('orderDuration', e.target.value)} className={inputCls + ' bg-surface-2'}>
+                    {['DAY','GTC','FOK','IOC'].map((d) => <option key={d} value={d}>{d}</option>)}
+                  </select>
+                </div>
+              </div>
+              <div className="flex items-center justify-between">
+                <div>
+                  <p className="text-xs text-white font-medium">Attach Bracket Orders (auto TP + SL)</p>
+                  {!f.useBracketOrders && <p className="text-[10px] text-slate-500">Orders placed without automatic take-profit or stop-loss legs</p>}
+                </div>
+                <button onClick={() => upd('useBracketOrders', !f.useBracketOrders)}>{toggleBtn(f.useBracketOrders)}</button>
+              </div>
+              <div className="grid grid-cols-2 gap-3">
+                <div>
+                  <p className="text-xs text-slate-500 mb-1">Min Avg Daily Volume (shares)</p>
+                  <input type="number" value={f.minAvgDailyVolume ?? 500000} onChange={(e) => upd('minAvgDailyVolume', parseInt(e.target.value))} className={inputCls} />
+                  <p className="text-[10px] text-slate-600 mt-1">Stocks below this volume are skipped</p>
+                </div>
+                <div>
+                  <p className="text-xs text-slate-500 mb-1">Min Market Cap ($)</p>
+                  <input type="number" value={f.minMarketCapUsd ?? 1_000_000_000} onChange={(e) => upd('minMarketCapUsd', parseFloat(e.target.value))} className={inputCls} />
+                  <div className="flex gap-1 mt-1.5">
+                    {MARKET_CAPS.map((mc) => (
+                      <button key={mc.label} onClick={() => upd('minMarketCapUsd', mc.val)}
+                        className={cn('flex-1 text-[10px] py-0.5 rounded border transition-colors', f.minMarketCapUsd === mc.val ? 'bg-accent-green/20 border-accent-green/40 text-accent-green' : 'bg-surface-2 border-surface-border text-slate-500 hover:text-white')}>
+                        {mc.label}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+              </div>
+              <SectorTagInput tags={f.blockedSectors ?? []} onChange={(t) => upd('blockedSectors', t)} />
+            </div>
+          </div>
+
+          {/* Save / Reset */}
+          <div className="flex items-center justify-end gap-3 pt-2 border-t border-surface-border">
+            <button onClick={() => { setForm({ ...config }); setUnsaved(false); setValErrors([]); setValWarnings([]); }} className="px-4 py-2 text-xs text-slate-400 hover:text-white border border-surface-border rounded-lg transition-colors">Reset</button>
+            <button onClick={() => form && saveMutation.mutate(form)} disabled={saveMutation.isPending} className={cn('px-5 py-2 bg-accent-green text-black text-xs font-bold rounded-lg transition-colors', saveMutation.isPending ? 'opacity-50 cursor-not-allowed' : 'hover:bg-accent-green/80')}>
+              {saveMutation.isPending ? 'Saving…' : 'Save Parameters'}
+            </button>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
 // ─── Main Dashboard ───────────────────────────────────────────────
 
 export default function TosDashboard() {
@@ -483,6 +832,8 @@ export default function TosDashboard() {
               {status && (
                 <DrawdownBar pct={status.drawdownPct ?? 0} max={status.maxDrawdownPct} />
               )}
+
+              <TOSAutoConfigPanel />
 
               <div className="grid grid-cols-1 xl:grid-cols-3 gap-6">
                 <div className="xl:col-span-2 space-y-6">

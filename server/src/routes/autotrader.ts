@@ -5,6 +5,14 @@ import { runTradingCycle, DEFAULT_AUTO_TRADE_CONFIG, type AutoTradeConfig } from
 import { buildSignalsFromLatestScan } from '../services/scans/dynamicUniverseService';
 import { getPortfolioState } from '../services/portfolio/PortfolioStateService';
 import { checkCircuitBreakers } from '../services/autotrader/CircuitBreaker';
+import {
+  getConfig,
+  saveConfig,
+  validateConfig,
+  checkSessionActive,
+  startSession,
+  pauseSession,
+} from '../services/autotrader/ExchangeAutoConfigService';
 
 const router = Router();
 router.use(requireAuth);
@@ -192,6 +200,92 @@ router.get('/signals/preview', async (req: Request, res: Response) => {
     res.json({ success: true, data: { signals, count: signals.length } });
   } catch (err) {
     res.status(500).json({ success: false, error: err instanceof Error ? err.message : 'Signals error' });
+  }
+});
+
+// ─── Exchange Config Routes ───────────────────────────────────────
+
+router.get('/exchange-config/:exchange', async (req: Request, res: Response) => {
+  try {
+    const userId = req.session!.userId as string;
+    const { exchange } = req.params;
+    if (!['hyperliquid', 'tos'].includes(exchange)) {
+      return res.status(400).json({ success: false, error: 'Invalid exchange. Must be hyperliquid or tos.' });
+    }
+    const config = await getConfig(userId, exchange as 'hyperliquid' | 'tos');
+    res.json({ success: true, data: config });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err instanceof Error ? err.message : 'Failed to get exchange config' });
+  }
+});
+
+router.put('/exchange-config/:exchange', async (req: Request, res: Response) => {
+  try {
+    const userId = req.session!.userId as string;
+    const { exchange } = req.params;
+    if (!['hyperliquid', 'tos'].includes(exchange)) {
+      return res.status(400).json({ success: false, error: 'Invalid exchange' });
+    }
+    const saved = await saveConfig(userId, exchange, req.body);
+    res.json({ success: true, data: saved });
+  } catch (err) {
+    res.status(400).json({ success: false, error: err instanceof Error ? err.message : 'Failed to save exchange config' });
+  }
+});
+
+router.post('/exchange-config/:exchange/validate', async (req: Request, res: Response) => {
+  try {
+    const { exchange } = req.params;
+    if (!['hyperliquid', 'tos'].includes(exchange)) {
+      return res.status(400).json({ success: false, error: 'Invalid exchange' });
+    }
+    const result = validateConfig(req.body, exchange);
+    res.json({ success: true, data: result });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err instanceof Error ? err.message : 'Validation error' });
+  }
+});
+
+router.get('/exchange-config/:exchange/session-status', async (req: Request, res: Response) => {
+  try {
+    const userId = req.session!.userId as string;
+    const { exchange } = req.params;
+    if (!['hyperliquid', 'tos'].includes(exchange)) {
+      return res.status(400).json({ success: false, error: 'Invalid exchange' });
+    }
+    const status = await checkSessionActive(userId, exchange);
+    res.json({ success: true, data: status });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err instanceof Error ? err.message : 'Session status error' });
+  }
+});
+
+router.post('/exchange-config/:exchange/session/start', async (req: Request, res: Response) => {
+  try {
+    const userId = req.session!.userId as string;
+    const { exchange } = req.params;
+    if (!['hyperliquid', 'tos'].includes(exchange)) {
+      return res.status(400).json({ success: false, error: 'Invalid exchange' });
+    }
+    await startSession(userId, exchange);
+    res.json({ success: true, data: { message: `${exchange} session started` } });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err instanceof Error ? err.message : 'Session start error' });
+  }
+});
+
+router.post('/exchange-config/:exchange/session/pause', async (req: Request, res: Response) => {
+  try {
+    const userId = req.session!.userId as string;
+    const { exchange } = req.params;
+    if (!['hyperliquid', 'tos'].includes(exchange)) {
+      return res.status(400).json({ success: false, error: 'Invalid exchange' });
+    }
+    const reason = req.body?.reason ?? 'Manually paused by user';
+    await pauseSession(userId, exchange, reason);
+    res.json({ success: true, data: { message: `${exchange} session paused` } });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err instanceof Error ? err.message : 'Session pause error' });
   }
 });
 
