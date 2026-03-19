@@ -995,3 +995,40 @@ model HyperliquidKillEvent {
 
   @@map("hl_kill_events")
 }
+
+// ─── Schwab / ThinkorSwim ─────────────────────────────────────────
+
+model TosOrderLog {
+  id            String   @id @default(cuid())
+  userId        String
+  symbol        String
+  instruction   String
+  orderType     String
+  price         String?
+  stopPrice     String?
+  quantity      String
+  duration      String   @default("DAY")
+  isDryRun      Boolean  @default(true)
+  status        String   @default("pending")
+  exchangeOid   String?
+  errorMessage  String?
+  rawResponse   Json?
+
+  submittedAt   DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  @@index([userId])
+  @@index([symbol])
+  @@map("tos_order_logs")
+}
+
+model TosKillEvent {
+  id         String   @id @default(cuid())
+  userId     String?
+  reason     String
+  trigger    String
+  snapshot   Json?
+  createdAt  DateTime @default(now())
+
+  @@map("tos_kill_events")
+}

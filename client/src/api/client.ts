@@ -186,6 +186,26 @@ export const api = {
     searchHistory: () => get('/polymarket/search-history'),
   },
 
+  tos: {
+    authUrl:         ()                          => get('/tos/auth/url'),
+    authCallback:    (code: string)              => post('/tos/auth/callback', { code }),
+    tokenInfo:       ()                          => get('/tos/auth/token'),
+    status:          ()                          => get('/tos/status'),
+    account:         ()                          => get('/tos/account'),
+    positions:       ()                          => get('/tos/positions'),
+    orders:          ()                          => get('/tos/orders'),
+    allOrders:       (limit?: number)            => get('/tos/orders/all', limit ? { limit } : {}),
+    quotes:          (symbols: string[])         => get('/tos/quotes', { symbols: symbols.join(',') }),
+    placeOrder:      (body: unknown)             => post('/tos/orders', body),
+    cancelOrder:     (orderId: string | number)  => del(`/tos/orders/${orderId}`),
+    closePosition:   (symbol: string, longQty: number, shortQty: number, assetType?: string) =>
+      post(`/tos/positions/${symbol}/close`, { longQuantity: longQty, shortQuantity: shortQty, assetType }),
+    killswitch:      (reason?: string)           => post('/tos/killswitch', { reason }),
+    resetKillswitch: ()                          => del('/tos/killswitch'),
+    orderHistory:    (limit?: number)            => get('/tos/order-history', limit ? { limit } : {}),
+    strategies:      ()                          => get('/tos/scheduler/strategies'),
+  },
+
   hyperliquid: {
     status:           ()                         => get('/hyperliquid/status'),
     markets:          ()                         => get('/hyperliquid/markets'),

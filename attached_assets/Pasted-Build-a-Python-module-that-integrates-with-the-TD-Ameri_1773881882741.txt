@@ -1,0 +1,25 @@
+Build a Python module that integrates with the TD Ameritrade / Thinkorswim API as an add-on to the existing platform. The module should:
+Core Functionality:
+	∙	Connect to the Schwab/TD Ameritrade API (which powers Thinkorswim) using the official schwab-py package or REST API via requests
+	∙	Authenticate using OAuth 2.0 — store CLIENT_ID, CLIENT_SECRET, and REDIRECT_URI as Replit Secrets
+	∙	Handle token refresh automatically so the session never expires mid-run
+	∙	Execute trades automatically — market orders, limit orders, stop orders, and bracket orders
+	∙	Support equities, options, and futures traded through Thinkorswim
+	∙	Allow configurable parameters: ticker symbol, order type, quantity, price, duration (DAY/GTC)
+Killswitch:
+	∙	Implement a killswitch flag (KILLSWITCH = True/False) that, when activated:
+	∙	Immediately cancels all open/pending orders
+	∙	Closes all open positions at market price
+	∙	Halts any further trade execution loop
+	∙	Killswitch triggerable via: (1) a /killswitch API endpoint, (2) a Replit environment variable KILLSWITCH=true, and (3) automatically if account drawdown exceeds a configurable threshold (MAX_DRAWDOWN_PCT = 5)
+Safety & Structure:
+	∙	All credentials stored in Replit Secrets, never hardcoded
+	∙	Wrap all order execution in try/except with detailed logging to a trades.log file
+	∙	Add a dry-run mode (DRY_RUN=true) that simulates trades without sending real orders to the brokerage
+	∙	Expose a /status endpoint showing current positions, account balance, unrealized PnL, and killswitch state
+	∙	Rate limit awareness — respect Schwab API’s request limits to avoid getting throttled or banned
+Integration:
+	∙	Structure the module so it can be imported into the existing platform (from tos_trader import TOSTrader)
+	∙	Include a config.py for all tunable parameters (symbols, order sizes, thresholds, etc.)
+	∙	Use asyncio for non-blocking order execution
+	∙	Include a scheduler (e.g. APScheduler) to run strategies on a defined interval or at market open/close
