@@ -6,3 +6,9 @@ id = "qpWu_cX2397hUXEET-qTp"
 uri = "file://mycode.tar.gz"
 type = "unspecified"
 title = "mycode.tar.gz — RIA BOT source code"
+
+[[outputs]]
+id = "IfmqxftdDwrazMS_bNY3v"
+uri = "file://ria-bot-code.tar.gz"
+type = "unspecified"
+title = "ria-bot-code.tar.gz"
