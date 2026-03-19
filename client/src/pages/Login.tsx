@@ -179,7 +179,26 @@ export default function Login() {
             </p>
           </div>
 
-          <div className="mt-8 p-3 rounded-lg bg-surface-2 border border-surface-border">
+          <div className="lg:hidden mt-6 p-4 rounded-xl bg-surface-2 border border-surface-border">
+            <p className="text-xs font-mono text-slate-500 uppercase tracking-wider mb-2">Dev Test Account</p>
+            <button
+              type="button"
+              onClick={() => { setEmail('dev@riabot.local'); setPassword('password123'); }}
+              className="w-full text-left space-y-1 group"
+            >
+              <p className="text-xs font-mono text-slate-400">
+                Email: <span className="text-accent-cyan">dev@riabot.local</span>
+              </p>
+              <p className="text-xs font-mono text-slate-400">
+                Password: <span className="text-accent-cyan">password123</span>
+              </p>
+              <p className="text-[10px] text-slate-600 group-hover:text-slate-500 transition-colors mt-1">
+                Tap to autofill
+              </p>
+            </button>
+          </div>
+
+          <div className="mt-4 p-3 rounded-lg bg-surface-2 border border-surface-border lg:mt-8">
             <p className="text-xs text-slate-600 font-mono text-center">
               ⚠ Paper trading only · No real money involved
             </p>
