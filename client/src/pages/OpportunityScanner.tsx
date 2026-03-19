@@ -12,6 +12,7 @@ import { EmptyState } from '../components/ui/EmptyState';
 import { LoadingState } from '../components/ui/LoadingState';
 import { ErrorState } from '../components/ui/ErrorState';
 import { api } from '../api/client';
+import { MiniVerdictBadge, RiskRewardPanel } from '../components/analysis/TradeVerdictHero';
 
 type Bias = 'BULLISH' | 'BEARISH' | 'NEUTRAL';
 type RecommendedAction = 'STRONG_BUY' | 'BUY' | 'WATCH' | 'AVOID' | 'SHORT' | 'STRONG_SHORT';
@@ -165,43 +166,37 @@ function ScanCard({
       </div>
 
       {expanded && (
-        <div className="px-4 pb-4 border-t border-surface-border pt-3 space-y-4">
+        <div className="px-4 pb-4 border-t border-surface-border pt-4 space-y-4">
+          <div className="flex items-center gap-3 flex-wrap">
+            <MiniVerdictBadge action={summary.recommendedAction} score={summary.convictionScore} />
+            <div className="flex gap-3 text-xs font-mono">
+              <span className="text-slate-600">Confidence: <span className="text-slate-300">{summary.confidenceScore}/100</span></span>
+              <span className="text-slate-600">Risk: <span className={summary.riskScore <= 35 ? 'text-emerald-400' : summary.riskScore <= 60 ? 'text-amber-400' : 'text-red-400'}>{summary.riskScore}/100</span></span>
+            </div>
+          </div>
+
           <p className="text-xs text-slate-400 leading-relaxed">{summary.thesisSummary}</p>
 
-          <div className="grid grid-cols-2 md:grid-cols-4 gap-2">
+          <RiskRewardPanel
+            stopLoss={summary.invalidation}
+            takeProfit1={summary.takeProfit1}
+            takeProfit2={null}
+            currentPrice={summary.price}
+          />
+
+          <div className="flex items-center justify-between">
             <div className="p-2.5 rounded-lg bg-surface-3 border border-surface-border">
               <p className="text-[10px] text-slate-600 font-mono uppercase mb-1">Entry Zone</p>
               <p className="text-xs font-mono text-white font-semibold">
                 {formatPrice(summary.entryLow)} – {formatPrice(summary.entryHigh)}
               </p>
             </div>
-            <div className="p-2.5 rounded-lg bg-red-400/5 border border-red-400/10">
-              <p className="text-[10px] text-slate-600 font-mono uppercase mb-1">Invalidation</p>
-              <p className="text-xs font-mono text-red-400 font-semibold">{formatPrice(summary.invalidation)}</p>
-            </div>
-            <div className="p-2.5 rounded-lg bg-emerald-400/5 border border-emerald-400/10">
-              <p className="text-[10px] text-slate-600 font-mono uppercase mb-1">Take Profit 1</p>
-              <p className="text-xs font-mono text-emerald-400 font-semibold">{formatPrice(summary.takeProfit1)}</p>
-            </div>
-            <div className="p-2.5 rounded-lg bg-surface-3 border border-surface-border">
-              <p className="text-[10px] text-slate-600 font-mono uppercase mb-1">Risk Score</p>
-              <p className={`text-xs font-mono font-semibold ${
-                summary.riskScore <= 35 ? 'text-emerald-400' : summary.riskScore <= 60 ? 'text-amber-400' : 'text-red-400'
-              }`}>{summary.riskScore}/100</p>
-            </div>
-          </div>
-
-          <div className="flex items-center gap-2">
             <button
               onClick={onClick}
-              className="flex items-center gap-1.5 px-3 py-1.5 bg-accent-blue hover:bg-accent-blue/80 rounded-lg text-xs font-semibold transition-colors"
+              className="flex items-center gap-1.5 px-4 py-2 bg-accent-blue hover:bg-accent-blue/80 rounded-lg text-xs font-semibold transition-colors"
             >
-              <Brain className="h-3.5 w-3.5" />Full Analysis
+              <Brain className="h-3.5 w-3.5" /> Full Analysis
             </button>
-            <div className="flex items-center gap-2 text-xs font-mono">
-              <span className="text-slate-600">Confidence:</span>
-              <span className="text-slate-400">{summary.confidenceScore}/100</span>
-            </div>
           </div>
         </div>
       )}

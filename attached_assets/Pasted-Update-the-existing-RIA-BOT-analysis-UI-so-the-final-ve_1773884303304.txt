@@ -1,0 +1,153 @@
+Update the existing RIA BOT analysis UI so the final verdict is dramatically more legible, visually dominant, and easier to understand at a glance.
+
+Goal:
+Make the core trade verdict the main focus of the analysis screen.
+
+The most important outputs should be:
+1. Action label
+2. Score
+3. Suggested hold duration
+4. Stop loss
+5. Take profit levels
+
+Current action labels:
+- Buy
+- Sell
+- Watch
+
+UI direction:
+The action verdict must be much larger, more prominent, and more visually separated from the rest of the analysis.
+It should feel like the centerpiece of the page.
+
+Main redesign requirements:
+
+1. Create a large “Trade Verdict” hero card at the top of every analysis result.
+This card should be the first thing the user sees.
+
+The hero card must include:
+- very large action label: BUY, SELL, or WATCH
+- large score display
+- confidence or health score subtitle
+- short one-line thesis summary
+- suggested hold duration
+- stop loss
+- take profit 1
+- take profit 2
+
+2. The action label must be visually dominant.
+Requirements:
+- very large font
+- bold styling
+- high contrast
+- color-coded treatment
+- prominent badge or pill styling
+- spacing around it so it stands out immediately
+
+3. The score must be the second most important visual element.
+Display:
+- score out of 100
+- optional circular progress or strong score badge
+- short score interpretation underneath, such as:
+  - Strong setup
+  - Moderate setup
+  - Weak setup
+
+4. Holding duration must be clearly displayed near the action label and score.
+Examples:
+- Suggested Hold: 1–2 days
+- Suggested Hold: 3–5 days
+- Suggested Hold: Up to 1 week
+
+5. Risk and reward levels must be pulled into the hero card.
+Display clearly:
+- Stop Loss
+- Take Profit 1
+- Take Profit 2
+
+These should not be buried lower in the analysis.
+They should be core summary items.
+
+6. Add a “Key Analysis Summary” section directly below the hero card.
+This section should contain the most important analysis components only:
+- trend
+- momentum
+- catalyst/news tone
+- volatility/risk
+- pattern detected
+- support/resistance summary
+
+Use concise labels and make them highly scannable.
+
+7. Add a “Why this verdict” section.
+This should include 3 to 5 short bullets explaining the main reasons behind the verdict.
+
+Example:
+- Bullish higher-timeframe trend remains intact
+- Volume confirms breakout
+- Recent catalyst flow is supportive
+- Risk remains acceptable relative to upside target
+
+8. Improve hierarchy of the analysis page.
+Order of importance should be:
+- Action label
+- Score
+- Hold duration
+- Stop loss / take profits
+- Thesis summary
+- Key reasons
+- Technical and catalyst details
+- Supporting charts and deeper analytics
+
+9. Styling requirements:
+- premium dark-mode interface
+- larger typography
+- stronger spacing and padding
+- high contrast summary cards
+- clean finance-dashboard look
+- clear visual separation between hero summary and deeper analytics
+- mobile responsive
+- desktop optimized
+
+10. Create reusable UI components for this redesign:
+- TradeVerdictHeroCard
+- ScoreBadge
+- HoldDurationBadge
+- RiskRewardPanel
+- AnalysisSummaryGrid
+- VerdictReasonList
+
+11. Ensure the final verdict also appears clearly in:
+- scanner results
+- symbol analysis page
+- open thesis cards
+- paper trading candidate cards
+
+12. Update result card layout so the user can understand the decision in under 3 seconds.
+
+Preferred hero card layout:
+Top row:
+- large BUY / SELL / WATCH badge
+- large score
+- confidence or health label
+
+Second row:
+- suggested hold duration
+- stop loss
+- take profit 1
+- take profit 2
+
+Third row:
+- one-sentence thesis summary
+
+Fourth row:
+- 3 to 5 top reasons
+
+13. Make sure the design “pops” visually.
+This should feel much more bold and polished than the current layout.
+The verdict should look unmistakably important.
+
+14. Keep all existing analysis logic intact.
+This task is a UI/UX redesign of the analysis output and summary presentation, not a change to backend scoring logic.
+
+Deliverable:
+Refactor the existing analysis interface so BUY, SELL, or WATCH, the score, hold duration, stop loss, and take profit levels become the main visual components of the analysis and are much bigger, cleaner, and easier to read.

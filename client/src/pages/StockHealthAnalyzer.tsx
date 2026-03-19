@@ -11,6 +11,7 @@ import { cn } from '../lib/utils';
 import { api } from '../api/client';
 import { Card, CardHeader } from '../components/ui/Card';
 import { LoadingState } from '../components/ui/LoadingState';
+import { TradeVerdictHeroCard, AnalysisSummaryGrid, BiasChip } from '../components/analysis/TradeVerdictHero';
 
 type ActionLabel = 'high conviction' | 'tradable' | 'developing' | 'weak' | 'avoid';
 
@@ -270,28 +271,40 @@ function HealthResultCard({ result, onRefresh, refreshing }: {
             </button>
           </div>
 
-          <div className="flex items-center gap-4 mb-4">
+          <div className="flex items-center justify-between mb-4">
             <div>
               <p className="text-2xl font-bold text-white font-mono">{fmt(result.currentPrice)}</p>
               <p className={cn('text-sm font-semibold', result.changePercent >= 0 ? 'text-accent-green' : 'text-red-400')}>
                 {result.changePercent >= 0 ? '+' : ''}{result.changePercent?.toFixed(2)}%
               </p>
             </div>
-            <div className="flex-1" />
-            <ScoreGauge score={result.healthScore} />
+            <BiasChip bias={result.bias} />
           </div>
 
-          <div className="flex flex-wrap gap-2">
-            <span className={cn('text-xs font-black px-3 py-1.5 rounded-lg border', action.bg, action.color)}>
-              {action.label}
-            </span>
-            <span className={cn('flex items-center gap-1.5 text-xs font-semibold px-3 py-1.5 rounded-lg border border-surface-border', biasColor(result.bias))}>
-              {biasIcon(result.bias)} {result.bias.toUpperCase()}
-            </span>
-            <span className="text-xs text-slate-400 px-3 py-1.5 rounded-lg border border-surface-border">
-              Hold: {result.suggestedHoldWindow}
-            </span>
-          </div>
+          <TradeVerdictHeroCard
+            action={result.actionLabel}
+            score={result.healthScore}
+            holdDuration={result.suggestedHoldWindow}
+            stopLoss={result.invalidationLevel}
+            takeProfit1={result.resistanceZone?.min ?? null}
+            takeProfit2={result.resistanceZone?.max ?? null}
+            currentPrice={result.currentPrice}
+            thesis={result.explanation}
+            reasons={result.topStrengths}
+            isMock={result.isMock}
+          />
+        </div>
+
+        <div className="p-5 border-b border-surface-border">
+          <p className="text-[10px] text-slate-500 uppercase tracking-wider mb-3 font-mono">Key Analysis Summary</p>
+          <AnalysisSummaryGrid
+            trend={result.trendState}
+            volatility={result.volatilityState}
+            catalystTone={result.catalystSummary?.split('.')[0] ?? undefined}
+            pattern={result.patternsDetected?.[0] ?? undefined}
+            supportRange={result.supportZone ? `${fmt(result.supportZone.min)} – ${fmt(result.supportZone.max)}` : undefined}
+            resistanceRange={result.resistanceZone ? `${fmt(result.resistanceZone.min)} – ${fmt(result.resistanceZone.max)}` : undefined}
+          />
         </div>
 
         <div className="p-5 border-b border-surface-border space-y-3">
@@ -350,11 +363,6 @@ function HealthResultCard({ result, onRefresh, refreshing }: {
             <ScoreBar label="Volatility Fit (10%)" value={result.scoreWeights?.volatility ?? 0} color="text-orange-400" />
             <ScoreBar label="Liquidity (10%)" value={result.scoreWeights?.liquidity ?? 0} color="text-yellow-400" />
           </div>
-        </div>
-
-        <div className="p-5 border-b border-surface-border">
-          <p className="text-[10px] text-slate-500 uppercase tracking-wider mb-3 font-mono">Research Verdict</p>
-          <p className="text-sm text-slate-300 leading-relaxed">{result.explanation}</p>
         </div>
 
         <div className="p-5 border-b border-surface-border grid grid-cols-2 gap-4">

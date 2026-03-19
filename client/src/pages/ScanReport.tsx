@@ -9,6 +9,7 @@ import { api } from '../api/client';
 import { Card, CardHeader } from '../components/ui/Card';
 import { LoadingState } from '../components/ui/LoadingState';
 import { ErrorState } from '../components/ui/ErrorState';
+import { MiniVerdictBadge } from '../components/analysis/TradeVerdictHero';
 
 interface ReportEntry {
   symbol: string;
@@ -181,13 +182,17 @@ export default function ScanReport() {
                 <MiniList
                   items={report.topConvictionSetupsJson ?? []}
                   renderItem={(r, i) => (
-                    <div key={i} className="flex items-center justify-between">
+                    <div key={i} className="flex items-center justify-between py-1">
                       <div className="flex items-center gap-2">
                         <span className="text-[10px] text-slate-600 font-mono w-4">{r.rank ?? i + 1}</span>
-                        <Link to={`/symbol/${r.symbol}`} className="text-xs font-bold text-white hover:text-accent-blue">{r.symbol}</Link>
-                        {r.action && <span className="text-[10px] text-slate-500">{r.action}</span>}
+                        <Link to={`/symbol/${r.symbol}`} className="text-sm font-bold text-white hover:text-accent-blue font-mono">{r.symbol}</Link>
+                        {r.name && <span className="text-[10px] text-slate-600 truncate max-w-24">{r.name}</span>}
                       </div>
-                      <span className={cn('text-xs font-mono font-bold', convColor(r.conviction ?? 0))}>{r.conviction}</span>
+                      <div className="flex items-center gap-2">
+                        {r.action && (
+                          <MiniVerdictBadge action={r.action as any} score={r.conviction ?? 0} />
+                        )}
+                      </div>
                     </div>
                   )}
                 />

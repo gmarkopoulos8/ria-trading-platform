@@ -7,6 +7,7 @@ import {
 } from 'lucide-react';
 import { Card, CardHeader } from '../ui/Card';
 import { api } from '../../api/client';
+import { TradeVerdictHeroCard } from '../analysis/TradeVerdictHero';
 
 type Bias = 'BULLISH' | 'BEARISH' | 'NEUTRAL';
 type RecommendedAction = 'STRONG_BUY' | 'BUY' | 'WATCH' | 'AVOID' | 'SHORT' | 'STRONG_SHORT';
@@ -166,7 +167,7 @@ export function ThesisPanel({ symbol, assetClass }: { symbol: string; assetClass
 
   return (
     <Card>
-      <div className="flex items-start justify-between mb-4">
+      <div className="flex items-center justify-between mb-4">
         <div className="flex items-center gap-2">
           <Brain className="h-4 w-4 text-accent-blue" />
           <div>
@@ -176,84 +177,35 @@ export function ThesisPanel({ symbol, assetClass }: { symbol: string; assetClass
             </p>
           </div>
         </div>
-        <div className="flex items-center gap-2">
-          <span className={`text-xs font-bold px-2.5 py-1 rounded-lg border font-mono ${bs?.bg}`}>
-            {thesis.bias}
-          </span>
-          <span className={`text-[10px] font-semibold px-2 py-0.5 rounded border font-mono ${actionStyle(thesis.recommendedAction)}`}>
-            {thesis.recommendedAction.replace(/_/g, ' ')}
-          </span>
-          <button onClick={() => refetch()} disabled={isFetching}
-            className="p-1.5 rounded-lg text-slate-500 hover:text-white hover:bg-surface-3 transition-colors disabled:opacity-50">
-            <RefreshCw className={`h-3.5 w-3.5 ${isFetching ? 'animate-spin' : ''}`} />
-          </button>
-        </div>
+        <button onClick={() => refetch()} disabled={isFetching}
+          className="p-1.5 rounded-lg text-slate-500 hover:text-white hover:bg-surface-3 transition-colors disabled:opacity-50">
+          <RefreshCw className={`h-3.5 w-3.5 ${isFetching ? 'animate-spin' : ''}`} />
+        </button>
       </div>
 
-      <div className="flex justify-center gap-4 mb-4">
-        <ScoreRing value={thesis.convictionScore} label="Conviction" color="stroke-accent-blue" />
-        <ScoreRing value={thesis.confidenceScore} label="Confidence" color="stroke-violet-400" />
-        <ScoreRing value={thesis.thesisHealthScore} label="Thesis Health" color="stroke-emerald-400" />
-        <ScoreRing value={100 - thesis.riskScore} label="Safety" color="stroke-amber-400" />
-        <ScoreRing
-          value={thesis.bias === 'BULLISH' ? thesis.bullishScore : thesis.bearishScore}
-          label={thesis.bias === 'BULLISH' ? 'Bull Score' : 'Bear Score'}
-          color={thesis.bias === 'BULLISH' ? 'stroke-emerald-400' : 'stroke-red-400'}
-        />
+      <TradeVerdictHeroCard
+        action={thesis.recommendedAction}
+        score={thesis.convictionScore}
+        holdDuration={thesis.suggestedHoldWindow}
+        stopLoss={thesis.invalidationZone.level}
+        takeProfit1={thesis.takeProfit1.level}
+        takeProfit2={thesis.takeProfit2.level}
+        thesis={thesis.thesisSummary}
+        reasons={thesis.supportingReasons}
+      />
+
+      <div className="mt-4 p-2.5 rounded-lg bg-surface-3 border border-surface-border">
+        <div className="flex items-center gap-1 mb-1">
+          <Target className="h-3 w-3 text-accent-blue" />
+          <p className="text-[10px] text-slate-600 font-mono uppercase">Entry Zone</p>
+        </div>
+        <p className="text-xs font-mono font-semibold text-white">
+          {formatPrice(thesis.entryZone.low)} – {formatPrice(thesis.entryZone.high)}
+        </p>
+        <p className="text-[10px] text-slate-600 leading-tight mt-0.5">{thesis.entryZone.description.slice(0, 60)}</p>
       </div>
 
-      <p className="text-xs text-slate-400 leading-relaxed mb-4">{thesis.thesisSummary}</p>
-
-      <div className="grid grid-cols-2 md:grid-cols-4 gap-2 mb-4">
-        <div className="p-2.5 rounded-lg bg-surface-3 border border-surface-border">
-          <div className="flex items-center gap-1 mb-1">
-            <Target className="h-3 w-3 text-accent-blue" />
-            <p className="text-[10px] text-slate-600 font-mono uppercase">Entry Zone</p>
-          </div>
-          <p className="text-xs font-mono font-semibold text-white">
-            {formatPrice(thesis.entryZone.low)}–{formatPrice(thesis.entryZone.high)}
-          </p>
-          <p className="text-[10px] text-slate-600 leading-tight mt-0.5">{thesis.entryZone.description.slice(0, 40)}</p>
-        </div>
-
-        <div className="p-2.5 rounded-lg bg-red-400/5 border border-red-400/10">
-          <div className="flex items-center gap-1 mb-1">
-            <Shield className="h-3 w-3 text-red-400" />
-            <p className="text-[10px] text-slate-600 font-mono uppercase">Invalidation</p>
-          </div>
-          <p className="text-xs font-mono font-semibold text-red-400">{formatPrice(thesis.invalidationZone.level)}</p>
-          <p className="text-[10px] text-slate-600 leading-tight mt-0.5">{thesis.invalidationZone.description.slice(0, 40)}</p>
-        </div>
-
-        <div className="p-2.5 rounded-lg bg-emerald-400/5 border border-emerald-400/10">
-          <div className="flex items-center gap-1 mb-1">
-            <TrendingUp className="h-3 w-3 text-emerald-400" />
-            <p className="text-[10px] text-slate-600 font-mono uppercase">Take Profit 1</p>
-          </div>
-          <p className="text-xs font-mono font-semibold text-emerald-400">{formatPrice(thesis.takeProfit1.level)}</p>
-        </div>
-
-        <div className="p-2.5 rounded-lg bg-emerald-400/5 border border-emerald-400/10">
-          <div className="flex items-center gap-1 mb-1">
-            <TrendingUp className="h-3 w-3 text-emerald-400/70" />
-            <p className="text-[10px] text-slate-600 font-mono uppercase">Take Profit 2</p>
-          </div>
-          <p className="text-xs font-mono font-semibold text-emerald-400/80">{formatPrice(thesis.takeProfit2.level)}</p>
-        </div>
-      </div>
-
-      <div className="flex items-center gap-3 mb-3 p-2.5 rounded-lg bg-surface-3 border border-surface-border">
-        <Clock className="h-3.5 w-3.5 text-slate-500 flex-shrink-0" />
-        <div className="flex-1 text-xs font-mono">
-          <span className="text-slate-600">Hold window: </span>
-          <span className="text-white font-semibold">{thesis.suggestedHoldWindow}</span>
-          <span className="mx-2 text-slate-700">·</span>
-          <span className="text-slate-600">Monitor: </span>
-          <span className="text-white">{thesis.monitoringFrequency.toLowerCase()}</span>
-        </div>
-      </div>
-
-      <div className="flex items-center gap-2 mb-3">
+      <div className="flex items-center gap-2 mt-3 mb-3">
         <button
           onClick={() => {
             setTradeEntry(String(((thesis.entryZone.low + thesis.entryZone.high) / 2).toFixed(2)));
