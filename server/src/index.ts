@@ -14,7 +14,6 @@ import performanceRouter from './routes/performance';
 import settingsRouter from './routes/settings';
 import dailyScansRouter from './routes/daily-scans';
 import stocksRouter from './routes/stocks';
-import polymarketRouter from './routes/polymarket';
 import hyperliquidRouter from './routes/hyperliquid';
 import tosRouter from './routes/tos';
 import { errorHandler, notFoundHandler } from './middleware/errorHandler';
@@ -105,7 +104,6 @@ app.use('/api/performance', performanceRouter);
 app.use('/api/settings', settingsRouter);
 app.use('/api/daily-scans', dailyScansRouter);
 app.use('/api/stocks', stocksRouter);
-app.use('/api/polymarket', polymarketRouter);
 app.use('/api/hyperliquid', hyperliquidRouter);
 app.use('/api/tos', tosRouter);
 

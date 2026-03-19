@@ -13,7 +13,6 @@ import {
   X,
   Radar,
   HeartPulse,
-  Layers,
   Activity,
   BarChart2,
 } from 'lucide-react';
@@ -25,7 +24,6 @@ const navItems = [
   { path: '/dashboard', label: 'Dashboard', icon: LayoutDashboard, description: 'Market overview' },
   { path: '/daily-scan', label: 'Daily Scan', icon: Radar, description: 'Ranked universe · top 100' },
   { path: '/stock-health', label: 'Stock Health', icon: HeartPulse, description: 'NYSE health analyzer' },
-  { path: '/polymarket', label: 'Polymarket', icon: Layers, description: 'Prediction markets' },
   { path: '/hyperliquid', label: 'Hyperliquid', icon: Activity, description: 'Perpetual DEX · live trading' },
   { path: '/tos', label: 'Thinkorswim', icon: BarChart2, description: 'Schwab API · equities · options · futures' },
   { path: '/scanner', label: 'Opportunity Scanner', icon: ScanSearch, description: 'AI-scored picks' },
