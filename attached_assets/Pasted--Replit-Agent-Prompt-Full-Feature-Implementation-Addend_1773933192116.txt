@@ -1,0 +1,961 @@
+# Replit Agent Prompt — Full Feature Implementation (Addendum 3)
+
+This is the third and final addendum. Apply all changes on top of the previous two prompts. Do not re-implement anything already built. All existing tabs, routes, pages, services, and DB models must continue to work exactly as before.
+
+-----
+
+## DATA SOURCES DECISION
+
+**Stocks news**: Use **Finnhub** (`https://finnhub.io/api/v1`) — free tier provides:
+
+- `GET /company-news?symbol={symbol}&from={date}&to={date}` — real company news with headline, summary, source, datetime, url
+- `GET /news-sentiment?symbol={symbol}` — pre-computed sentiment score, buzz score, article count
+- `GET /calendar/earnings?from={date}&to={date}` — earnings calendar with EPS estimates, surprise data
+- `GET /stock/recommendation?symbol={symbol}` — analyst buy/sell/hold consensus
+- `GET /stock/upgrade-downgrade?symbol={symbol}` — analyst upgrades/downgrades with price targets
+- Auth: `?token=FINNHUB_API_KEY` query param or `X-Finnhub-Token` header
+- Free tier rate limit: 60 calls/minute — implement a rate-limit queue
+
+**Crypto news**: Use **CryptoPanic** (`https://cryptopanic.com/api/free/v1/`) — free tier:
+
+- `GET /posts/?auth_token={token}&currencies={BTC,ETH}&public=true&filter=important` — real crypto news with votes, sentiment filter
+- `filter` options: `rising` | `hot` | `bullish` | `bearish` | `important` | `saved` | `lol`
+- Free tier: no pagination limit for basic posts, ~200 req/hour
+- Auth: `auth_token=CRYPTOPANIC_API_KEY` query param
+
+**Sector ETF data for sector rotation**: Use Yahoo Finance (already integrated) — fetch SPY, XLK, XLF, XLE, XLV, XLI, XLY, XLP, XLRE, XLU, XLC daily performance. No additional key needed.
+
+**Live P&L WebSocket for stocks**: Use Finnhub WebSocket `wss://ws.finnhub.io?token={FINNHUB_API_KEY}` — subscribe with `{"type":"subscribe","symbol":"AAPL"}` to get real-time trade prices. For crypto live P&L, use the existing Hyperliquid WebSocket infrastructure already in the codebase.
+
+**Secrets to add** (user must set these in Replit Secrets):
+
+- `FINNHUB_API_KEY` — from finnhub.io free account
+- `CRYPTOPANIC_API_KEY` — from cryptopanic.com free account
+- `TELEGRAM_BOT_TOKEN` — from @BotFather on Telegram
+- `TELEGRAM_CHAT_ID` — populated automatically via setup flow (see Phase B)
+
+-----
+
+## PHASE 1 — Replace Mock News with Real Data
+
+### 1A. Finnhub News Provider
+
+**File**: `server/src/services/news/FinnhubNewsProvider.ts`
+
+Replace `generateNewsItems()` in `generator.ts` with real Finnhub data. Create a provider that:
+
+- Implements the same `NormalizedNewsItem[]` output shape that the existing `NewsService` and `CatalystAgent` already consume — this means zero changes to any downstream agents
+- `fetchCompanyNews(ticker: string, daysBack = 5): Promise<NormalizedNewsItem[]>`:
+  - Calls `GET https://finnhub.io/api/v1/company-news?symbol={ticker}&from={fromDate}&to={toDate}&token={FINNHUB_API_KEY}`
+  - Maps response fields: `headline` → `headline`, `summary` → `summary`, `source` → source name, `datetime` (unix) → `publishedAt`, `url` → `url`
+  - Calls `GET /news-sentiment?symbol={ticker}` concurrently — use returned `buzz.articlesInLastWeek`, `sentiment.bearishPercent`, `sentiment.bullishPercent` to enrich the sentiment scoring
+  - Calls `GET /stock/upgrade-downgrade?symbol={ticker}` — map upgrades to `eventType: 'ANALYST_ACTION'`, include fromGrade/toGrade/priceTarget in summary
+  - Calls `GET /stock/recommendation?symbol={ticker}` — include latest consensus (strongBuy/buy/hold/sell/strongSell counts) as a synthetic news item
+  - Rate limit: implement a simple token bucket — max 55 calls/minute (conservative under the 60 limit). Use a module-level queue with `setTimeout` spacing
+- `fetchCryptoNews(ticker: string): Promise<NormalizedNewsItem[]>`:
+  - Calls CryptoPanic `GET https://cryptopanic.com/api/free/v1/posts/?auth_token={CRYPTOPANIC_API_KEY}&currencies={ticker}&public=true&filter=important&kind=news`
+  - Maps: `title` → `headline`, `source.title` → source name, `published_at` → `publishedAt`, `url` → `url`
+  - Map CryptoPanic vote counts to sentiment: `votes.positive > votes.negative` → POSITIVE, etc.
+  - Fall back to `generateNewsItems()` (existing mock) if the API key is not set or returns an error — never break the scan pipeline
+
+In `server/src/services/news/NewsService.ts`, update `getCatalysts()` to call `FinnhubNewsProvider.fetchCompanyNews()` or `fetchCryptoNews()` based on `isCryptoSymbol(ticker)`, instead of `generateNewsItems()`. Keep the 15-minute cache. Keep all existing error handling.
+
+### 1B. Earnings Calendar Service
+
+**File**: `server/src/services/events/EarningsCalendarService.ts`
+
+- `getUpcomingEarnings(tickers: string[], daysAhead = 7): Promise<EarningsEvent[]>`:
+  - Calls `GET https://finnhub.io/api/v1/calendar/earnings?from={today}&to={today+daysAhead}&token={key}`
+  - Filter results to only include tickers in the passed array
+  - Returns array of `{ ticker, reportDate, epsEstimate, revenueEstimate, quarter, year }`
+- `hasEarningsRisk(ticker: string, daysAhead = 5): Promise<boolean>`:
+  - Returns true if an earnings event exists within `daysAhead` days for the ticker
+  - Cache results for 6 hours — the calendar doesn’t change minute-to-minute
+- Persist upcoming events to a new `EarningsEvent` DB model:
+
+```prisma
+model EarningsEvent {
+  id              String   @id @default(cuid())
+  ticker          String
+  reportDate      DateTime
+  epsEstimate     Float?
+  revenueEstimate Float?
+  quarter         Int?
+  year            Int?
+  fetchedAt       DateTime @default(now())
+
+  @@unique([ticker, reportDate])
+  @@index([reportDate])
+  @@index([ticker])
+}
+```
+
+Run `npx prisma migrate dev --name add_earnings_events`.
+
+In `AutoTradeExecutor.ts`, before placing any order, call `hasEarningsRisk(ticker)`. If true, log the skip with reason `'EARNINGS_RISK_WINDOW'` to `AutoTradeLog`. Add `earningsRiskWindow` as a configurable parameter in `ExchangeAutoConfig` (default 5 days).
+
+-----
+
+## PHASE 2 — Telegram Notification Bot
+
+### 2A. Telegram Service
+
+**File**: `server/src/services/notifications/TelegramService.ts`
+
+Use the Telegram Bot API directly via `axios` — no external Telegram library needed.
+
+```typescript
+const TELEGRAM_API = `https://api.telegram.org/bot${process.env.TELEGRAM_BOT_TOKEN}`;
+
+interface TelegramMessage {
+  type: 'TRADE_PLACED' | 'TRADE_CLOSED' | 'CIRCUIT_BREAKER' | 'KILLSWITCH' | 
+        'DAILY_SUMMARY' | 'SESSION_PAUSED' | 'EARNINGS_WARNING' | 
+        'THESIS_DEGRADED' | 'TARGET_APPROACHED' | 'SYSTEM_ERROR';
+  exchange?: 'tos' | 'hyperliquid';
+  ticker?: string;
+  data: Record<string, unknown>;
+}
+```
+
+Implement:
+
+**`sendMessage(chatId: string, text: string, parseMode: 'HTML' | 'Markdown' = 'HTML'): Promise<boolean>`**
+
+- POST to `https://api.telegram.org/bot{TOKEN}/sendMessage`
+- Body: `{ chat_id: chatId, text, parse_mode: parseMode, disable_web_page_preview: true }`
+- Return true on success, false on failure — never throw, always catch
+- Log failures to console but do not crash the caller
+
+**`notify(message: TelegramMessage): Promise<void>`**
+
+- Loads `TELEGRAM_CHAT_ID` from env — if not set, silently skip
+- Formats message into a rich HTML string based on type:
+  - `TRADE_PLACED`:
+    
+    ```
+    🟢 <b>TRADE PLACED</b> — {EXCHANGE}
+    📈 {ticker} | {side} | {quantity} units
+    💰 Entry: ${entryPrice} | Stop: ${stop} | TP: ${target}
+    🎯 Conviction: {score}/100 | R:R {ratio}:1
+    📋 Dry Run: {YES/NO}
+    ⏱ {timestamp}
+    ```
+  - `TRADE_CLOSED`:
+    
+    ```
+    🔴 <b>POSITION CLOSED</b> — {EXCHANGE}
+    📉 {ticker} | {closeReason}
+    💵 P&L: {+/-$amount} ({+/-%pct})
+    ⏱ Held {days} days | Closed {timestamp}
+    ```
+  - `CIRCUIT_BREAKER`:
+    
+    ```
+    🚨 <b>CIRCUIT BREAKER ACTIVATED</b>
+    ⚠️ Reason: {reason}
+    🛑 All autonomous trading paused
+    🔄 Auto-reset at next market open
+    ```
+  - `DAILY_SUMMARY`:
+    
+    ```
+    📊 <b>DAILY SUMMARY</b> — {date}
+    
+    Trades placed: {n} | Closed: {n}
+    Today's P&L: {+/-$amount}
+    
+    TOS: {equity} equity | {n} positions
+    Hyperliquid: ${accountValue} | {n} positions
+    
+    Top pick: {ticker} (conviction {score})
+    Circuit breaker: {active/inactive}
+    ```
+  - `EARNINGS_WARNING`:
+    
+    ```
+    ⚠️ <b>EARNINGS WARNING</b>
+    📅 {ticker} reports earnings on {date}
+    🚫 Auto-trade blocked for {daysAhead}-day window
+    ```
+  - `SESSION_PAUSED`: compact one-liner with reason
+  - `THESIS_DEGRADED`: alert with ticker, old health vs new health, recommended action
+  - `TARGET_APPROACHED`: alert with ticker, current price vs target, unrealized P&L
+
+**`sendDailySummary(): Promise<void>`**
+
+- Called automatically at 4:15 PM ET on trading days and 11:59 PM for crypto
+- Aggregates today’s `AutoTradeLog`, current portfolio state, and circuit breaker status
+- Sends a `DAILY_SUMMARY` notification
+
+**`getSetupLink(): string`**
+
+- Returns `https://t.me/{BOT_USERNAME}?start=setup` — used in the onboarding UI
+
+### 2B. Telegram Setup Flow (Backend)
+
+**File**: `server/src/routes/telegram.ts`
+
+```
+GET  /api/telegram/status        → { configured: bool, chatId: string|null, botUsername: string|null }
+POST /api/telegram/verify        → receives { code } — matches against stored setup code
+GET  /api/telegram/test          → sends a test message to configured chatId
+POST /api/telegram/setup-code    → generates a 6-digit code, stores in memory for 10 min
+GET  /api/telegram/webhook       → Telegram webhook endpoint (or use polling)
+```
+
+Setup flow:
+
+1. User clicks “Connect Telegram” in Settings — backend generates a random 6-digit code and stores it in memory with a 10-minute TTL
+1. Frontend shows: “Message your bot `@RIABotNotifier` the code: **481923**”
+1. User opens Telegram, starts a chat with the bot, sends the code
+1. Bot receives the message via long-polling (`getUpdates`), matches the code, saves `chat_id` to `TELEGRAM_CHAT_ID` env/DB
+1. Bot sends confirmation: “✅ RIA BOT notifications connected! You’ll receive alerts here.”
+
+Implement long-polling in a background loop — poll `getUpdates` every 3 seconds when setup is pending, stop when confirmed. Do not use webhooks (Replit URLs are not stable enough for webhook registration).
+
+Register this router in `server/src/index.ts` under `/api/telegram`.
+
+### 2C. Wire Notifications into Existing Services
+
+In `AutoTradeExecutor.ts`:
+
+- After successful `placeOrder()` → call `telegramService.notify({ type: 'TRADE_PLACED', ... })`
+- After successful `closePosition()` → call `telegramService.notify({ type: 'TRADE_CLOSED', ... })`
+
+In `CircuitBreaker.ts`:
+
+- When `activateBreaker()` is called → `telegramService.notify({ type: 'CIRCUIT_BREAKER', ... })`
+
+In `IntradayMonitorLoop.ts`:
+
+- When thesis health degrades by more than 15 points → `telegramService.notify({ type: 'THESIS_DEGRADED', ... })`
+- When target proximity < 3% → `telegramService.notify({ type: 'TARGET_APPROACHED', ... })`
+- When session pauses → `telegramService.notify({ type: 'SESSION_PAUSED', ... })`
+
+In `dailyScanScheduler.ts`:
+
+- After 4 PM ET market close scan → `telegramService.sendDailySummary()`
+
+In `EarningsCalendarService.ts`:
+
+- When a trade is skipped for earnings risk → `telegramService.notify({ type: 'EARNINGS_WARNING', ... })`
+
+-----
+
+## PHASE 3 — Fully Implemented Risk Console
+
+Replace the placeholder `RiskConsole.tsx` with a fully live page. Add a backend route first.
+
+### 3A. Risk Console API
+
+Add to `server/src/routes/autotrader.ts` (or create `server/src/routes/risk.ts`):
+
+```
+GET /api/risk/snapshot → live risk metrics aggregated from portfolio state + open positions
+```
+
+The snapshot endpoint should return:
+
+```typescript
+{
+  positions: OpenPosition[],        // from PortfolioStateService
+  metrics: {
+    maxDrawdownPct: number,         // worst single position drawdown
+    portfolioBetaVsSPY: number,     // avg correlation-weighted beta
+    concentrationPct: number,       // largest single position as % of total
+    sectorExposure: Record<string, number>, // sector → % of portfolio
+    totalNotional: number,
+    totalEquity: number,
+    unrealizedPnl: number,
+    dailyPnl: number,
+    activeAlertCount: number,
+  },
+  limits: {
+    maxSinglePosition: { limit: number, current: number, status: 'ok'|'warn'|'breach' },
+    maxSectorExposure: { limit: number, current: number, status: 'ok'|'warn'|'breach' },
+    dailyLossLimit: { limit: number, current: number, status: 'ok'|'warn'|'breach' },
+    maxDrawdownLimit: { limit: number, current: number, status: 'ok'|'warn'|'breach' },
+    maxConcurrentPositions: { limit: number, current: number, status: 'ok'|'warn'|'breach' },
+  },
+  circuitBreaker: CircuitBreakerState,
+  recentAlerts: MonitoringAlert[],   // last 10 unread alerts
+  correlationWarnings: Array<{ tickers: string[], reason: string }>,
+}
+```
+
+For `portfolioBetaVsSPY`: fetch the last 30 days of daily returns for each held ticker and SPY, compute beta as `cov(ticker, SPY) / var(SPY)` — use the OHLCV history already cached by `TechnicalService`.
+
+For `correlationWarnings`: flag any two open positions with >0.75 pairwise correlation using their 30-day return series.
+
+For `sectorExposure`: map each position’s ticker to the sector data in `scanUniverseService` — for unknown tickers use Finnhub’s `GET /stock/profile2?symbol={ticker}` to fetch sector.
+
+### 3B. Risk Console UI (`client/src/pages/RiskConsole.tsx`)
+
+Replace the entire placeholder with a real implementation:
+
+**Header row**: “Risk Console” title + circuit breaker badge (pulsing red if active, green if clear) + “Refresh” button + last-updated timestamp.
+
+**Stat cards row** (4 cards using existing `StatCard` component):
+
+- Max Drawdown: current % with color (green <5%, yellow 5-10%, red >10%)
+- Portfolio Beta: number (green <1.2, yellow 1.2-1.8, red >1.8)
+- Concentration: largest position % (green <10%, yellow 10-20%, red >20%)
+- Active Alerts: count with red badge if >0
+
+**Two-column grid**:
+
+Left — **Exposure by Asset Class**: horizontal bar chart using Recharts `BarChart`. Bars for each asset class (Stocks, Crypto, ETF) showing % of portfolio. Below it, **Sector Exposure**: same bar chart by sector.
+
+Right — **Correlation Warnings**: list any pairs of positions with high correlation. Each warning as a yellow card: “⚠ NVDA + AMD — 0.89 correlation (both semiconductors). Consider reducing one.” If no warnings, show a green “✅ No correlation risk detected” card.
+
+**Risk Limits Table** (full width): replaces the current hardcoded static list with live data from the snapshot. Each row shows: rule name, current value, limit, progress bar filled proportionally, status badge (SAFE / WARN / BREACH). Clicking a BREACH row opens an inline explanation of what to do.
+
+**Position Risk Breakdown** (full width): table of all open positions with columns: Ticker, Exchange, Side, Notional ($), % Portfolio, Distance to Stop (%), Unrealized P&L, Thesis Health (color-coded), Action. Sort by “Distance to Stop” ascending — positions closest to their stop float to the top as they need the most attention.
+
+**Recent Alerts** (full width): last 10 monitoring alerts with severity badge, message, time, and “Mark Read” button.
+
+Auto-refresh every 60 seconds via `useQuery` with `refetchInterval: 60_000`.
+
+-----
+
+## PHASE 4 — Trade Journal with AI Post-Mortem
+
+### 4A. Schema
+
+Add to `server/prisma/schema.prisma`:
+
+```prisma
+model TradeJournal {
+  id              String   @id @default(cuid())
+  userId          String
+  closedPositionId String  @unique
+  ticker          String
+  exchange        String
+  side            String
+  entryPrice      Float
+  exitPrice       Float
+  pnl             Float
+  pnlPct          Float
+  holdDays        Float?
+  closeReason     String?
+  thesisOutcome   String?
+  
+  // AI-generated post-mortem
+  postMortem      String?  // full markdown text
+  keyLesson       String?  // one-sentence takeaway
+  entryQuality    String?  // 'GOOD' | 'EARLY' | 'LATE' | 'CHASED'
+  exitQuality     String?  // 'DISCIPLINED' | 'TOO_EARLY' | 'TOO_LATE' | 'PANIC'
+  thesisCalled    Boolean? // did the thesis direction play out?
+  improvementTags String[] @default([])  // e.g. ['waited_for_confirmation', 'sized_appropriately']
+  
+  generatedAt     DateTime?
+  createdAt       DateTime @default(now())
+
+  @@index([userId])
+  @@index([ticker])
+  @@index([createdAt])
+}
+```
+
+Run `npx prisma migrate dev --name add_trade_journal`.
+
+### 4B. Journal Service
+
+**File**: `server/src/services/journal/TradeJournalService.ts`
+
+**`generatePostMortem(closedPositionId: string, userId: string): Promise<TradeJournal>`**
+
+1. Load the `ClosedPosition` record — entry/exit price, hold days, thesis, close reason, outcome, stop loss, target
+1. Load the `AgentOutput` records for this ticker around the time of entry (use `createdAt` closest to `openedAt`)
+1. Construct a prompt for Claude (use `process.env.ANTHROPIC_API_KEY` if set, otherwise generate a rule-based post-mortem):
+   
+   ```
+   You are a professional trading coach reviewing a closed trade.
+   
+   Trade: {ticker} {side} on {exchange}
+   Entry: ${entryPrice} | Exit: ${exitPrice} | P&L: {+/-pct}%
+   Hold time: {days} days | Close reason: {closeReason}
+   Thesis outcome: {outcome}
+   Original thesis: {thesisSummary}
+   Entry zone was: ${entryLow}–${entryHigh}
+   Invalidation was: ${stopLoss}
+   Target was: ${targetPrice}
+   Actual entry vs zone: {above/below/within} the entry zone
+   Actual exit vs target: {above/below/at} the take-profit level
+   
+   Provide a structured post-mortem in this exact JSON format:
+   {
+     "postMortem": "2-3 paragraph analysis of what happened",
+     "keyLesson": "one sentence takeaway",
+     "entryQuality": "GOOD|EARLY|LATE|CHASED",
+     "exitQuality": "DISCIPLINED|TOO_EARLY|TOO_LATE|PANIC",
+     "thesisCalled": true|false,
+     "improvementTags": ["tag1", "tag2"]
+   }
+   ```
+1. Parse the JSON response and persist to `TradeJournal`
+1. Return the saved journal entry
+
+**Rule-based fallback** (when no AI key): generate post-mortem from heuristics:
+
+- If `closeReason === 'HIT_TARGET'` → entryQuality based on whether entry was within zone, exitQuality = ‘DISCIPLINED’
+- If `closeReason === 'HIT_STOP'` → examine if stop was placed correctly, flag if loss > 10% as sizing issue
+- Generate `keyLesson` from outcome: “Target hit — thesis validated. Continue applying same entry criteria.” etc.
+
+**`generatePostMortems(userId: string, limit = 5): Promise<void>`**
+
+- Finds `ClosedPosition` records with no corresponding `TradeJournal`
+- Generates post-mortems for up to `limit` at a time (avoid API hammering)
+- Called automatically after `IntradayMonitorLoop` closes a position
+
+### 4C. Journal Routes
+
+Add to a new `server/src/routes/journal.ts`:
+
+```
+GET  /api/journal              → paginated list of journal entries for user
+GET  /api/journal/:id          → single entry
+POST /api/journal/generate     → trigger generation for all unreviewed closed positions
+GET  /api/journal/stats        → aggregated patterns: most common lessons, entry quality distribution, etc.
+```
+
+Register under `/api/journal` in `server/src/index.ts`.
+
+### 4D. Journal UI
+
+Add a new **“Trade Journal”** tab to the `PerformanceLab.tsx` page (it already has tabs: overview/patterns/sectors/catalysts/thesis/tradelog). Add `journal` as a 7th tab.
+
+The journal tab shows:
+
+- A card for each closed trade with post-mortem generated. Each card shows: ticker + P&L badge (green/red), hold duration, close reason, a collapsible “Post-Mortem” section with the AI text, key lesson in a yellow highlighted box, entry/exit quality badges, improvement tags as chips.
+- At the top: aggregate stats — “Entry quality: 60% GOOD, 25% LATE, 15% CHASED” as a small horizontal bar. “Exit quality: 45% DISCIPLINED…” Same for thesisCalled %.
+- “Generate Post-Mortems” button that calls `POST /api/journal/generate`
+- If `ANTHROPIC_API_KEY` is not set, show a banner: “AI post-mortems require an Anthropic API key in Secrets. Rule-based analysis is being used instead.”
+
+-----
+
+## PHASE 5 — Watchlist-to-Trade Pipeline
+
+The `Watchlist` and `WatchlistItem` models already exist in the schema. Connect them to the autonomous system.
+
+### 5A. Watchlist Enhancement
+
+Add fields to `WatchlistItem` in the schema migration:
+
+```prisma
+// Add to existing WatchlistItem model:
+autoTradeEnabled  Boolean @default(false)
+minConvictionToTrade Float? // override global threshold for this specific ticker
+notes            String?
+addedThesisScore Float?   // thesis conviction at time of adding to watchlist
+currentThesisScore Float? // updated by monitoring
+lastAnalyzedAt   DateTime?
+```
+
+Run `npx prisma migrate dev --name enhance_watchlist`.
+
+### 5B. Watchlist Monitor
+
+In `IntradayMonitorLoop.ts`, add a watchlist check on each monitoring cycle:
+
+1. Load all `WatchlistItem` records where `autoTradeEnabled = true`
+1. For each, run `thesisEngine.analyze(ticker)`
+1. Update `currentThesisScore` and `lastAnalyzedAt`
+1. If `convictionScore >= (item.minConvictionToTrade ?? globalConfig.minConvictionScore)`:
+- Check the same guards as `AutoTradeExecutor` (not already holding, not already ordered, within capital limits)
+- If all pass: call `AutoTradeExecutor.evaluateAndExecute()` with just this single ticker
+- Send Telegram notification: “👀 Watchlist alert: {ticker} hit conviction threshold ({score}). Auto-trade initiated.”
+1. If conviction drops below threshold by >15 points: notify via Telegram that a watched position is weakening
+
+### 5C. Watchlist UI Enhancement
+
+In the existing watchlist UI (find the watchlist component — it’s linked from the sidebar), add per-item controls:
+
+- Toggle: “Auto-trade when ready” (`autoTradeEnabled`)
+- Input: “Min conviction to trade” (optional override, placeholder = “Use global default”)
+- Textarea: “Notes” (why you added this)
+- Show current thesis conviction score badge next to each ticker (live, from `lastAnalyzedAt`)
+- Show “🎯 Ready to trade” badge if conviction is above threshold
+- Show “📊 Analyzing…” spinner when `lastAnalyzedAt` is null
+
+-----
+
+## PHASE 6 — Sharpe & Sortino Ratios
+
+In `server/src/services/analytics/PerformanceService.ts`, add to `getOverview()`:
+
+```typescript
+// Add to the return object of getOverview():
+sharpeRatio: number,   // (avgReturn - riskFreeRate) / stdDevReturns, annualized
+sortinoRatio: number,  // (avgReturn - riskFreeRate) / downsideDeviation, annualized
+calmarRatio: number,   // annualizedReturn / maxDrawdownPct
+```
+
+Implementation:
+
+- `riskFreeRate`: use 0.045 / 252 as daily risk-free rate (approx 4.5% annual T-bill rate)
+- `stdDevReturns`: standard deviation of daily `pnlPercent` values across all trades
+- `downsideDeviation`: standard deviation of only negative `pnlPercent` values (Sortino uses downside only)
+- `annualizedSharpe = (avgDailyReturn - dailyRiskFree) / stdDev * sqrt(252)`
+- `annualizedSortino = (avgDailyReturn - dailyRiskFree) / downsideDev * sqrt(252)`
+- `maxDrawdownPct`: compute the maximum peak-to-trough decline in the equity curve
+- `calmarRatio = annualizedReturn / maxDrawdownPct` (handle divide-by-zero)
+
+In `PerformanceLab.tsx`, add to the Overview tab’s stat cards row (currently shows winRate, totalPnl, etc.):
+
+- Sharpe Ratio card: value colored green if >1.5, yellow if 0.5–1.5, red if <0.5. Tooltip: “Risk-adjusted return. >1.5 is excellent, >1 is good.”
+- Sortino Ratio card: same color thresholds. Tooltip: “Like Sharpe but only penalizes downside volatility.”
+- Calmar Ratio card: green if >1, yellow 0.5–1, red <0.5. Tooltip: “Annual return divided by max drawdown.”
+
+-----
+
+## PHASE 7 — Sector Rotation Detector
+
+**File**: `server/src/services/market/SectorRotationService.ts`
+
+```typescript
+const SECTOR_ETFS = {
+  Technology: 'XLK',
+  Financials: 'XLF',
+  Energy: 'XLE',
+  Healthcare: 'XLV',
+  Industrials: 'XLI',
+  'Consumer Discretionary': 'XLY',
+  'Consumer Staples': 'XLP',
+  'Real Estate': 'XLRE',
+  Utilities: 'XLU',
+  'Communication Services': 'XLC',
+  Materials: 'XLB',
+};
+```
+
+**`getSectorMomentum(): Promise<SectorMomentumMap>`**:
+
+- Fetches 1-month daily bars for each sector ETF (SPY + XLK + XLF + …) via Yahoo Finance (already integrated)
+- Computes 5-day return, 20-day return, and relative strength vs SPY for each
+- Returns map of sector → `{ fiveDayReturn, twentyDayReturn, relativeStrength, trend: 'LEADING'|'NEUTRAL'|'LAGGING' }`
+- Cache for 1 hour
+
+**`getSectorBonus(ticker: string, sector: string): Promise<number>`**:
+
+- Gets sector momentum for the ticker’s sector
+- Returns a modifier: +5 if sector is LEADING, 0 if NEUTRAL, -10 if LAGGING
+- This modifier is added to the thesis conviction score in `dailyRankingService.ts`
+
+In `server/src/services/scans/dailyRankingService.ts`, after computing `compositeScore`, call `getSectorBonus(ticker, sector)` and add it to the final score (clamped 0–100). This means sector-leading picks get a slight boost and sector-lagging picks get penalized.
+
+**Sector Rotation UI** — add a new panel to `Dashboard.tsx`:
+
+Below the existing market overview section, add a “Sector Rotation” mini-panel showing all 11 sectors as a grid of small cards:
+
+- Each card: sector name, sector ETF ticker, 5-day return (green/red), relative strength vs SPY, trend badge (LEADING/NEUTRAL/LAGGING)
+- Sort by 5-day return descending
+- Refresh every 30 minutes
+- Clicking a sector card navigates to `/scanner?sector={sector}` (filtered opportunity scanner)
+
+-----
+
+## PHASE 8 — Strategy Profiles
+
+### 8A. Schema
+
+```prisma
+model StrategyProfile {
+  id          String   @id @default(cuid())
+  userId      String
+  name        String   // e.g. "Aggressive Crypto Swing"
+  description String?
+  isActive    Boolean  @default(false)
+  
+  // Snapshot of AutoTradeConfig + both ExchangeAutoConfigs at save time
+  globalConfig  Json
+  hlConfig      Json
+  tosConfig     Json
+  
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  @@index([userId])
+}
+```
+
+Run `npx prisma migrate dev --name add_strategy_profiles`.
+
+### 8B. Strategy Routes
+
+```
+GET    /api/autotrader/strategies          → list user's saved profiles
+POST   /api/autotrader/strategies          → save current config as new profile (body: { name, description })
+PUT    /api/autotrader/strategies/:id      → update profile name/description
+DELETE /api/autotrader/strategies/:id      → delete profile
+POST   /api/autotrader/strategies/:id/activate → load this profile's config into active config
+```
+
+### 8C. Strategy UI
+
+In `AutoTrader.tsx`, add a “Strategy Profiles” section above the Configuration Panel:
+
+- A dropdown showing saved profiles + “Current (unsaved)” option
+- “Save as new profile” button → modal with name + description input
+- “Load” button next to each profile in a list view → confirms “This will replace your current config”
+- “Delete” button
+- 4 built-in preset profiles that are created on first load if no profiles exist:
+1. **“Conservative Stocks”** — conviction≥82, moderate risk, TOS only, no leverage, $2K cap, stocks+ETFs
+1. **“Moderate Balanced”** — conviction≥78, moderate risk, both exchanges, 2x HL leverage, $5K cap
+1. **“Aggressive Crypto”** — conviction≥72, aggressive risk, HL only, 3x leverage, $3K cap, shorts enabled
+1. **“Watchlist Only”** — conviction≥85, conservative, only trades watchlist items, $1K cap
+
+-----
+
+## PHASE 9 — Correlation Guard
+
+In `server/src/services/autotrader/AutoTradeExecutor.ts`, add a correlation check before each order:
+
+**`computePairwiseCorrelation(ticker1: string, ticker2: string): Promise<number>`**:
+
+- Fetch 30-day daily return series for both tickers using existing `marketService.history()`
+- Compute Pearson correlation coefficient
+- Cache results for 4 hours
+
+In `evaluateAndExecute()`, after all other checks pass, before placing the order:
+
+1. Get list of all currently open positions across both exchanges
+1. For each existing open position, compute `pairwiseCorrelation(candidate, existingTicker)`
+1. If any correlation > 0.80: skip with reason `'HIGH_CORRELATION: {existingTicker} ({correlationValue})'`
+1. Additionally: compute total sector exposure. If adding this position would bring a sector above 25% of total portfolio (configurable), skip with reason `'SECTOR_CONCENTRATION'`
+
+Add correlation warnings to the Risk Console snapshot endpoint (from Phase 3A).
+
+-----
+
+## PHASE 10 — Live P&L WebSocket
+
+### 10A. Backend WebSocket Manager
+
+**File**: `server/src/services/market/LivePriceManager.ts`
+
+Manages a single Finnhub WebSocket connection for stock tickers and uses Hyperliquid’s existing `getAllMids()` for crypto:
+
+```typescript
+class LivePriceManager {
+  private ws: WebSocket | null = null;
+  private subscribers = new Map<string, Set<(price: number) => void>>();
+  private lastPrices = new Map<string, number>();
+  
+  connect(): void  // opens wss://ws.finnhub.io?token={FINNHUB_API_KEY}
+  subscribe(ticker: string, callback: (price: number) => void): () => void
+  unsubscribe(ticker: string, callback: Function): void
+  getLastPrice(ticker: string): number | null
+  disconnect(): void
+}
+```
+
+- On connect, subscribe to all tickers of currently open TOS positions
+- For crypto: poll `getAllMids()` every 10 seconds (Hyperliquid doesn’t require WebSocket for mid prices)
+- Reconnect automatically with exponential backoff if connection drops
+- Expose a simple REST endpoint: `GET /api/market/live-prices?tickers=AAPL,NVDA` that returns current cached prices — this is what the frontend polls
+
+### 10B. Frontend Live P&L
+
+In `Dashboard.tsx`, for the open positions section:
+
+- Replace static `currentPrice` display with a live-updating price fetched from `GET /api/market/live-prices` every 10 seconds via `useQuery` with `refetchInterval: 10_000`
+- Show a small green/red pulsing dot next to live prices to indicate they’re real-time
+- Compute and display unrealized P&L in real-time: `(livePrice - entryPrice) * quantity`
+- If `FINNHUB_API_KEY` is not set, fall back to 60-second polling (existing behavior) with no live indicator
+
+-----
+
+## PHASE 11 — Multi-Timeframe Intraday Scan
+
+In `server/src/services/scans/dailyScanOrchestrator.ts`, add a new scan mode:
+
+**`runIntradayConfirmationScan(topTickers: string[]): Promise<IntradayConfirmation[]>`**:
+
+- Takes the top 10 tickers from the most recent daily scan run
+- For each, fetches 5-minute OHLCV bars (last 2 days) via Finnhub: `GET /stock/candle?symbol={ticker}&resolution=5&from={unix}&to={unix}&token={key}`
+- Runs a subset of `TechnicalService` indicators on the 5-min bars: RSI, MACD, volume trend, and nearest support/resistance
+- Returns an `IntradayConfirmation` for each: `{ ticker, intradayBias, intradayConviction, isNearSupport, volumeConfirmed, entryRefinement }`
+- If `intradayBias` matches the daily thesis bias AND `isNearSupport` is true: flag as `CONFIRMED` — this is the best entry timing
+- If `intradayBias` contradicts daily bias: flag as `WAIT` — the daily setup exists but price is extended
+
+In `AutoTradeExecutor.ts`, if the intraday confirmation scan has run recently (within 30 minutes) and a candidate is flagged as `WAIT`, skip it and add to a “pending confirmation” list. Re-evaluate on the next scan cycle.
+
+Add a route `POST /api/autotrader/intraday-scan` that triggers this scan manually.
+
+In `DailyScan.tsx`, add a “Intraday Confirmation” column to the ranked results table showing CONFIRMED / WAIT / PENDING for each ticker (if intraday scan has run).
+
+-----
+
+## PHASE 12 — Paper → Live Graduation
+
+**File**: `server/src/services/autotrader/GraduationService.ts`
+
+```typescript
+interface GraduationEligibility {
+  positionId: string;
+  ticker: string;
+  eligible: boolean;
+  reasons: string[];
+  warnings: string[];
+  suggestedExchange: 'tos' | 'hyperliquid';
+  suggestedSize: number;
+}
+```
+
+**`checkGraduationEligibility(positionId: string): Promise<GraduationEligibility>`**:
+
+- Load the `PaperPosition` and its `PositionSnapshot` history
+- Eligible criteria:
+  - Position has been open ≥ 3 days
+  - Thesis health has stayed above 50 for all snapshots
+  - Current thesis health ≥ 60
+  - No `SETUP_INVALIDATED` or `INVALIDATION_THREATENED` alerts in the history
+  - Thesis bias is still aligned with the original entry bias
+  - The thesis conviction score from the latest analysis is ≥ 65
+- Warnings (not blocking): earnings within 7 days, high volatility, position near resistance
+
+**`graduateToLive(positionId: string, userId: string): Promise<GraduationResult>`**:
+
+- Calls `checkGraduationEligibility` — throws if not eligible
+- Determines exchange (crypto → HL, stock → TOS)
+- Calls `PositionSizer` to compute appropriate live size
+- Places the live order via the appropriate exchange service
+- Logs to `AutoTradeLog` with action `'GRADUATE'`
+- Sends Telegram notification: “🎓 Paper position graduated to live: {ticker} → {exchange}”
+
+Add to `server/src/routes/autotrader.ts`:
+
+```
+GET  /api/autotrader/graduation/eligible   → list all paper positions with their eligibility
+POST /api/autotrader/graduation/:id/graduate → graduate a specific paper position to live
+```
+
+In `PaperPortfolio.tsx`, add a “Graduation” column to each open paper position row. Show either:
+
+- Green “✓ Eligible” badge + “Graduate to Live” button (if eligible)
+- Grey “Monitoring…” badge with days remaining (if <3 days open)
+- Yellow “⚠ Not Ready” badge with the blocking reason (if ineligible but not expired)
+
+The “Graduate to Live” button opens a confirmation modal showing: suggested exchange, suggested size, current thesis health, key risks, and a clear warning “This will place a REAL ORDER with REAL MONEY.”
+
+-----
+
+## PHASE 13 — Backtesting Engine
+
+### 13A. Schema
+
+```prisma
+model BacktestRun {
+  id              String   @id @default(cuid())
+  userId          String
+  name            String
+  startDate       DateTime
+  endDate         DateTime
+  assetScope      String
+  configSnapshot  Json     // ExchangeAutoConfig used for the backtest
+  
+  status          String   @default("pending") // pending|running|completed|failed
+  
+  totalTrades     Int?
+  winRate         Float?
+  totalReturn     Float?
+  sharpeRatio     Float?
+  maxDrawdownPct  Float?
+  profitFactor    Float?
+  
+  results         Json?    // full trade-by-trade results array
+  errorMessage    String?
+  
+  startedAt       DateTime?
+  completedAt     DateTime?
+  createdAt       DateTime @default(now())
+
+  @@index([userId])
+}
+```
+
+Run `npx prisma migrate dev --name add_backtest`.
+
+### 13B. Backtest Service
+
+**File**: `server/src/services/backtest/BacktestService.ts`
+
+**`runBacktest(params: BacktestParams): Promise<string>`** (returns backtest run ID, runs async):
+
+```typescript
+interface BacktestParams {
+  userId: string;
+  name: string;
+  startDate: string;  // 'YYYY-MM-DD'
+  endDate: string;
+  assetScope: 'ALL' | 'STOCKS_ONLY' | 'CRYPTO_ONLY';
+  config: ExchangeAutoConfig;  // the parameter set to test
+}
+```
+
+Implementation:
+
+1. Create a `BacktestRun` DB record with status `'pending'`
+1. Run asynchronously (don’t await in the route handler):
+1. Load `DailyScanResult` records from the DB between `startDate` and `endDate` — these are historical scan results already persisted from past runs
+1. For each scan result date in chronological order:
+- Apply the config filters (minConvictionScore, allowedBias, etc.)
+- For each passing candidate: fetch historical OHLCV for the entry date from Yahoo Finance
+- Simulate entry at `entryZone.low` or next day open (use actual open price from historical bars)
+- Track position using historical daily closes:
+  - If close < stopLoss: exit at next day open, record as loss
+  - If close > takeProfit1: exit at next day open, record as win
+  - If hold exceeds `suggestedHoldWindow` days: exit at close, record result
+- Apply `PositionSizer` logic using simulated equity (starting at $100,000)
+1. Compute all performance metrics: win rate, total return, Sharpe, Sortino, max drawdown, profit factor, avg hold days
+1. Save results to `BacktestRun.results` and update status to `'completed'`
+
+**Limitation note in code comments**: “Backtest quality is limited by available historical scan data. Results are only meaningful after the platform has been running for 30+ days and has accumulated scan history.”
+
+### 13C. Backtest Routes
+
+```
+POST /api/backtest/run          → start a backtest (returns run ID immediately)
+GET  /api/backtest/runs         → list user's backtest runs
+GET  /api/backtest/runs/:id     → get run results
+DELETE /api/backtest/runs/:id   → delete a run
+```
+
+Register under `/api/backtest` in `server/src/index.ts`.
+
+### 13D. Backtest UI
+
+Add a new **“Backtest”** page accessible from the Auto Trader page (not a main sidebar tab — a sub-page linked from the Auto Trader “Configuration Panel” with a “Backtest This Config” button).
+
+**File**: `client/src/pages/Backtest.tsx`
+
+Add route `<Route path="backtest" element={<Backtest />} />` in `App.tsx`.
+
+The page has two sections:
+
+**Left panel — Run Backtest**:
+
+- Date range pickers (from/to)
+- Asset scope selector
+- “Use Current Config” button (auto-populates params from active config)
+- Name input for the run
+- “Run Backtest” button → calls `POST /api/backtest/run`
+- Banner if no historical scan data: “No historical scan data available yet. Run daily scans for 30+ days to enable meaningful backtests.”
+
+**Right panel — Results**:
+
+- List of past backtest runs with name, date range, status badge
+- Click a run to expand its results:
+  - Summary stats: win rate, total return, Sharpe, max drawdown, profit factor
+  - Equity curve chart using Recharts (same style as Performance Lab)
+  - Trade log table: date, ticker, entry, exit, P&L, close reason
+
+-----
+
+## PHASE 14 — Telegram Settings in UI
+
+In `client/src/pages/Settings.tsx`, add a “Notifications” section to the existing settings sidebar:
+
+When clicked, show a panel with:
+
+- **Connection status**: “✅ Connected to Telegram” (green) or “❌ Not connected” (grey)
+- If not connected: a step-by-step setup card:
+1. “Click to get your setup code” button → calls `POST /api/telegram/setup-code` → shows the 6-digit code prominently
+1. Instruction text: “Open Telegram → search for @{BOT_USERNAME} → send this code to the bot”
+1. Auto-polling status: “Waiting for confirmation…” spinner (polls `GET /api/telegram/status` every 3 seconds)
+1. On success: status updates to “✅ Connected”
+- If connected: show connected chat ID (last 4 digits only for privacy), “Send Test Message” button, “Disconnect” button
+
+**Notification preferences** (stored in `UserSettings.notificationPrefs` JSON field — add this field):
+
+- Toggle each notification type on/off:
+  - Trade Placed ✓
+  - Trade Closed ✓
+  - Circuit Breaker Activated ✓
+  - Daily Summary ✓
+  - Earnings Warning ✓
+  - Thesis Health Degraded ✓ (default off — can be noisy)
+  - Target Approached ✓ (default off)
+  - Session Paused ✓
+
+-----
+
+## IMPLEMENTATION ORDER
+
+Build in this exact sequence to avoid dependency issues:
+
+1. Phase 1A (Finnhub news) — everything improves downstream
+1. Phase 1B (Earnings calendar) + Phase 2A/2B/2C (Telegram) — can build in parallel
+1. Phase 3 (Risk Console) — needs PortfolioStateService from previous prompts
+1. Phase 4 (Trade Journal) — needs ClosedPosition records
+1. Phase 6 (Sharpe/Sortino) — pure math addition to existing service
+1. Phase 7 (Sector Rotation) — new service, minimal dependencies
+1. Phase 8 (Strategy Profiles) — pure config management
+1. Phase 9 (Correlation Guard) — adds to AutoTradeExecutor
+1. Phase 5 (Watchlist Pipeline) — adds to IntradayMonitorLoop
+1. Phase 10 (Live P&L WebSocket) — needs Finnhub key
+1. Phase 11 (Intraday Scan) — needs Finnhub candle endpoint
+1. Phase 12 (Graduation) — needs positions + live exchange services
+1. Phase 13 (Backtest) — needs historical scan data in DB
+1. Phase 14 (Telegram Settings UI) — needs Phase 2 complete
+
+-----
+
+## SECRETS TO ADD IN REPLIT
+
+The user must add these in Replit Secrets before the new features work:
+
+- `FINNHUB_API_KEY` — get free at finnhub.io
+- `CRYPTOPANIC_API_KEY` — get free at cryptopanic.com (click “API” in the nav)
+- `TELEGRAM_BOT_TOKEN` — create a bot via @BotFather on Telegram, copy the token
+- `ANTHROPIC_API_KEY` — (optional) needed for AI-generated trade post-mortems; rule-based fallback works without it
+
+Existing secrets that must already be set for the platform to function:
+
+- `HL_WALLET_ADDRESS`, `HL_PRIVATE_KEY` (or keep dry run)
+- `SCHWAB_CLIENT_ID`, `SCHWAB_CLIENT_SECRET`, `SCHWAB_REFRESH_TOKEN`, `SCHWAB_ACCOUNT_NUMBER` (or keep dry run)
+
+-----
+
+## NEW FILES SUMMARY
+
+```
+server/src/services/news/FinnhubNewsProvider.ts
+server/src/services/events/EarningsCalendarService.ts
+server/src/services/notifications/TelegramService.ts
+server/src/services/journal/TradeJournalService.ts
+server/src/services/market/SectorRotationService.ts
+server/src/services/market/LivePriceManager.ts
+server/src/services/autotrader/GraduationService.ts
+server/src/services/backtest/BacktestService.ts
+server/src/routes/telegram.ts
+server/src/routes/journal.ts
+server/src/routes/backtest.ts
+client/src/pages/Backtest.tsx
+```
+
+## MODIFIED FILES SUMMARY
+
+```
+server/prisma/schema.prisma                    → EarningsEvent, TradeJournal, StrategyProfile, BacktestRun models; WatchlistItem fields; UserSettings.notificationPrefs
+server/src/services/news/NewsService.ts        → swap mock for FinnhubNewsProvider
+server/src/services/analytics/PerformanceService.ts → add Sharpe/Sortino/Calmar
+server/src/services/scans/dailyRankingService.ts → add sector bonus
+server/src/services/scans/dailyScanOrchestrator.ts → add intraday confirmation scan
+server/src/services/scans/dailyScanScheduler.ts → wire daily summary Telegram
+server/src/services/autotrader/AutoTradeExecutor.ts → earnings guard + correlation guard
+server/src/services/autotrader/IntradayMonitorLoop.ts → watchlist monitor + post-mortem trigger + Telegram calls
+server/src/services/autotrader/CircuitBreaker.ts → Telegram on activation
+server/src/routes/autotrader.ts                → strategy profiles + graduation + intraday scan routes + risk snapshot
+server/src/index.ts                            → register telegram, journal, backtest routes
+client/src/pages/RiskConsole.tsx               → full live implementation
+client/src/pages/PerformanceLab.tsx            → journal tab + Sharpe/Sortino cards
+client/src/pages/Dashboard.tsx                 → sector rotation panel + live P&L
+client/src/pages/Settings.tsx                  → Telegram setup section
+client/src/pages/DailyScan.tsx                 → intraday confirmation column
+client/src/pages/PaperPortfolio.tsx            → graduation controls
+client/src/pages/AutoTrader.tsx                → strategy profiles section
+client/src/api/client.ts                       → journal, backtest, telegram, graduation, sector API methods
+client/src/App.tsx                             → add /backtest route
+```

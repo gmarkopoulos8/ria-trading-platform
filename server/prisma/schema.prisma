@@ -46,6 +46,7 @@ model UserSettings {
   stocksApiKey         String?
   cryptoApiKey         String?
   preferences          Json?
+  notificationPrefs    Json?
   autoTradeEnabled     Boolean  @default(false)
   autoTradeConfig      Json?
 
@@ -84,6 +85,12 @@ model WatchlistItem {
   notes       String?
   alertPrice  Float?
   sortOrder   Int     @default(0)
+
+  autoTradeEnabled     Boolean  @default(false)
+  minConvictionToTrade Float?
+  addedThesisScore     Float?
+  currentThesisScore   Float?
+  lastAnalyzedAt       DateTime?
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
@@ -936,4 +943,106 @@ model TosKillEvent {
   createdAt  DateTime @default(now())
 
   @@map("tos_kill_events")
+}
+
+// ─── Earnings Calendar ────────────────────────────────────────────
+
+model EarningsEvent {
+  id              String   @id @default(cuid())
+  ticker          String
+  reportDate      DateTime
+  epsEstimate     Float?
+  revenueEstimate Float?
+  quarter         Int?
+  year            Int?
+  fetchedAt       DateTime @default(now())
+
+  @@unique([ticker, reportDate])
+  @@index([reportDate])
+  @@index([ticker])
+  @@map("earnings_events")
+}
+
+// ─── Trade Journal ────────────────────────────────────────────────
+
+model TradeJournal {
+  id               String   @id @default(cuid())
+  userId           String
+  closedPositionId String   @unique
+  ticker           String
+  exchange         String
+  side             String
+  entryPrice       Float
+  exitPrice        Float
+  pnl              Float
+  pnlPct           Float
+  holdDays         Float?
+  closeReason      String?
+  thesisOutcome    String?
+
+  postMortem      String?
+  keyLesson       String?
+  entryQuality    String?
+  exitQuality     String?
+  thesisCalled    Boolean?
+  improvementTags String[]  @default([])
+
+  generatedAt     DateTime?
+  createdAt       DateTime  @default(now())
+
+  @@index([userId])
+  @@index([ticker])
+  @@index([createdAt])
+  @@map("trade_journals")
+}
+
+// ─── Strategy Profiles ────────────────────────────────────────────
+
+model StrategyProfile {
+  id          String   @id @default(cuid())
+  userId      String
+  name        String
+  description String?
+  isActive    Boolean  @default(false)
+
+  globalConfig  Json
+  hlConfig      Json
+  tosConfig     Json
+
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  @@index([userId])
+  @@map("strategy_profiles")
+}
+
+// ─── Backtest ─────────────────────────────────────────────────────
+
+model BacktestRun {
+  id              String   @id @default(cuid())
+  userId          String
+  name            String
+  startDate       DateTime
+  endDate         DateTime
+  assetScope      String
+  configSnapshot  Json
+
+  status          String   @default("pending")
+
+  totalTrades     Int?
+  winRate         Float?
+  totalReturn     Float?
+  sharpeRatio     Float?
+  maxDrawdownPct  Float?
+  profitFactor    Float?
+
+  results         Json?
+  errorMessage    String?
+
+  startedAt       DateTime?
+  completedAt     DateTime?
+  createdAt       DateTime  @default(now())
+
+  @@index([userId])
+  @@map("backtest_runs")
 }
