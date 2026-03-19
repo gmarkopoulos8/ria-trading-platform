@@ -1,0 +1,787 @@
+# Replit Agent Prompt — Three-Level Trading Controls
+
+This is an addendum to all previous prompts. Apply on top of everything already built. Do not remove or rename any existing functions, routes, or UI elements — only extend them.
+
+-----
+
+## OVERVIEW
+
+The existing killswitch does two things at once: halts trading AND closes all positions. This replaces it with three distinct levels:
+
+- **Level 1 — Pause**: stops new entries, keeps positions open, fully reversible
+- **Level 2 — Hard Stop**: stops new entries + cancels pending orders, keeps positions open, fully reversible
+- **Level 3 — Emergency Exit**: cancels all orders + closes all positions at market, requires typing “CONFIRM”
+
+The existing `executeKillswitch()` function maps to Level 3 behavior. Levels 1 and 2 are new. Nothing that currently calls `executeKillswitch()` (drawdown monitor, auto-circuit breaker) changes — those always trigger Level 3 because they represent automated risk events. Only the manual UI controls are split into three levels.
+
+-----
+
+## PHASE 1 — Backend: New Control Functions
+
+### 1A. Hyperliquid Killswitch Service
+
+In `server/src/services/hyperliquid/hyperliquidKillswitchService.ts`, add the following alongside the existing `executeKillswitch()`. Do NOT modify the existing function.
+
+Add a separate pause state to `hyperliquidConfig.ts`:
+
+```typescript
+// Add to hyperliquidConfig.ts alongside existing killswitch state:
+
+let _pauseActive = false;
+let _pauseReason: string | null = null;
+let _pauseTime: Date | null = null;
+
+export function isPauseActive(): boolean { return _pauseActive; }
+export function activatePause(reason: string): void {
+  _pauseActive = true;
+  _pauseReason = reason;
+  _pauseTime = new Date();
+  console.info(`[HL-PAUSE] Activated: ${reason}`);
+}
+export function deactivatePause(): void {
+  _pauseActive = false;
+  _pauseReason = null;
+  _pauseTime = null;
+  console.info('[HL-PAUSE] Deactivated');
+}
+export function getPauseState() {
+  return { active: _pauseActive, reason: _pauseReason, activatedAt: _pauseTime };
+}
+```
+
+In `hyperliquidKillswitchService.ts`, add:
+
+**`pauseTrading(reason: string, userId?: string): Promise<PauseResult>`**
+
+```typescript
+export async function pauseTrading(reason: string, userId?: string): Promise<{
+  success: boolean;
+  level: 'PAUSE';
+}> {
+  activatePause(reason);
+  
+  try {
+    await prisma.hyperliquidKillEvent.create({
+      data: { userId, reason, trigger: 'pause', snapshot: { level: 'PAUSE' } },
+    });
+  } catch {}
+
+  console.info(`[HL-PAUSE] Trading paused — reason: ${reason}`);
+  return { success: true, level: 'PAUSE' };
+}
+```
+
+**`hardStop(reason: string, userId?: string): Promise<HardStopResult>`**
+
+```typescript
+export async function hardStop(reason: string, userId?: string): Promise<{
+  success: boolean;
+  level: 'HARD_STOP';
+  ordersCancelled: number;
+  errors: string[];
+  isDryRun: boolean;
+}> {
+  // Activate the existing killswitch flag — this blocks ALL new order execution
+  activateKillswitch(reason, 'manual');
+
+  // Also deactivate pause if it was active (hard stop supersedes pause)
+  deactivatePause();
+
+  let ordersCancelled = 0;
+  const errors: string[] = [];
+
+  // Cancel all PENDING/OPEN orders — but do NOT close positions
+  try {
+    const openOrders = await getOpenOrders(HL_CONFIG.WALLET_ADDRESS);
+    if (openOrders.length > 0) {
+      console.warn(`[HL-HARD-STOP] Cancelling ${openOrders.length} open orders`);
+      ordersCancelled = await cancelAllOrders(openOrders, userId);
+    }
+  } catch (err) {
+    errors.push(err instanceof Error ? err.message : 'Order cancellation error');
+  }
+
+  try {
+    await prisma.hyperliquidKillEvent.create({
+      data: {
+        userId, reason, trigger: 'manual',
+        snapshot: { level: 'HARD_STOP', ordersCancelled },
+      },
+    });
+  } catch {}
+
+  console.warn(`[HL-HARD-STOP] Complete — cancelled=${ordersCancelled} errors=${errors.length}`);
+  return { success: errors.length === 0, level: 'HARD_STOP', ordersCancelled, errors, isDryRun: HL_CONFIG.DRY_RUN };
+}
+```
+
+**`resumeTrading(userId?: string): Promise<void>`**
+
+```typescript
+// Resumes from EITHER pause or hard stop (but NOT after emergency exit — that requires manual review)
+export async function resumeTrading(userId?: string): Promise<void> {
+  deactivatePause();
+  deactivateKillswitch();
+  console.info('[HL] Trading resumed by userId:', userId ?? 'unknown');
+}
+```
+
+Update `getKillswitchStatus()` to include pause state:
+
+```typescript
+export function getKillswitchStatus() {
+  return {
+    ...getKillswitchState(),
+    pause: getPauseState(),
+    controlLevel: isKillswitchActive() ? 'HARD_STOP' : isPauseActive() ? 'PAUSE' : 'ACTIVE',
+    maxDrawdownPct: HL_CONFIG.MAX_DRAWDOWN_PCT,
+    dryRun: HL_CONFIG.DRY_RUN,
+    monitorRunning: _monitorTimer !== null,
+  };
+}
+```
+
+Update `isKillswitchActive()` usage in `hyperliquidExchangeService.ts` — the `assertSafe()` function already checks `isKillswitchActive()`. Add a pause check alongside it:
+
+```typescript
+// In hyperliquidExchangeService.ts, update assertSafe():
+function assertSafe(action: string): void {
+  if (isKillswitchActive()) {
+    throw new Error(`HARD STOP ACTIVE — ${action} blocked`);
+  }
+  if (isPauseActive()) {
+    throw new Error(`TRADING PAUSED — ${action} blocked. Resume trading to continue.`);
+  }
+}
+```
+
+Import `isPauseActive` from `hyperliquidConfig`.
+
+### 1B. TOS Killswitch Service
+
+Apply the exact same pattern to `server/src/services/tos/tosConfig.ts` and `server/src/services/tos/tosKillswitchService.ts`:
+
+Add pause state to `tosConfig.ts`:
+
+```typescript
+let _pauseActive = false;
+let _pauseReason: string | null = null;
+let _pauseTime: Date | null = null;
+
+export function isPauseActive(): boolean { return _pauseActive; }
+export function activatePause(reason: string): void {
+  _pauseActive = true; _pauseReason = reason; _pauseTime = new Date();
+  console.info(`[TOS-PAUSE] Activated: ${reason}`);
+}
+export function deactivatePause(): void {
+  _pauseActive = false; _pauseReason = null; _pauseTime = null;
+  console.info('[TOS-PAUSE] Deactivated');
+}
+export function getPauseState() {
+  return { active: _pauseActive, reason: _pauseReason, activatedAt: _pauseTime };
+}
+```
+
+Add to `tosKillswitchService.ts`:
+
+**`pauseTrading(reason, userId?)`** — same pattern as HL, no order cancellation
+
+**`hardStop(reason, userId?)`** — activates killswitch + cancels all open orders via `cancelAllOpenOrders()`, does NOT close positions
+
+**`resumeTrading(userId?)`** — deactivates both pause and killswitch
+
+Update `tosExchangeService.ts` `assertSafe()` to check `isPauseActive()` as well.
+
+Update `getKillswitchStatus()` in `tosKillswitchService.ts`:
+
+```typescript
+export function getKillswitchStatus() {
+  return {
+    ...getKillswitchState(),
+    pause: getPauseState(),
+    controlLevel: isKillswitchActive() ? 'HARD_STOP' : isPauseActive() ? 'PAUSE' : 'ACTIVE',
+    maxDrawdownPct: TOS_CONFIG.MAX_DRAWDOWN_PCT,
+    dryRun: TOS_CONFIG.DRY_RUN,
+    monitorRunning: _monitorTimer !== null,
+    schedulerRunning: _schedulerTimer !== null,
+  };
+}
+```
+
+-----
+
+## PHASE 2 — New API Routes
+
+### 2A. Hyperliquid Routes
+
+In `server/src/routes/hyperliquid.ts`, add alongside the existing `/killswitch` routes:
+
+```typescript
+import { pauseTrading, hardStop, resumeTrading, executeKillswitch, resetKillswitch } from '../services/hyperliquid/hyperliquidKillswitchService';
+
+// Level 1 — Pause
+router.post('/controls/pause', async (req: Request, res: Response) => {
+  try {
+    const { reason = 'Manual pause' } = req.body;
+    const result = await pauseTrading(reason, req.session.userId);
+    res.json({ success: true, data: result });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err instanceof Error ? err.message : 'Pause failed' });
+  }
+});
+
+// Level 2 — Hard Stop
+router.post('/controls/hard-stop', async (req: Request, res: Response) => {
+  try {
+    const { reason = 'Manual hard stop' } = req.body;
+    const result = await hardStop(reason, req.session.userId);
+    res.json({ success: true, data: result });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err instanceof Error ? err.message : 'Hard stop failed' });
+  }
+});
+
+// Level 3 — Emergency Exit (existing executeKillswitch, just a new route alias)
+router.post('/controls/emergency-exit', async (req: Request, res: Response) => {
+  try {
+    const { reason = 'Emergency exit — manual trigger', confirmText } = req.body;
+    // Backend double-check on the confirmation
+    if (confirmText !== 'CONFIRM') {
+      return res.status(400).json({ success: false, error: 'Must send confirmText: "CONFIRM" to execute emergency exit' });
+    }
+    const result = await executeKillswitch(reason, 'manual', req.session.userId);
+    res.json({ success: true, data: result });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err instanceof Error ? err.message : 'Emergency exit failed' });
+  }
+});
+
+// Resume (works from any level)
+router.post('/controls/resume', async (req: Request, res: Response) => {
+  try {
+    await resumeTrading(req.session.userId);
+    res.json({ success: true, message: 'Trading resumed' });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err instanceof Error ? err.message : 'Resume failed' });
+  }
+});
+```
+
+Keep the existing `/killswitch` POST and DELETE routes exactly as they are — they still work as before for backward compatibility and for the drawdown monitor.
+
+### 2B. TOS Routes
+
+Add identical routes to `server/src/routes/tos.ts`:
+
+```
+POST /api/tos/controls/pause
+POST /api/tos/controls/hard-stop
+POST /api/tos/controls/emergency-exit  (requires confirmText: "CONFIRM" in body)
+POST /api/tos/controls/resume
+```
+
+Same implementation pattern as Hyperliquid above.
+
+-----
+
+## PHASE 3 — Auto Trader Integration
+
+In `server/src/services/autotrader/AutoTradeExecutor.ts`, update the safety check before placing any order:
+
+```typescript
+// Import both from each exchange:
+import { isPauseActive as isHLPaused } from '../hyperliquid/hyperliquidConfig';
+import { isPauseActive as isTOSPaused } from '../tos/tosConfig';
+import { isKillswitchActive as isHLStopped } from '../hyperliquid/hyperliquidConfig';
+import { isKillswitchActive as isTOSStopped } from '../tos/tosConfig';
+
+// In evaluateAndExecute(), before routing to each exchange:
+if (exchange === 'hyperliquid' && (isHLPaused() || isHLStopped())) {
+  logSkip(ticker, `HL trading paused/stopped: ${isHLStopped() ? 'HARD_STOP' : 'PAUSE'}`);
+  continue;
+}
+if (exchange === 'tos' && (isTOSPaused() || isTOSStopped())) {
+  logSkip(ticker, `TOS trading paused/stopped: ${isTOSStopped() ? 'HARD_STOP' : 'PAUSE'}`);
+  continue;
+}
+```
+
+In `IntradayMonitorLoop.ts`, the auto-exit logic (closing positions when thesis deteriorates) should still work during a PAUSE — monitoring never stops. But it should NOT auto-exit during a HARD_STOP (user has taken manual control). Add this check:
+
+```typescript
+// In the auto-exit section of IntradayMonitorLoop:
+// Only auto-close via thesis degradation if not in hard stop
+if (!isTOSStopped() && !isHLStopped()) {
+  // ... existing auto-exit logic ...
+}
+// Pause does NOT block the monitoring loop or auto-exits
+// Hard stop DOES block auto-exits (user has taken manual control)
+```
+
+-----
+
+## PHASE 4 — Updated UI: Hyperliquid Dashboard
+
+In `client/src/pages/hyperliquid/HyperliquidDashboard.tsx`, replace the existing killswitch button section entirely. The existing code has a single “KILLSWITCH” button and a “Resume Trading” button — replace both with the three-level control panel.
+
+### New state variables (add to the component):
+
+```typescript
+const [showHardStopConfirm, setShowHardStopConfirm] = useState(false);
+const [showEmergencyConfirm, setShowEmergencyConfirm] = useState(false);
+const [emergencyConfirmText, setEmergencyConfirmText] = useState('');
+const [controlReason, setControlReason] = useState('');
+```
+
+### New mutations (add alongside existing killMutation):
+
+```typescript
+const pauseMutation = useMutation({
+  mutationFn: (reason: string) => api.hyperliquid.pause(reason),
+  onSuccess: () => { toast.info('Trading paused'); qc.invalidateQueries({ queryKey: ['hl-status'] }); },
+  onError: (err: any) => toast.error(err?.response?.data?.error ?? 'Pause failed'),
+});
+
+const hardStopMutation = useMutation({
+  mutationFn: (reason: string) => api.hyperliquid.hardStop(reason),
+  onSuccess: (data: any) => {
+    toast.warning(`Hard stop activated — ${data?.data?.ordersCancelled ?? 0} orders cancelled`);
+    setShowHardStopConfirm(false);
+    qc.invalidateQueries({ queryKey: ['hl-status'] });
+  },
+  onError: (err: any) => toast.error(err?.response?.data?.error ?? 'Hard stop failed'),
+});
+
+const emergencyExitMutation = useMutation({
+  mutationFn: ({ reason, confirmText }: { reason: string; confirmText: string }) =>
+    api.hyperliquid.emergencyExit(reason, confirmText),
+  onSuccess: (data: any) => {
+    toast.error(`EMERGENCY EXIT — ${data?.data?.positionsClosed ?? 0} positions closed`);
+    setShowEmergencyConfirm(false);
+    setEmergencyConfirmText('');
+    qc.invalidateQueries({ queryKey: ['hl-status'] });
+  },
+  onError: (err: any) => toast.error(err?.response?.data?.error ?? 'Emergency exit failed'),
+});
+
+const resumeMutation = useMutation({
+  mutationFn: () => api.hyperliquid.resume(),
+  onSuccess: () => { toast.success('Trading resumed'); qc.invalidateQueries({ queryKey: ['hl-status'] }); },
+  onError: (err: any) => toast.error(err?.response?.data?.error ?? 'Resume failed'),
+});
+```
+
+### Derived state:
+
+```typescript
+const controlLevel: 'ACTIVE' | 'PAUSE' | 'HARD_STOP' = status?.killswitch?.controlLevel ?? 'ACTIVE';
+const isPaused = controlLevel === 'PAUSE';
+const isStopped = controlLevel === 'HARD_STOP';
+const isAnyControlActive = isPaused || isStopped;
+```
+
+### Replace the existing killswitch button area with this control panel:
+
+Find the section in the existing component that renders the `KILLSWITCH` and `Resume Trading` buttons (around line 345–355 based on the grep). Replace that entire block with:
+
+```tsx
+{/* ─── Trading Controls ─────────────────────────────────── */}
+<Card className="p-4">
+  <div className="flex items-center justify-between mb-3">
+    <p className="text-xs font-mono uppercase tracking-wider text-slate-500">Trading Controls</p>
+    {/* Status badge */}
+    <span className={cn(
+      'text-xs font-bold px-2 py-1 rounded font-mono',
+      isStopped ? 'bg-red-500/20 text-red-400 animate-pulse' :
+      isPaused  ? 'bg-amber-500/20 text-amber-400' :
+                  'bg-accent-green/20 text-accent-green'
+    )}>
+      {isStopped ? '⛔ HARD STOP' : isPaused ? '⏸ PAUSED' : '● ACTIVE'}
+    </span>
+  </div>
+
+  {/* Active control banner */}
+  {isAnyControlActive && (
+    <div className={cn(
+      'flex items-center justify-between p-3 rounded-lg mb-3 border',
+      isStopped
+        ? 'bg-red-500/10 border-red-500/30'
+        : 'bg-amber-500/10 border-amber-500/30'
+    )}>
+      <div>
+        <p className={cn('text-sm font-bold', isStopped ? 'text-red-400' : 'text-amber-400')}>
+          {isStopped ? '⛔ Hard Stop Active — Trading Halted' : '⏸ Trading Paused'}
+        </p>
+        <p className="text-xs text-slate-500 mt-0.5">
+          {status?.killswitch?.reason ?? status?.killswitch?.pause?.reason ?? 'Manual control active'}
+        </p>
+        <p className="text-xs text-slate-600 mt-0.5">
+          Since {status?.killswitch?.activatedAt
+            ? new Date(status.killswitch.activatedAt).toLocaleTimeString()
+            : status?.killswitch?.pause?.activatedAt
+            ? new Date(status.killswitch.pause.activatedAt).toLocaleTimeString()
+            : '—'}
+        </p>
+      </div>
+      <button
+        onClick={() => resumeMutation.mutate()}
+        disabled={resumeMutation.isPending}
+        className="flex items-center gap-1.5 px-3 py-2 rounded-lg bg-accent-green/20 border border-accent-green/40 text-accent-green text-xs font-semibold hover:bg-accent-green/30 transition-colors"
+      >
+        <Power className="h-3.5 w-3.5" />
+        {resumeMutation.isPending ? 'Resuming...' : 'Resume Trading'}
+      </button>
+    </div>
+  )}
+
+  {/* Three control buttons */}
+  {!isAnyControlActive && (
+    <div className="flex items-center gap-2 mb-3">
+      {/* Level 1 — Pause */}
+      <button
+        onClick={() => pauseMutation.mutate('Manual pause')}
+        disabled={pauseMutation.isPending}
+        className="flex-1 flex items-center justify-center gap-1.5 py-2 rounded-lg bg-amber-500/10 border border-amber-500/30 text-amber-400 text-xs font-semibold hover:bg-amber-500/20 transition-colors"
+      >
+        <PauseCircle className="h-3.5 w-3.5" />
+        {pauseMutation.isPending ? '...' : 'Pause'}
+      </button>
+
+      {/* Level 2 — Hard Stop */}
+      <button
+        onClick={() => setShowHardStopConfirm(true)}
+        className="flex-1 flex items-center justify-center gap-1.5 py-2 rounded-lg bg-orange-500/10 border border-orange-500/30 text-orange-400 text-xs font-semibold hover:bg-orange-500/20 transition-colors"
+      >
+        <StopCircle className="h-3.5 w-3.5" />
+        Hard Stop
+      </button>
+    </div>
+  )}
+
+  {/* Level 3 — Emergency Exit (always visible, separated visually) */}
+  <div className="pt-3 border-t border-surface-border">
+    <button
+      onClick={() => setShowEmergencyConfirm(true)}
+      className="w-full flex items-center justify-between px-3 py-2.5 rounded-lg bg-red-500/5 border border-red-500/20 hover:bg-red-500/10 hover:border-red-500/40 transition-colors group"
+    >
+      <div className="flex items-center gap-2">
+        <AlertOctagon className="h-4 w-4 text-red-500/60 group-hover:text-red-400" />
+        <div className="text-left">
+          <p className="text-xs font-semibold text-red-500/70 group-hover:text-red-400">Emergency Exit All Positions</p>
+          <p className="text-[10px] text-slate-600">Closes all open positions at market. Use only in emergencies.</p>
+        </div>
+      </div>
+      <ChevronRight className="h-3.5 w-3.5 text-red-500/40 group-hover:text-red-400" />
+    </button>
+  </div>
+</Card>
+
+{/* Hard Stop Confirmation Modal */}
+{showHardStopConfirm && (
+  <div className="fixed inset-0 bg-black/60 backdrop-blur-sm flex items-center justify-center z-50 p-4">
+    <div className="bg-surface-1 border border-surface-border rounded-2xl p-6 max-w-sm w-full shadow-2xl">
+      <div className="flex items-center gap-3 mb-4">
+        <div className="w-10 h-10 rounded-xl bg-orange-500/20 border border-orange-500/30 flex items-center justify-center flex-shrink-0">
+          <StopCircle className="h-5 w-5 text-orange-400" />
+        </div>
+        <div>
+          <h3 className="text-sm font-black text-white">Activate Hard Stop?</h3>
+          <p className="text-xs text-slate-500">New orders blocked · Pending orders cancelled · Positions kept open</p>
+        </div>
+      </div>
+      <textarea
+        value={controlReason}
+        onChange={(e) => setControlReason(e.target.value)}
+        placeholder="Optional reason (e.g. 'Taking manual control')…"
+        className="w-full bg-surface-3 border border-surface-border rounded-lg p-2.5 text-sm text-white placeholder-slate-600 resize-none h-20 mb-4 focus:outline-none focus:border-orange-500/50"
+      />
+      <div className="flex gap-2">
+        <button onClick={() => setShowHardStopConfirm(false)} className="flex-1 py-2.5 rounded-xl border border-surface-border text-slate-400 text-sm hover:text-white transition-colors">
+          Cancel
+        </button>
+        <button
+          onClick={() => hardStopMutation.mutate(controlReason || 'Manual hard stop')}
+          disabled={hardStopMutation.isPending}
+          className="flex-1 py-2.5 rounded-xl bg-orange-500/20 border border-orange-500/40 text-orange-400 text-sm font-bold hover:bg-orange-500/30 transition-colors"
+        >
+          {hardStopMutation.isPending ? <RefreshCw className="h-4 w-4 animate-spin mx-auto" /> : 'Hard Stop'}
+        </button>
+      </div>
+    </div>
+  </div>
+)}
+
+{/* Emergency Exit Confirmation Modal */}
+{showEmergencyConfirm && (
+  <div className="fixed inset-0 bg-black/80 backdrop-blur-sm flex items-center justify-center z-50 p-4">
+    <div className="bg-surface-1 border border-red-500/40 rounded-2xl p-6 max-w-sm w-full shadow-2xl">
+      <div className="flex items-center gap-3 mb-1">
+        <div className="w-10 h-10 rounded-xl bg-red-500/20 border border-red-500/40 flex items-center justify-center flex-shrink-0">
+          <AlertOctagon className="h-5 w-5 text-red-400" />
+        </div>
+        <h3 className="text-sm font-black text-red-400">Emergency Exit</h3>
+      </div>
+      <p className="text-xs text-slate-400 mb-4">
+        This will <strong className="text-white">immediately close ALL open positions at market price</strong> and cancel all pending orders. This cannot be undone.
+      </p>
+      <div className="p-3 rounded-lg bg-red-500/10 border border-red-500/20 mb-4">
+        <p className="text-xs text-red-400 font-mono">
+          ⚠ Market orders during volatile conditions may fill at significantly worse prices than current market price.
+        </p>
+      </div>
+      <div className="mb-4">
+        <label className="text-xs text-slate-500 mb-1.5 block">Type <span className="font-mono font-bold text-white">CONFIRM</span> to proceed</label>
+        <input
+          type="text"
+          value={emergencyConfirmText}
+          onChange={(e) => setEmergencyConfirmText(e.target.value.toUpperCase())}
+          placeholder="CONFIRM"
+          className="w-full bg-surface-3 border border-surface-border rounded-lg px-3 py-2.5 text-sm font-mono text-white placeholder-slate-600 focus:outline-none focus:border-red-500/50 uppercase"
+        />
+      </div>
+      <div className="flex gap-2">
+        <button
+          onClick={() => { setShowEmergencyConfirm(false); setEmergencyConfirmText(''); }}
+          className="flex-1 py-2.5 rounded-xl border border-surface-border text-slate-400 text-sm hover:text-white transition-colors"
+        >
+          Cancel
+        </button>
+        <button
+          onClick={() => emergencyExitMutation.mutate({
+            reason: 'Emergency exit — manual trigger',
+            confirmText: emergencyConfirmText,
+          })}
+          disabled={emergencyConfirmText !== 'CONFIRM' || emergencyExitMutation.isPending}
+          className="flex-1 py-2.5 rounded-xl bg-red-500/20 border border-red-500/40 text-red-400 text-sm font-black hover:bg-red-500/30 transition-colors disabled:opacity-30 disabled:cursor-not-allowed"
+        >
+          {emergencyExitMutation.isPending
+            ? <RefreshCw className="h-4 w-4 animate-spin mx-auto" />
+            : '🚨 EXIT ALL POSITIONS'
+          }
+        </button>
+      </div>
+    </div>
+  </div>
+)}
+```
+
+Add these imports at the top of the file:
+
+```typescript
+import { PauseCircle, StopCircle, AlertOctagon } from 'lucide-react';
+```
+
+Remove the existing `showKillConfirm` state, `killReason` state, and `killMutation` — they are replaced by the above. Keep `resetKillMutation` but rename its call to `resumeMutation` in the JSX.
+
+-----
+
+## PHASE 5 — Updated UI: TOS Dashboard
+
+Apply the identical control panel to `client/src/pages/tos/TosDashboard.tsx`:
+
+- Same three-level control panel structure
+- Same state variables
+- Same modal designs
+- New mutations calling `api.tos.pause()`, `api.tos.hardStop()`, `api.tos.emergencyExit()`, `api.tos.resume()`
+- Remove existing `showKillConfirm`, `killReason`, `killMutation` — replaced by the new three-level setup
+- Import `PauseCircle`, `StopCircle`, `AlertOctagon` from `lucide-react`
+
+-----
+
+## PHASE 6 — Updated UI: Auto Trader Page
+
+In `client/src/pages/AutoTrader.tsx`, add a **“Platform Controls”** section showing the combined state of both exchanges:
+
+```tsx
+{/* Platform Controls — shows both exchange control levels */}
+<Card className="p-4">
+  <p className="text-xs font-mono uppercase tracking-wider text-slate-500 mb-3">Platform Controls</p>
+  
+  <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+    {/* HL Control */}
+    <div className="p-3 rounded-lg bg-surface-3 border border-surface-border">
+      <div className="flex items-center justify-between mb-2">
+        <span className="text-xs text-slate-400 font-semibold">Hyperliquid</span>
+        <ControlLevelBadge level={hlControlLevel} />
+      </div>
+      {hlControlLevel === 'ACTIVE' ? (
+        <button onClick={() => hlPauseMutation.mutate('Paused from Auto Trader')}
+          className="w-full text-xs py-1.5 rounded-lg bg-amber-500/10 border border-amber-500/30 text-amber-400 hover:bg-amber-500/20 transition-colors flex items-center justify-center gap-1.5">
+          <PauseCircle className="h-3 w-3" /> Pause
+        </button>
+      ) : (
+        <button onClick={() => hlResumeMutation.mutate()}
+          className="w-full text-xs py-1.5 rounded-lg bg-accent-green/10 border border-accent-green/30 text-accent-green hover:bg-accent-green/20 transition-colors flex items-center justify-center gap-1.5">
+          <Power className="h-3 w-3" /> Resume
+        </button>
+      )}
+    </div>
+
+    {/* TOS Control */}
+    <div className="p-3 rounded-lg bg-surface-3 border border-surface-border">
+      <div className="flex items-center justify-between mb-2">
+        <span className="text-xs text-slate-400 font-semibold">ThinkorSwim</span>
+        <ControlLevelBadge level={tosControlLevel} />
+      </div>
+      {tosControlLevel === 'ACTIVE' ? (
+        <button onClick={() => tosPauseMutation.mutate('Paused from Auto Trader')}
+          className="w-full text-xs py-1.5 rounded-lg bg-amber-500/10 border border-amber-500/30 text-amber-400 hover:bg-amber-500/20 transition-colors flex items-center justify-center gap-1.5">
+          <PauseCircle className="h-3 w-3" /> Pause
+        </button>
+      ) : (
+        <button onClick={() => tosResumeMutation.mutate()}
+          className="w-full text-xs py-1.5 rounded-lg bg-accent-green/10 border border-accent-green/30 text-accent-green hover:bg-accent-green/20 transition-colors flex items-center justify-center gap-1.5">
+          <Power className="h-3 w-3" /> Resume
+        </button>
+      )}
+    </div>
+  </div>
+
+  <p className="text-xs text-slate-600 mt-3 text-center">
+    For Hard Stop or Emergency Exit, use the individual exchange tabs.
+  </p>
+</Card>
+```
+
+Add `ControlLevelBadge` as a small inline component:
+
+```tsx
+function ControlLevelBadge({ level }: { level: 'ACTIVE' | 'PAUSE' | 'HARD_STOP' }) {
+  if (level === 'HARD_STOP') return <span className="text-[10px] font-bold px-1.5 py-0.5 rounded bg-red-500/20 text-red-400 font-mono animate-pulse">HARD STOP</span>;
+  if (level === 'PAUSE') return <span className="text-[10px] font-bold px-1.5 py-0.5 rounded bg-amber-500/20 text-amber-400 font-mono">PAUSED</span>;
+  return <span className="text-[10px] font-bold px-1.5 py-0.5 rounded bg-accent-green/20 text-accent-green font-mono">ACTIVE</span>;
+}
+```
+
+-----
+
+## PHASE 7 — Dashboard Status Cards Update
+
+In `client/src/pages/Dashboard.tsx`, update both exchange status cards to show the control level:
+
+```tsx
+{/* Add to each exchange status card, next to the connection dot: */}
+{hlControlLevel !== 'ACTIVE' && (
+  <span className={cn(
+    'text-[10px] font-bold px-1.5 py-0.5 rounded font-mono',
+    hlControlLevel === 'HARD_STOP' ? 'bg-red-500/20 text-red-400' : 'bg-amber-500/20 text-amber-400'
+  )}>
+    {hlControlLevel === 'HARD_STOP' ? 'STOPPED' : 'PAUSED'}
+  </span>
+)}
+```
+
+-----
+
+## PHASE 8 — API Client Methods
+
+Add to `client/src/api/client.ts`:
+
+```typescript
+// In the hyperliquid section:
+pause: (reason?: string) => apiPost('/hyperliquid/controls/pause', { reason }),
+hardStop: (reason?: string) => apiPost('/hyperliquid/controls/hard-stop', { reason }),
+emergencyExit: (reason?: string, confirmText?: string) => apiPost('/hyperliquid/controls/emergency-exit', { reason, confirmText }),
+resume: () => apiPost('/hyperliquid/controls/resume', {}),
+
+// In the tos section:
+pause: (reason?: string) => apiPost('/tos/controls/pause', { reason }),
+hardStop: (reason?: string) => apiPost('/tos/controls/hard-stop', { reason }),
+emergencyExit: (reason?: string, confirmText?: string) => apiPost('/tos/controls/emergency-exit', { reason, confirmText }),
+resume: () => apiPost('/tos/controls/resume', {}),
+```
+
+-----
+
+## PHASE 9 — Telegram Notifications
+
+In `server/src/services/notifications/TelegramService.ts`, add notification triggers for each control level:
+
+When `pauseTrading()` is called: send a brief info message — `⏸ Trading paused on {exchange}: {reason}`
+
+When `hardStop()` is called: send a warning — `🛑 Hard Stop activated on {exchange} — {ordersCancelled} orders cancelled. Positions remain open. Reason: {reason}`
+
+When `executeKillswitch()` is called manually (trigger=‘manual’): send critical alert — `🚨 Emergency Exit executed on {exchange} — {positionsClosed} positions closed, {ordersCancelled} orders cancelled`
+
+When `resumeTrading()` is called: send info — `✅ Trading resumed on {exchange}`
+
+These notifications should call `telegramService.notify()` from within each killswitch service function, passing the appropriate type. Import and call the telegram service at the bottom of each action in `hyperliquidKillswitchService.ts` and `tosKillswitchService.ts`, wrapped in try/catch so a Telegram failure never blocks a killswitch action.
+
+-----
+
+## BEHAVIORAL RULES — IMPORTANT
+
+**Pause behavior**:
+
+- Blocks `assertSafe()` in both exchange services — no new orders placed
+- Does NOT cancel existing orders
+- Does NOT close positions
+- Monitoring loop continues running
+- Auto-exits from thesis degradation still fire (monitoring doesn’t pause)
+- One-click resume
+
+**Hard Stop behavior**:
+
+- Activates the existing killswitch flag (blocks assertSafe)
+- Cancels all pending/open orders immediately
+- Does NOT close positions
+- Monitoring loop continues running
+- Auto-exits from thesis degradation are blocked (user has taken manual control)
+- One-click resume
+
+**Emergency Exit behavior**:
+
+- Same as the existing `executeKillswitch()` — this is unchanged
+- Requires typing “CONFIRM” in the UI
+- Requires `confirmText: "CONFIRM"` in the API body
+- Closes ALL positions at market
+- Cancels ALL orders
+- One-click resume still works after this — but positions are already closed
+
+**Automated triggers (drawdown monitor, circuit breaker)**:
+
+- Always trigger Emergency Exit level (existing `executeKillswitch()`)
+- These are never downgraded to Pause or Hard Stop — automated risk events always do the full exit
+- This behavior is unchanged from the current implementation
+
+**controlLevel derivation**:
+
+- `'HARD_STOP'` if `isKillswitchActive()` is true
+- `'PAUSE'` if `isPauseActive()` is true and killswitch is not active
+- `'ACTIVE'` if neither is active
+- Hard Stop takes precedence over Pause if somehow both are set
+
+-----
+
+## SUMMARY
+
+### Modified Files
+
+```
+server/src/services/hyperliquid/hyperliquidConfig.ts      → add pause state functions
+server/src/services/hyperliquid/hyperliquidKillswitchService.ts → add pauseTrading(), hardStop(), resumeTrading()
+server/src/services/hyperliquid/hyperliquidExchangeService.ts   → assertSafe() checks isPauseActive()
+server/src/services/tos/tosConfig.ts                      → add pause state functions
+server/src/services/tos/tosKillswitchService.ts           → add pauseTrading(), hardStop(), resumeTrading()
+server/src/services/tos/tosExchangeService.ts             → assertSafe() checks isPauseActive()
+server/src/routes/hyperliquid.ts                          → add 4 /controls/* routes
+server/src/routes/tos.ts                                  → add 4 /controls/* routes
+server/src/services/autotrader/AutoTradeExecutor.ts       → check isPauseActive() before order routing
+server/src/services/autotrader/IntradayMonitorLoop.ts     → block auto-exits during hard stop
+server/src/services/notifications/TelegramService.ts      → add control level notification types
+client/src/pages/hyperliquid/HyperliquidDashboard.tsx     → three-level control panel
+client/src/pages/tos/TosDashboard.tsx                     → three-level control panel
+client/src/pages/AutoTrader.tsx                           → platform controls section
+client/src/pages/Dashboard.tsx                            → control level badges on status cards
+client/src/api/client.ts                                  → pause/hardStop/emergencyExit/resume methods
+```
+
+### Nothing Changes
+
+```
+Existing executeKillswitch() functions — completely unchanged
+Existing /killswitch POST and DELETE routes — still work as before
+Drawdown monitor behavior — still triggers full emergency exit
+Circuit breaker behavior — still triggers full emergency exit
+All existing DB models — no schema changes needed
+```

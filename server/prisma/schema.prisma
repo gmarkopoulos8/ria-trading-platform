@@ -1073,6 +1073,11 @@ model ExchangeCredential {
   maxDrawdownPct  Float    @default(5.0)
   defaultLeverage Int      @default(2)
 
+  availableAccountsJson  Json?
+  viewAccountNumber      String?
+  autoTradeAccountNumber String?
+  accountsLastFetchedAt  DateTime?
+
   isConnected    Boolean   @default(false)
   lastVerifiedAt DateTime?
   lastError      String?

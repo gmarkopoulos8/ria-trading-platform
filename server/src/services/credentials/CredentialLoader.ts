@@ -22,6 +22,9 @@ export async function loadDefaultCredentials(): Promise<void> {
 
     const tosCreds = await credentialService.getTOSCredentials(firstUser.id);
     if (tosCreds && tosCreds.source === 'database') {
+      const tosRec = await prisma.exchangeCredential.findUnique({
+        where: { userId_exchange: { userId: firstUser.id, exchange: 'tos' } },
+      });
       setTOSRuntimeCredentials({
         clientId: tosCreds.clientId,
         clientSecret: tosCreds.clientSecret,
@@ -30,6 +33,8 @@ export async function loadDefaultCredentials(): Promise<void> {
         accountNumber: tosCreds.accountNumber,
         dryRun: tosCreds.dryRun,
         maxDrawdownPct: tosCreds.maxDrawdownPct,
+        viewAccountNumber: tosRec?.viewAccountNumber ?? undefined,
+        autoTradeAccountNumber: tosRec?.autoTradeAccountNumber ?? undefined,
       });
     }
 

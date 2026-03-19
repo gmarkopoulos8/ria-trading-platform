@@ -1,5 +1,6 @@
 import { prisma } from '../../lib/prisma';
 import { encryptIfPresent, decryptIfPresent } from '../../lib/encryption';
+import type { SchwabAccountSummary } from '../tos/tosAccountUtils';
 
 export interface HLCredentials {
   walletAddress: string;
@@ -217,6 +218,84 @@ class CredentialService {
     });
   }
 
+  async fetchAndStoreAccounts(userId: string): Promise<SchwabAccountSummary[]> {
+    const { getAllAccountSummaries, clearAccountsCache } = await import('../tos/tosInfoService');
+    clearAccountsCache();
+    const summaries = await getAllAccountSummaries(true);
+
+    const rec = await prisma.exchangeCredential.findUnique({
+      where: { userId_exchange: { userId, exchange: 'tos' } },
+    });
+
+    let autoTradeAccountNumber = rec?.autoTradeAccountNumber ?? null;
+    if (!autoTradeAccountNumber && summaries.length > 0) {
+      const paperFirst = summaries.find(a => a.isPaper);
+      autoTradeAccountNumber = paperFirst?.accountNumber ?? summaries[0].accountNumber;
+    }
+
+    await prisma.exchangeCredential.updateMany({
+      where: { userId, exchange: 'tos' },
+      data: {
+        availableAccountsJson: summaries as any,
+        accountsLastFetchedAt: new Date(),
+        autoTradeAccountNumber: autoTradeAccountNumber ?? undefined,
+        viewAccountNumber: rec?.viewAccountNumber ?? autoTradeAccountNumber ?? undefined,
+      },
+    });
+
+    return summaries;
+  }
+
+  async getAvailableAccounts(userId: string): Promise<SchwabAccountSummary[]> {
+    const rec = await prisma.exchangeCredential.findUnique({
+      where: { userId_exchange: { userId, exchange: 'tos' } },
+    });
+
+    const tenMinAgo = new Date(Date.now() - 10 * 60_000);
+    const stale = !rec?.accountsLastFetchedAt || rec.accountsLastFetchedAt < tenMinAgo;
+
+    if (!rec?.availableAccountsJson || stale) {
+      try {
+        return await this.fetchAndStoreAccounts(userId);
+      } catch {
+        return Array.isArray(rec?.availableAccountsJson) ? (rec.availableAccountsJson as unknown as SchwabAccountSummary[]) : [];
+      }
+    }
+
+    return Array.isArray(rec.availableAccountsJson)
+      ? (rec.availableAccountsJson as unknown as SchwabAccountSummary[])
+      : [];
+  }
+
+  async setViewAccount(userId: string, accountNumber: string): Promise<void> {
+    await prisma.exchangeCredential.updateMany({
+      where: { userId, exchange: 'tos' },
+      data: { viewAccountNumber: accountNumber },
+    });
+  }
+
+  async setAutoTradeAccount(userId: string, accountNumber: string): Promise<SchwabAccountSummary> {
+    const rec = await prisma.exchangeCredential.findUnique({
+      where: { userId_exchange: { userId, exchange: 'tos' } },
+    });
+
+    const accounts: SchwabAccountSummary[] = Array.isArray(rec?.availableAccountsJson)
+      ? (rec!.availableAccountsJson as unknown as SchwabAccountSummary[])
+      : [];
+
+    const target = accounts.find(a => a.accountNumber === accountNumber);
+    if (!target && accounts.length > 0) {
+      throw new Error(`Account ${accountNumber} not found in available accounts`);
+    }
+
+    await prisma.exchangeCredential.updateMany({
+      where: { userId, exchange: 'tos' },
+      data: { autoTradeAccountNumber: accountNumber },
+    });
+
+    return target ?? { accountNumber, accountNumberMasked: `...${accountNumber.slice(-4)}`, type: 'UNKNOWN', isPaper: false, label: `Account (..${accountNumber.slice(-4)})`, equity: 0, buyingPower: 0, dayTradingBuyingPower: 0, positionCount: 0 };
+  }
+
   async getConnectionStatus(userId: string): Promise<{ hl: ConnectionStatus; tos: ConnectionStatus }> {
     const [hlRec, tosRec] = await Promise.all([
       prisma.exchangeCredential.findUnique({ where: { userId_exchange: { userId, exchange: 'hyperliquid' } } }).catch(() => null),
@@ -248,6 +327,10 @@ class CredentialService {
         }
       : { isConnected: false, lastVerifiedAt: null, lastError: null, source: 'none', dryRun: true };
 
+    const tosAccounts: SchwabAccountSummary[] = Array.isArray(tosRec?.availableAccountsJson)
+      ? (tosRec!.availableAccountsJson as unknown as SchwabAccountSummary[])
+      : [];
+
     const tos: ConnectionStatus = tosRec
       ? {
           isConnected: tosRec.isConnected,
@@ -256,7 +339,11 @@ class CredentialService {
           source: 'database',
           dryRun: tosRec.dryRun,
           accountNumber: tosRec.accountNumber ? `...${tosRec.accountNumber.slice(-4)}` : undefined,
-        }
+          lastUpdatedAt: tosRec.updatedAt.toISOString(),
+          viewAccountNumber: tosRec.viewAccountNumber,
+          autoTradeAccountNumber: tosRec.autoTradeAccountNumber,
+          availableAccounts: tosAccounts,
+        } as any
       : tosEnv
       ? {
           isConnected: true,
@@ -265,8 +352,11 @@ class CredentialService {
           source: 'env',
           dryRun: process.env.SCHWAB_DRY_RUN !== 'false',
           accountNumber: process.env.SCHWAB_ACCOUNT_NUMBER ? `...${process.env.SCHWAB_ACCOUNT_NUMBER.slice(-4)}` : undefined,
+          viewAccountNumber: null,
+          autoTradeAccountNumber: null,
+          availableAccounts: [],
         }
-      : { isConnected: false, lastVerifiedAt: null, lastError: null, source: 'none', dryRun: true };
+      : { isConnected: false, lastVerifiedAt: null, lastError: null, source: 'none', dryRun: true, viewAccountNumber: null, autoTradeAccountNumber: null, availableAccounts: [] };
 
     return { hl, tos };
   }

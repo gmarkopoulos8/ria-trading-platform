@@ -91,8 +91,10 @@ router.get('/status', async (req: Request, res: Response) => {
     const killswitch = getKillswitchStatus();
     const tokenInfo  = getTokenInfo();
 
+    const viewAcct = (req.query.accountNumber as string) || TOS_CONFIG.VIEW_ACCOUNT_NUMBER || TOS_CONFIG.ACCOUNT_NUMBER;
+
     const [account, openOrders] = hasCredentials()
-      ? await Promise.all([getPrimaryAccount(), getOpenOrders()])
+      ? await Promise.all([getPrimaryAccount(viewAcct || undefined), getOpenOrders(viewAcct || undefined)])
       : [null, []];
 
     const drawdownPct    = await computeDrawdownPct(account);
@@ -106,6 +108,7 @@ router.get('/status', async (req: Request, res: Response) => {
         hasAccountNumber: hasAccountNumber(),
         dryRun:          TOS_CONFIG.DRY_RUN,
         accountNumber:   TOS_CONFIG.ACCOUNT_NUMBER || null,
+        viewAccountNumber: viewAcct || null,
         killswitch,
         tokenInfo,
         drawdownPct,
@@ -123,15 +126,16 @@ router.get('/status', async (req: Request, res: Response) => {
 
 // ─── Account ─────────────────────────────────────────────────────
 
-router.get('/account', async (_req: Request, res: Response) => {
+router.get('/account', async (req: Request, res: Response) => {
   try {
-    const account = await getPrimaryAccount();
+    const viewAcct = (req.query.accountNumber as string) || TOS_CONFIG.VIEW_ACCOUNT_NUMBER || TOS_CONFIG.ACCOUNT_NUMBER;
+    const account = await getPrimaryAccount(viewAcct || undefined);
     if (!account) return res.json({ success: true, data: { account: null } });
 
     const [drawdownPct, unrealizedPnl, openOrders] = await Promise.all([
       computeDrawdownPct(account),
       computeUnrealizedPnl(account),
-      getOpenOrders(),
+      getOpenOrders(viewAcct || undefined),
     ]);
 
     res.json({ success: true, data: { account, drawdownPct, unrealizedPnl, openOrders } });

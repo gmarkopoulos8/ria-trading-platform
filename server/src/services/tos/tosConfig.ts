@@ -9,6 +9,8 @@ let _runtimeCreds: {
   accountNumber?: string;
   dryRun?: boolean;
   maxDrawdownPct?: number;
+  viewAccountNumber?: string;
+  autoTradeAccountNumber?: string;
 } | null = null;
 
 export function setTOSRuntimeCredentials(creds: typeof _runtimeCreds): void {
@@ -43,7 +45,14 @@ export const TOS_CONFIG = {
   },
 
   get ACCOUNT_NUMBER(): string {
-    return _runtimeCreds?.accountNumber ?? process.env.SCHWAB_ACCOUNT_NUMBER ?? '';
+    return _runtimeCreds?.autoTradeAccountNumber
+      ?? _runtimeCreds?.accountNumber
+      ?? process.env.SCHWAB_ACCOUNT_NUMBER
+      ?? '';
+  },
+
+  get VIEW_ACCOUNT_NUMBER(): string {
+    return _runtimeCreds?.viewAccountNumber ?? this.ACCOUNT_NUMBER;
   },
 
   get DRY_RUN(): boolean {

@@ -178,8 +178,8 @@ export const api = {
     authUrl:         ()                          => get('/tos/auth/url'),
     authCallback:    (code: string)              => post('/tos/auth/callback', { code }),
     tokenInfo:       ()                          => get('/tos/auth/token'),
-    status:          ()                          => get('/tos/status'),
-    account:         ()                          => get('/tos/account'),
+    status:          (accountNumber?: string)     => get(`/tos/status${accountNumber ? `?accountNumber=${accountNumber}` : ''}`),
+    account:         (accountNumber?: string)     => get(`/tos/account${accountNumber ? `?accountNumber=${accountNumber}` : ''}`),
     positions:       ()                          => get('/tos/positions'),
     orders:          ()                          => get('/tos/orders'),
     allOrders:       (limit?: number)            => get('/tos/orders/all', limit ? { limit } : {}),
@@ -240,6 +240,10 @@ export const api = {
     tosDisconnect: () => del('/credentials/tos/disconnect'),
     tosUpdateSettings: (data: { dryRun?: boolean; maxDrawdownPct?: number }) =>
       patch('/credentials/tos/settings', data),
+    tosAccounts: () => get('/credentials/tos/accounts'),
+    tosRefreshAccounts: () => post('/credentials/tos/accounts/refresh', {}),
+    tosSetViewAccount: (data: { accountNumber: string }) => put('/credentials/tos/accounts/view', data),
+    tosSetAutoTradeAccount: (data: { accountNumber: string }) => put('/credentials/tos/accounts/autotrade', data),
   },
 
   scans: {

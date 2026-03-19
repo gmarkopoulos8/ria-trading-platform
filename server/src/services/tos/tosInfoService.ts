@@ -6,6 +6,10 @@
 import axios from 'axios';
 import { TOS_CONFIG, hasCredentials, hasAccountNumber } from './tosConfig';
 import { getValidAccessToken } from './tosAuthService';
+import { buildAccountSummary, type SchwabAccountSummary } from './tosAccountUtils';
+
+let _accountsCache: { accounts: SchwabAccountSummary[]; fetchedAt: number } | null = null;
+const ACCOUNTS_CACHE_MS = 5 * 60_000;
 
 async function tosGet<T>(url: string, params?: Record<string, unknown>): Promise<T> {
   const token = await getValidAccessToken();
@@ -142,19 +146,44 @@ export async function getAccounts(): Promise<TosAccount[]> {
   }
 }
 
-export async function getPrimaryAccount(): Promise<TosAccount | null> {
+export async function getAccountByNumber(accountNumber: string): Promise<TosAccount | null> {
   if (!hasCredentials()) return null;
   try {
-    const accountNum = TOS_CONFIG.ACCOUNT_NUMBER;
-    if (!accountNum) {
+    return tosGet<TosAccount>(`${TOS_CONFIG.TRADER_URL}/accounts/${accountNumber}`, { fields: 'positions,orders' });
+  } catch (err) {
+    console.error('[TOS-Info] getAccountByNumber error:', err instanceof Error ? err.message : err);
+    return null;
+  }
+}
+
+export async function getPrimaryAccount(accountNumber?: string): Promise<TosAccount | null> {
+  if (!hasCredentials()) return null;
+  try {
+    const acct = accountNumber ?? TOS_CONFIG.ACCOUNT_NUMBER;
+    if (!acct) {
       const accounts = await getAccounts();
       return accounts[0] ?? null;
     }
-    return tosGet<TosAccount>(`${TOS_CONFIG.TRADER_URL}/accounts/${accountNum}`, { fields: 'positions,orders' });
+    return getAccountByNumber(acct);
   } catch (err) {
     console.error('[TOS-Info] getPrimaryAccount error:', err instanceof Error ? err.message : err);
     return null;
   }
+}
+
+export async function getAllAccountSummaries(bustCache = false): Promise<SchwabAccountSummary[]> {
+  if (!bustCache && _accountsCache && Date.now() - _accountsCache.fetchedAt < ACCOUNTS_CACHE_MS) {
+    return _accountsCache.accounts;
+  }
+  const accounts = await getAccounts();
+  const summaries = accounts.map(buildAccountSummary);
+  summaries.sort((a, b) => (a.isPaper === b.isPaper ? 0 : a.isPaper ? 1 : -1));
+  _accountsCache = { accounts: summaries, fetchedAt: Date.now() };
+  return summaries;
+}
+
+export function clearAccountsCache(): void {
+  _accountsCache = null;
 }
 
 export async function getOpenOrders(accountNumber?: string): Promise<TosOrder[]> {

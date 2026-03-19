@@ -2,7 +2,7 @@ import { useQuery } from '@tanstack/react-query';
 import { useNavigate } from 'react-router-dom';
 import {
   TrendingUp, TrendingDown, Activity, DollarSign, Zap, BarChart2,
-  Target, AlertTriangle, ArrowRight, RefreshCw, Lock, CheckCircle2, WifiOff,
+  Target, AlertTriangle, ArrowRight, RefreshCw, Lock, CheckCircle2, WifiOff, FlaskConical,
 } from 'lucide-react';
 import { Card, CardHeader, StatCard } from '../components/ui/Card';
 import { Badge } from '../components/ui/Badge';
@@ -82,9 +82,21 @@ export default function Dashboard() {
     staleTime: 30_000,
   });
 
+  const { data: tosAccountsData } = useQuery({
+    queryKey: ['tos-accounts'],
+    queryFn: () => (api.credentials as any).tosAccounts(),
+    staleTime: 60_000,
+    refetchInterval: 120_000,
+  });
+
   const encryptionOk = (credData as any)?.data?.encryptionConfigured !== false;
   const hlCred = (credData as any)?.data?.hyperliquid;
   const tosCred = (credData as any)?.data?.tos;
+
+  const tosAvailableAccounts: any[] = (tosAccountsData as any)?.data?.accounts ?? [];
+  const autoTradeAccountNumber: string = (tosAccountsData as any)?.data?.autoTradeAccountNumber ?? '';
+  const viewAccountNumber: string = (tosAccountsData as any)?.data?.viewAccountNumber ?? '';
+  const autoTradeAccount = tosAvailableAccounts.find(a => a.accountNumber === autoTradeAccountNumber);
 
   const portfolio = (portfolioData as any)?.data?.portfolio;
   const openPositions: any[] = (portfolioData as any)?.data?.positions ?? [];
@@ -249,33 +261,64 @@ export default function Dashboard() {
           {/* ThinkorSwim card */}
           <div
             className={cn(
-              'p-4 rounded-xl border flex items-center justify-between cursor-pointer group hover:border-opacity-60 transition-all',
+              'p-4 rounded-xl border cursor-pointer group hover:border-opacity-60 transition-all',
               tosCred?.isConnected
                 ? 'bg-accent-purple/5 border-accent-purple/30'
                 : 'bg-surface-2 border-surface-border hover:border-slate-600',
             )}
             onClick={() => navigate('/thinkorswim')}
           >
-            <div className="flex items-center gap-3">
-              <div className={cn('w-9 h-9 rounded-lg flex items-center justify-center',
-                tosCred?.isConnected ? 'bg-accent-purple/20' : 'bg-surface-3')}>
-                <BarChart2 className={cn('h-4 w-4', tosCred?.isConnected ? 'text-accent-purple' : 'text-slate-500')} />
+            <div className="flex items-center justify-between">
+              <div className="flex items-center gap-3">
+                <div className={cn('w-9 h-9 rounded-lg flex items-center justify-center',
+                  tosCred?.isConnected ? 'bg-accent-purple/20' : 'bg-surface-3')}>
+                  <BarChart2 className={cn('h-4 w-4', tosCred?.isConnected ? 'text-accent-purple' : 'text-slate-500')} />
+                </div>
+                <div>
+                  <p className="text-sm font-semibold text-white">ThinkorSwim</p>
+                  {tosCred?.isConnected ? (
+                    <p className="text-xs text-slate-400">Schwab API · {relTime(tosCred.lastUpdatedAt)}</p>
+                  ) : (
+                    <p className="text-xs text-slate-500">Not connected · click to set up</p>
+                  )}
+                </div>
               </div>
-              <div>
-                <p className="text-sm font-semibold text-white">ThinkorSwim</p>
-                {tosCred?.isConnected ? (
-                  <p className="text-xs text-slate-400">Schwab API · {relTime(tosCred.lastUpdatedAt)}</p>
-                ) : (
-                  <p className="text-xs text-slate-500">Not connected · click to set up</p>
-                )}
+              <div className="flex items-center gap-2">
+                {tosCred?.isConnected
+                  ? <CheckCircle2 className="h-4 w-4 text-accent-green" />
+                  : <WifiOff className="h-4 w-4 text-slate-600" />}
+                <ArrowRight className="h-4 w-4 text-slate-600 group-hover:text-slate-400 transition-colors" />
               </div>
             </div>
-            <div className="flex items-center gap-2">
-              {tosCred?.isConnected
-                ? <CheckCircle2 className="h-4 w-4 text-accent-green" />
-                : <WifiOff className="h-4 w-4 text-slate-600" />}
-              <ArrowRight className="h-4 w-4 text-slate-600 group-hover:text-slate-400 transition-colors" />
-            </div>
+
+            {tosCred?.isConnected && autoTradeAccount && (
+              <div className="mt-3 pt-3 border-t border-surface-border flex items-center justify-between flex-wrap gap-2">
+                <div className="flex items-center gap-1.5 text-xs text-slate-400">
+                  {autoTradeAccount.isPaper
+                    ? <FlaskConical className="h-3 w-3 text-accent-blue" />
+                    : <Zap className="h-3 w-3 text-accent-green" />}
+                  <span className="font-mono text-slate-300">{autoTradeAccount.accountNumberMasked ?? `...${autoTradeAccountNumber.slice(-4)}`}</span>
+                  <span className={cn('px-1.5 py-0.5 rounded text-[10px] font-bold',
+                    autoTradeAccount.isPaper
+                      ? 'bg-accent-blue/10 text-accent-blue'
+                      : 'bg-accent-green/10 text-accent-green'
+                  )}>
+                    {autoTradeAccount.isPaper ? 'PAPER' : 'LIVE'}
+                  </span>
+                  {viewAccountNumber && autoTradeAccountNumber && viewAccountNumber !== autoTradeAccountNumber && (
+                    <span className="ml-1 px-1.5 py-0.5 rounded text-[10px] bg-amber-500/10 text-amber-400">viewing diff acct</span>
+                  )}
+                </div>
+                <div className="flex items-center gap-3 text-xs text-slate-500">
+                  {autoTradeAccount.equity != null && (
+                    <span>Equity <span className="text-white font-mono">{fmtCash(autoTradeAccount.equity)}</span></span>
+                  )}
+                  {autoTradeAccount.buyingPower != null && (
+                    <span>BP <span className="text-white font-mono">{fmtCash(autoTradeAccount.buyingPower)}</span></span>
+                  )}
+                </div>
+              </div>
+            )}
           </div>
         </div>
       )}

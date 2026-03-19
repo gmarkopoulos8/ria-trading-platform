@@ -1,0 +1,637 @@
+# Replit Agent Prompt — Schwab Multi-Account Switcher
+
+This is an addendum to all previous prompts. Apply on top of everything already built. Do not remove, rename, or break any existing functionality.
+
+-----
+
+## OVERVIEW
+
+Schwab’s API returns all accounts linked to your login in a single `GET /accounts` call — live brokerage, paperMoney, IRA, and any others. The platform currently only uses one hardcoded account number. This change:
+
+1. Fetches all available accounts after OAuth connects and stores them
+1. Adds a **UI account dropdown** to the TOS dashboard — one click switches which account you’re viewing
+1. Adds a separate **“Auto Trader Account”** selector in the Auto Trader settings — the bot’s target account is independent from the UI view account
+1. Clearly labels every account as `LIVE` or `PAPER` with type and masked account number
+1. Requires an explicit confirmation when switching the Auto Trader from a paper account to a live account
+
+-----
+
+## PHASE 1 — Detect Account Type
+
+Schwab doesn’t return a direct “paperMoney: true” flag, but paper accounts are identifiable by their account type. Add a utility function:
+
+**File**: `server/src/services/tos/tosAccountUtils.ts`
+
+```typescript
+export interface SchwabAccountSummary {
+  accountNumber: string;
+  accountNumberMasked: string;  // last 4 digits: "...4821"
+  type: string;                 // 'MARGIN', 'CASH', 'IRA', 'ROTH_IRA', etc.
+  isPaper: boolean;
+  label: string;                // human-readable: "paperMoney (..4821)" or "Margin (..1234)"
+  equity: number;
+  buyingPower: number;
+  dayTradingBuyingPower: number;
+  positionCount: number;
+}
+
+// Schwab paper accounts have type containing 'PAPER' or account number starting with certain prefixes.
+// More reliably: paper accounts return isDayTrader=false and have very round equity values on fresh accounts.
+// The most reliable signal: Schwab paperMoney accounts have accountNumber starting with '999' in testnet
+// or the account type field contains 'PAPER'. Check both.
+export function detectIsPaper(account: TosAccount): boolean {
+  const acct = account.securitiesAccount;
+  const typeStr = (acct.type ?? '').toUpperCase();
+  const numStr = acct.accountNumber ?? '';
+  
+  // Schwab paperMoney accounts: type is 'PAPER' or accountNumber starts with 999
+  // Also check for the string 'PAPER' anywhere in the type
+  return typeStr.includes('PAPER') || numStr.startsWith('999');
+}
+
+export function buildAccountSummary(account: TosAccount): SchwabAccountSummary {
+  const acct = account.securitiesAccount;
+  const balances = acct.currentBalances;
+  const positions = acct.positions ?? [];
+  const isPaper = detectIsPaper(account);
+  const lastFour = acct.accountNumber.slice(-4);
+  const typeLabel = isPaper ? 'paperMoney' : (acct.type ?? 'Brokerage');
+  
+  return {
+    accountNumber: acct.accountNumber,
+    accountNumberMasked: `...${lastFour}`,
+    type: acct.type ?? 'BROKERAGE',
+    isPaper,
+    label: `${typeLabel} (..${lastFour})`,
+    equity: balances?.equity ?? 0,
+    buyingPower: balances?.buyingPower ?? 0,
+    dayTradingBuyingPower: balances?.dayTradingBuyingPower ?? 0,
+    positionCount: positions.filter(p => p.longQuantity > 0 || p.shortQuantity > 0).length,
+  };
+}
+```
+
+-----
+
+## PHASE 2 — Store Available Accounts in DB
+
+Add to the `ExchangeCredential` model in `server/prisma/schema.prisma`:
+
+```prisma
+// Add these fields to the existing ExchangeCredential model:
+availableAccountsJson  Json?    // Array of SchwabAccountSummary — all linked accounts
+viewAccountNumber      String?  // The account the UI is currently viewing
+autoTradeAccountNumber String?  // The account the autonomous trader uses
+accountsLastFetchedAt  DateTime?
+```
+
+Run `npx prisma migrate dev --name add_schwab_account_switcher`.
+
+-----
+
+## PHASE 3 — Account Fetching Service
+
+In `server/src/services/tos/tosInfoService.ts`, add:
+
+**`getAllAccountSummaries(): Promise<SchwabAccountSummary[]>`**:
+
+- Calls existing `getAccounts()` which hits `GET /trader/v1/accounts`
+- Maps each account through `buildAccountSummary()`
+- Returns sorted: paper accounts last (live accounts first in the list)
+- Cache result for 5 minutes — account list doesn’t change often
+
+**`getAccountByNumber(accountNumber: string): Promise<TosAccount | null>`**:
+
+- Calls `GET /trader/v1/accounts/{accountNumber}?fields=positions,orders`
+- Returns the specific account data
+- This replaces `getPrimaryAccount()` when an account number is explicitly specified
+
+Update `getPrimaryAccount()` to accept an optional `accountNumber` parameter:
+
+```typescript
+export async function getPrimaryAccount(accountNumber?: string): Promise<TosAccount | null> {
+  const acct = accountNumber ?? TOS_CONFIG.ACCOUNT_NUMBER;
+  if (!acct) {
+    // No account specified — return first available
+    const accounts = await getAccounts();
+    return accounts[0] ?? null;
+  }
+  return getAccountByNumber(acct);
+}
+```
+
+-----
+
+## PHASE 4 — Credential Service Updates
+
+In `server/src/services/credentials/CredentialService.ts` (from the previous prompt), add:
+
+**`fetchAndStoreAccounts(userId: string): Promise<SchwabAccountSummary[]>`**:
+
+- Calls `getAllAccountSummaries()`
+- Stores the array as JSON in `ExchangeCredential.availableAccountsJson`
+- If `autoTradeAccountNumber` is not yet set: auto-set it to the first **paper** account found (safest default)
+- If no paper account: auto-set to first account but leave `dryRun: true`
+- Updates `accountsLastFetchedAt`
+- Returns the summaries
+
+**`getAvailableAccounts(userId: string): Promise<SchwabAccountSummary[]>`**:
+
+- Reads from `ExchangeCredential.availableAccountsJson`
+- If null or older than 10 minutes: re-fetches via `fetchAndStoreAccounts()`
+- Returns the array
+
+**`setViewAccount(userId: string, accountNumber: string): Promise<void>`**:
+
+- Updates `viewAccountNumber` — no validation needed, this is just a UI preference
+
+**`setAutoTradeAccount(userId: string, accountNumber: string): Promise<SchwabAccountSummary>`**:
+
+- Validates the account number exists in `availableAccountsJson`
+- Gets the account summary for the target account
+- If switching from paper → live: **does not block**, but returns `isPaper: false` so the caller can show a confirmation
+- Updates `autoTradeAccountNumber`
+- If the new account is live: also updates `TOS_CONFIG` runtime credentials via `setTOSRuntimeCredentials()`
+- Returns the full `SchwabAccountSummary` of the selected account
+
+**Update `getConnectionStatus()`** to include account info:
+
+```typescript
+// In the TOS section of the status response, add:
+tos: {
+  ...existingFields,
+  viewAccountNumber: credential.viewAccountNumber,
+  autoTradeAccountNumber: credential.autoTradeAccountNumber,
+  availableAccounts: JSON.parse(credential.availableAccountsJson ?? '[]'),
+}
+```
+
+-----
+
+## PHASE 5 — Updated TOS Config Runtime Credentials
+
+In `server/src/services/tos/tosConfig.ts`, update `setTOSRuntimeCredentials()` to also accept and store the active account numbers:
+
+```typescript
+let _runtimeCreds: {
+  // ... existing fields ...
+  viewAccountNumber?: string;
+  autoTradeAccountNumber?: string;
+} | null = null;
+
+// Update ACCOUNT_NUMBER getter:
+get ACCOUNT_NUMBER(): string {
+  // Auto trade account takes priority for order execution
+  return _runtimeCreds?.autoTradeAccountNumber 
+    ?? _runtimeCreds?.accountNumber 
+    ?? process.env.SCHWAB_ACCOUNT_NUMBER 
+    ?? '';
+},
+
+// Add a new getter for view account:
+get VIEW_ACCOUNT_NUMBER(): string {
+  return _runtimeCreds?.viewAccountNumber 
+    ?? this.ACCOUNT_NUMBER;
+},
+```
+
+All existing order placement code (`tosExchangeService.ts`) uses `TOS_CONFIG.ACCOUNT_NUMBER` — this means it automatically uses the auto trade account without any other changes needed.
+
+-----
+
+## PHASE 6 — New API Routes
+
+Add to `server/src/routes/credentials.ts`:
+
+```
+GET  /api/credentials/tos/accounts                    → list all available Schwab accounts
+POST /api/credentials/tos/accounts/refresh            → force re-fetch from Schwab API
+PUT  /api/credentials/tos/accounts/view               → set UI view account { accountNumber }
+PUT  /api/credentials/tos/accounts/autotrade          → set auto trader account { accountNumber }
+```
+
+**`GET /api/credentials/tos/accounts`**:
+
+```typescript
+router.get('/tos/accounts', requireAuth, async (req, res) => {
+  const accounts = await credentialService.getAvailableAccounts(req.session.userId!);
+  const cred = await prisma.exchangeCredential.findUnique({
+    where: { userId_exchange: { userId: req.session.userId!, exchange: 'tos' } }
+  });
+  
+  return res.json({
+    success: true,
+    data: {
+      accounts,
+      viewAccountNumber: cred?.viewAccountNumber ?? null,
+      autoTradeAccountNumber: cred?.autoTradeAccountNumber ?? null,
+    }
+  });
+});
+```
+
+**`PUT /api/credentials/tos/accounts/autotrade`**:
+
+```typescript
+router.put('/tos/accounts/autotrade', requireAuth, async (req, res) => {
+  const { accountNumber } = req.body;
+  if (!accountNumber) return res.status(400).json({ success: false, error: 'accountNumber required' });
+  
+  const summary = await credentialService.setAutoTradeAccount(req.session.userId!, accountNumber);
+  
+  // Reload runtime credentials so the change takes effect immediately
+  await loadDefaultCredentials();
+  
+  return res.json({
+    success: true,
+    data: {
+      message: `Auto Trader account set to ${summary.label}`,
+      account: summary,
+      warning: !summary.isPaper 
+        ? 'Auto Trader is now targeting a LIVE account. Real money will be used.' 
+        : null,
+    }
+  });
+});
+```
+
+Also update the **TOS connect route** (`POST /api/credentials/tos/connect`) from the previous prompt — after successfully saving credentials and verifying the connection, immediately call `fetchAndStoreAccounts(userId)` so the account list is populated right after connection.
+
+-----
+
+## PHASE 7 — TOS Dashboard UI Changes
+
+In `client/src/pages/tos/TosDashboard.tsx`, make the following changes:
+
+### 7A. Add Account Data Fetching
+
+Add a new query alongside the existing status query:
+
+```typescript
+const { data: accountsData, refetch: refetchAccounts } = useQuery({
+  queryKey: ['tos-accounts'],
+  queryFn: () => api.credentials.tosAccounts(),
+  staleTime: 5 * 60_000,
+  refetchInterval: 5 * 60_000,
+  enabled: !!tosConnected,
+});
+
+const availableAccounts: SchwabAccountSummary[] = (accountsData as any)?.data?.accounts ?? [];
+const viewAccountNumber: string = (accountsData as any)?.data?.viewAccountNumber ?? '';
+const autoTradeAccountNumber: string = (accountsData as any)?.data?.autoTradeAccountNumber ?? '';
+```
+
+### 7B. Account Switcher Dropdown Component
+
+Add this component inside the file:
+
+```tsx
+function AccountSwitcher({
+  accounts,
+  selectedAccountNumber,
+  onSelect,
+  label,
+  showAutoTradeWarning = false,
+}: {
+  accounts: SchwabAccountSummary[];
+  selectedAccountNumber: string;
+  onSelect: (accountNumber: string) => void;
+  label: string;
+  showAutoTradeWarning?: boolean;
+}) {
+  const [open, setOpen] = useState(false);
+  const selected = accounts.find(a => a.accountNumber === selectedAccountNumber) ?? accounts[0];
+
+  return (
+    <div className="relative">
+      <button
+        onClick={() => setOpen(!open)}
+        className="flex items-center gap-2 px-3 py-1.5 rounded-lg bg-surface-3 border border-surface-border hover:border-slate-500 transition-colors text-sm"
+      >
+        {/* Account type badge */}
+        <span className={cn(
+          'text-xs font-bold px-1.5 py-0.5 rounded font-mono',
+          selected?.isPaper
+            ? 'bg-accent-blue/20 text-accent-blue'
+            : 'bg-accent-green/20 text-accent-green'
+        )}>
+          {selected?.isPaper ? 'PAPER' : 'LIVE'}
+        </span>
+        <span className="text-white font-mono text-xs">{selected?.label ?? 'Select account'}</span>
+        <ChevronDown className={cn('h-3 w-3 text-slate-500 transition-transform', open && 'rotate-180')} />
+      </button>
+
+      {open && (
+        <div className="absolute top-full left-0 mt-1 w-72 bg-surface-1 border border-surface-border rounded-xl shadow-2xl z-50 overflow-hidden">
+          <div className="px-3 py-2 border-b border-surface-border">
+            <p className="text-xs text-slate-500 font-mono uppercase tracking-wider">{label}</p>
+          </div>
+          {accounts.map((account) => (
+            <button
+              key={account.accountNumber}
+              onClick={() => {
+                if (showAutoTradeWarning && !account.isPaper && selected?.isPaper) {
+                  if (!confirm(`Switch Auto Trader to a LIVE account (${account.label})?\n\nReal money will be used. Make sure Dry Run is enabled until you're ready.`)) return;
+                }
+                onSelect(account.accountNumber);
+                setOpen(false);
+              }}
+              className={cn(
+                'w-full flex items-center justify-between px-3 py-3 hover:bg-surface-3 transition-colors text-left',
+                account.accountNumber === selectedAccountNumber && 'bg-surface-3'
+              )}
+            >
+              <div className="flex items-center gap-2.5">
+                <span className={cn(
+                  'text-xs font-bold px-1.5 py-0.5 rounded font-mono flex-shrink-0',
+                  account.isPaper
+                    ? 'bg-accent-blue/20 text-accent-blue'
+                    : 'bg-accent-green/20 text-accent-green'
+                )}>
+                  {account.isPaper ? 'PAPER' : 'LIVE'}
+                </span>
+                <div>
+                  <p className="text-sm text-white font-mono">{account.accountNumberMasked}</p>
+                  <p className="text-xs text-slate-500">{account.type}</p>
+                </div>
+              </div>
+              <div className="text-right flex-shrink-0">
+                <p className="text-xs text-white font-mono">${account.equity.toLocaleString('en-US', { maximumFractionDigits: 0 })}</p>
+                <p className="text-xs text-slate-500">{account.positionCount} pos</p>
+              </div>
+            </button>
+          ))}
+          <div className="px-3 py-2 border-t border-surface-border">
+            <button
+              onClick={() => { api.credentials.tosRefreshAccounts().then(() => refetchAccounts()); setOpen(false); }}
+              className="text-xs text-slate-500 hover:text-white flex items-center gap-1.5 transition-colors"
+            >
+              <RefreshCw className="h-3 w-3" /> Refresh account list
+            </button>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+```
+
+### 7C. Header Row with Dual Dropdowns
+
+Replace the existing page header section with this layout. The header now has two account switchers side by side:
+
+```tsx
+{/* Page header */}
+<div className="flex items-start justify-between flex-wrap gap-3">
+  <div>
+    <h1 className="text-xl font-bold text-white">ThinkorSwim</h1>
+    <p className="text-sm text-slate-500 font-mono mt-0.5">Schwab API · equities · options · futures</p>
+  </div>
+
+  {tosConnected && availableAccounts.length > 0 && (
+    <div className="flex items-center gap-3 flex-wrap">
+      {/* Viewing dropdown — what the UI shows */}
+      <div className="flex flex-col gap-1">
+        <span className="text-xs text-slate-600 font-mono uppercase tracking-wider px-1">Viewing</span>
+        <AccountSwitcher
+          accounts={availableAccounts}
+          selectedAccountNumber={viewAccountNumber}
+          onSelect={(acctNum) => {
+            api.credentials.tosSetViewAccount({ accountNumber: acctNum })
+              .then(() => { refetchAccounts(); queryClient.invalidateQueries({ queryKey: ['tos-status'] }); });
+          }}
+          label="Select account to view"
+          showAutoTradeWarning={false}
+        />
+      </div>
+
+      {/* Divider */}
+      <div className="w-px h-10 bg-surface-border self-center hidden sm:block" />
+
+      {/* Auto Trader dropdown — what the bot trades on */}
+      <div className="flex flex-col gap-1">
+        <span className="text-xs text-slate-600 font-mono uppercase tracking-wider px-1">Auto Trader</span>
+        <AccountSwitcher
+          accounts={availableAccounts}
+          selectedAccountNumber={autoTradeAccountNumber}
+          onSelect={(acctNum) => {
+            api.credentials.tosSetAutoTradeAccount({ accountNumber: acctNum })
+              .then((result) => {
+                refetchAccounts();
+                queryClient.invalidateQueries({ queryKey: ['tos-status'] });
+                if ((result as any)?.data?.warning) {
+                  toast.warning((result as any).data.warning);
+                } else {
+                  toast.success((result as any)?.data?.message ?? 'Auto Trader account updated');
+                }
+              });
+          }}
+          label="Select auto trader account"
+          showAutoTradeWarning={true}
+        />
+      </div>
+    </div>
+  )}
+</div>
+```
+
+### 7D. Update Status Query to Use View Account
+
+The existing `GET /api/tos/status` and `GET /api/tos/account` calls should pass the currently viewed account number so the stats, positions, and orders shown all reflect the selected view account.
+
+Add a query parameter support to the existing TOS routes:
+
+In `server/src/routes/tos.ts`, update the status and account routes to accept an optional `?accountNumber=` query param that overrides `TOS_CONFIG.ACCOUNT_NUMBER` for that request only:
+
+```typescript
+router.get('/status', async (req: Request, res: Response) => {
+  // Use requested account number for this view, or fall back to auto trade account
+  const viewAcct = (req.query.accountNumber as string) || TOS_CONFIG.VIEW_ACCOUNT_NUMBER || TOS_CONFIG.ACCOUNT_NUMBER;
+  
+  const [account, openOrders] = hasCredentials()
+    ? await Promise.all([getPrimaryAccount(viewAcct), getOpenOrders(viewAcct)])
+    : [null, []];
+  
+  // ... rest unchanged ...
+});
+```
+
+In `TosDashboard.tsx`, pass the current view account to all queries:
+
+```typescript
+const { data: statusData } = useQuery({
+  queryKey: ['tos-status', viewAccountNumber],  // include in key so it refetches on switch
+  queryFn: () => api.tos.status(viewAccountNumber),  // pass as query param
+  refetchInterval: 30_000,
+  enabled: tosConnected,
+});
+```
+
+Update `api.tos.status()` in `client/src/api/client.ts` to accept an optional `accountNumber` parameter and append it as `?accountNumber=X`.
+
+### 7E. Auto Trader Account Indicator
+
+Add a small persistent indicator below the Auto Trader dropdown showing the current state clearly:
+
+```tsx
+{autoTradeAccountNumber && (
+  <div className={cn(
+    'flex items-center gap-2 px-3 py-2 rounded-lg text-xs border',
+    autoTradeAccount?.isPaper
+      ? 'bg-accent-blue/5 border-accent-blue/20 text-accent-blue'
+      : 'bg-accent-green/5 border-accent-green/20 text-accent-green'
+  )}>
+    {autoTradeAccount?.isPaper
+      ? <><FlaskConical className="h-3 w-3" /> Auto Trader using paperMoney — no real funds at risk</>
+      : <><Zap className="h-3 w-3" /> Auto Trader using LIVE account — real funds</>
+    }
+    {statusData?.data?.dryRun && (
+      <span className="ml-auto font-mono bg-amber-500/20 text-amber-400 px-1.5 py-0.5 rounded">DRY RUN ON</span>
+    )}
+  </div>
+)}
+```
+
+-----
+
+## PHASE 8 — Auto Trader Settings Account Selector
+
+In `client/src/pages/AutoTrader.tsx` (from the previous prompt), update the exchange status card for TOS to show the auto trade account:
+
+Replace the existing TOS status card content with:
+
+```tsx
+{/* Auto Trader TOS account info */}
+{tosAutoTradeAccount && (
+  <div className="space-y-2 mt-3">
+    <div className="flex items-center justify-between text-xs">
+      <span className="text-slate-500">Trading on</span>
+      <div className="flex items-center gap-1.5">
+        <span className={cn(
+          'font-bold px-1.5 py-0.5 rounded font-mono text-xs',
+          tosAutoTradeAccount.isPaper
+            ? 'bg-accent-blue/20 text-accent-blue'
+            : 'bg-accent-green/20 text-accent-green'
+        )}>
+          {tosAutoTradeAccount.isPaper ? 'PAPER' : 'LIVE'}
+        </span>
+        <span className="text-white font-mono">{tosAutoTradeAccount.accountNumberMasked}</span>
+      </div>
+    </div>
+    <div className="flex items-center justify-between text-xs">
+      <span className="text-slate-500">Equity</span>
+      <span className="text-white font-mono">${tosAutoTradeAccount.equity.toLocaleString()}</span>
+    </div>
+    <div className="flex items-center justify-between text-xs">
+      <span className="text-slate-500">Buying power</span>
+      <span className="text-white font-mono">${tosAutoTradeAccount.buyingPower.toLocaleString()}</span>
+    </div>
+    <button
+      onClick={() => navigate('/tos')}
+      className="w-full text-xs text-slate-500 hover:text-accent-blue text-center py-1 transition-colors"
+    >
+      Switch account →
+    </button>
+  </div>
+)}
+```
+
+-----
+
+## PHASE 9 — Dashboard Status Card Update
+
+In `client/src/pages/Dashboard.tsx`, update the TOS status card (added in the previous prompt) to show both accounts when they differ:
+
+```tsx
+{/* In the TOS status card, after the equity row: */}
+{tosAutoTradeAccount && (
+  <>
+    <div className="flex justify-between text-xs">
+      <span className="text-slate-500">Auto Trader</span>
+      <div className="flex items-center gap-1.5">
+        <span className={cn(
+          'font-bold px-1 py-0.5 rounded font-mono text-[10px]',
+          tosAutoTradeAccount.isPaper ? 'bg-accent-blue/20 text-accent-blue' : 'bg-accent-green/20 text-accent-green'
+        )}>
+          {tosAutoTradeAccount.isPaper ? 'PAPER' : 'LIVE'}
+        </span>
+        <span className="text-slate-400 font-mono">{tosAutoTradeAccount.accountNumberMasked}</span>
+      </div>
+    </div>
+  </>
+)}
+```
+
+-----
+
+## PHASE 10 — API Client Methods
+
+Add to `client/src/api/client.ts`:
+
+```typescript
+// Add to the existing credentials section:
+tosAccounts: () => apiGet('/credentials/tos/accounts'),
+tosRefreshAccounts: () => apiPost('/credentials/tos/accounts/refresh', {}),
+tosSetViewAccount: (data: { accountNumber: string }) => apiPut('/credentials/tos/accounts/view', data),
+tosSetAutoTradeAccount: (data: { accountNumber: string }) => apiPut('/credentials/tos/accounts/autotrade', data),
+
+// Update existing tos.status to accept optional accountNumber:
+// In the tos section of the api client:
+status: (accountNumber?: string) => apiGet(`/tos/status${accountNumber ? `?accountNumber=${accountNumber}` : ''}`),
+```
+
+-----
+
+## IMPORTANT BEHAVIORAL RULES
+
+**Auto Trader account is always independent from the view account.** Switching what you’re viewing never affects what the bot trades on. They are two completely separate settings.
+
+**Switching the Auto Trader to a LIVE account shows a browser confirm() dialog.** The user must explicitly click OK. The text clearly states “Real money will be used.”
+
+**When TOS is first connected**, the auto trade account defaults to the first paper account found. If no paper account exists, it defaults to the first account but keeps `dryRun: true` and shows a warning.
+
+**The `ACCOUNT_NUMBER` used by `tosExchangeService.placeOrder()`** always comes from `TOS_CONFIG.ACCOUNT_NUMBER` which now resolves to `autoTradeAccountNumber`. No changes to the order placement code are needed.
+
+**Viewing a different account than the auto trade account** shows a subtle info banner in the TOS dashboard:
+
+```tsx
+{viewAccountNumber !== autoTradeAccountNumber && viewAccountNumber && autoTradeAccountNumber && (
+  <div className="flex items-center gap-2 p-2.5 rounded-lg bg-amber-500/10 border border-amber-500/20 text-xs text-amber-400">
+    <AlertTriangle className="h-3.5 w-3.5 flex-shrink-0" />
+    Viewing a different account than the Auto Trader. 
+    Trades execute on <strong className="font-mono">{autoTradeAccountMasked}</strong>.
+  </div>
+)}
+```
+
+-----
+
+## SUMMARY
+
+### New Files
+
+```
+server/src/services/tos/tosAccountUtils.ts
+```
+
+### Modified Files
+
+```
+server/prisma/schema.prisma                          → add 4 fields to ExchangeCredential
+server/src/services/tos/tosInfoService.ts            → add getAllAccountSummaries(), update getPrimaryAccount()
+server/src/services/tos/tosConfig.ts                 → add VIEW_ACCOUNT_NUMBER getter, update ACCOUNT_NUMBER
+server/src/services/credentials/CredentialService.ts → add account fetch/store/switch methods
+server/src/routes/credentials.ts                     → add 4 account routes
+server/src/routes/tos.ts                             → accept ?accountNumber= query param on status/account routes
+client/src/pages/tos/TosDashboard.tsx                → dual account switcher header
+client/src/pages/AutoTrader.tsx                      → auto trade account display
+client/src/pages/Dashboard.tsx                       → show auto trade account in TOS card
+client/src/api/client.ts                             → account API methods, update tos.status()
+```
+
+### What Stays the Same
+
+- All order placement code — `tosExchangeService.placeOrder()` is unchanged
+- All killswitch and drawdown monitor logic — unchanged
+- All existing TOS routes — just get an optional `?accountNumber=` param added
+- The Hyperliquid dashboard — unchanged (HL has one wallet, no account switching needed)

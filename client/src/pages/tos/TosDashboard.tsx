@@ -5,7 +5,7 @@ import {
   TrendingUp, TrendingDown, RefreshCw, Clock, DollarSign, Lock,
   BarChart3, Power, PowerOff, ChevronDown, ChevronUp, Minus,
   ShieldAlert, Zap, Activity, X, Settings2, Eye, EyeOff, ExternalLink,
-  CheckCircle2, AlertTriangle,
+  CheckCircle2, AlertTriangle, FlaskConical,
 } from 'lucide-react';
 import { cn } from '../../lib/utils';
 import { api } from '../../api/client';
@@ -13,6 +13,18 @@ import { Card, CardHeader, StatCard } from '../../components/ui/Card';
 import { LoadingState } from '../../components/ui/LoadingState';
 
 // ─── Types ────────────────────────────────────────────────────────
+
+interface SchwabAccountSummary {
+  accountNumber: string;
+  accountNumberMasked: string;
+  type: string;
+  isPaper: boolean;
+  label: string;
+  equity: number;
+  buyingPower: number;
+  dayTradingBuyingPower: number;
+  positionCount: number;
+}
 
 interface Balances {
   equity: number;
@@ -683,6 +695,99 @@ function TOSAutoConfigPanel() {
   );
 }
 
+// ─── Account Switcher ─────────────────────────────────────────────
+
+function AccountSwitcher({
+  accounts,
+  selectedAccountNumber,
+  onSelect,
+  label,
+  showAutoTradeWarning = false,
+  refetchAccounts,
+}: {
+  accounts: SchwabAccountSummary[];
+  selectedAccountNumber: string;
+  onSelect: (accountNumber: string) => void;
+  label: string;
+  showAutoTradeWarning?: boolean;
+  refetchAccounts?: () => void;
+}) {
+  const [open, setOpen] = useState(false);
+  const selected = accounts.find(a => a.accountNumber === selectedAccountNumber) ?? accounts[0];
+
+  return (
+    <div className="relative">
+      <button
+        onClick={() => setOpen(!open)}
+        className="flex items-center gap-2 px-3 py-1.5 rounded-lg bg-surface-3 border border-surface-border hover:border-slate-500 transition-colors text-sm"
+      >
+        <span className={cn(
+          'text-xs font-bold px-1.5 py-0.5 rounded font-mono',
+          selected?.isPaper ? 'bg-accent-blue/20 text-accent-blue' : 'bg-accent-green/20 text-accent-green'
+        )}>
+          {selected?.isPaper ? 'PAPER' : 'LIVE'}
+        </span>
+        <span className="text-white font-mono text-xs">{selected?.label ?? 'Select account'}</span>
+        <ChevronDown className={cn('h-3 w-3 text-slate-500 transition-transform', open && 'rotate-180')} />
+      </button>
+
+      {open && (
+        <div className="absolute top-full left-0 mt-1 w-72 bg-surface-1 border border-surface-border rounded-xl shadow-2xl z-50 overflow-hidden">
+          <div className="px-3 py-2 border-b border-surface-border">
+            <p className="text-xs text-slate-500 font-mono uppercase tracking-wider">{label}</p>
+          </div>
+          {accounts.map((account) => (
+            <button
+              key={account.accountNumber}
+              onClick={() => {
+                if (showAutoTradeWarning && !account.isPaper && selected?.isPaper) {
+                  if (!confirm(`Switch Auto Trader to a LIVE account (${account.label})?\n\nReal money will be used. Make sure Dry Run is enabled until you're ready.`)) return;
+                }
+                onSelect(account.accountNumber);
+                setOpen(false);
+              }}
+              className={cn(
+                'w-full flex items-center justify-between px-3 py-3 hover:bg-surface-3 transition-colors text-left',
+                account.accountNumber === selectedAccountNumber && 'bg-surface-3'
+              )}
+            >
+              <div className="flex items-center gap-2.5">
+                <span className={cn(
+                  'text-xs font-bold px-1.5 py-0.5 rounded font-mono flex-shrink-0',
+                  account.isPaper ? 'bg-accent-blue/20 text-accent-blue' : 'bg-accent-green/20 text-accent-green'
+                )}>
+                  {account.isPaper ? 'PAPER' : 'LIVE'}
+                </span>
+                <div>
+                  <p className="text-sm text-white font-mono">{account.accountNumberMasked}</p>
+                  <p className="text-xs text-slate-500">{account.type}</p>
+                </div>
+              </div>
+              <div className="text-right flex-shrink-0">
+                <p className="text-xs text-white font-mono">${account.equity.toLocaleString('en-US', { maximumFractionDigits: 0 })}</p>
+                <p className="text-xs text-slate-500">{account.positionCount} pos</p>
+              </div>
+            </button>
+          ))}
+          <div className="px-3 py-2 border-t border-surface-border">
+            <button
+              onClick={() => {
+                if (refetchAccounts) {
+                  (api.credentials as any).tosRefreshAccounts().then(() => refetchAccounts());
+                }
+                setOpen(false);
+              }}
+              className="text-xs text-slate-500 hover:text-white flex items-center gap-1.5 transition-colors"
+            >
+              <RefreshCw className="h-3 w-3" /> Refresh account list
+            </button>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
 // ─── TOS Connect Wizard ───────────────────────────────────────────
 
 function TOSConnectCard({ onConnected }: { onConnected: () => void }) {
@@ -855,16 +960,29 @@ export default function TosDashboard() {
 
   const tosConnected = (credStatus as any)?.data?.tos?.isConnected ?? false;
 
+  const { data: accountsData, refetch: refetchAccounts } = useQuery({
+    queryKey: ['tos-accounts'],
+    queryFn: () => (api.credentials as any).tosAccounts(),
+    staleTime: 5 * 60_000,
+    refetchInterval: 5 * 60_000,
+    enabled: tosConnected,
+  });
+
+  const availableAccounts: SchwabAccountSummary[] = (accountsData as any)?.data?.accounts ?? [];
+  const viewAccountNumber: string = (accountsData as any)?.data?.viewAccountNumber ?? '';
+  const autoTradeAccountNumber: string = (accountsData as any)?.data?.autoTradeAccountNumber ?? '';
+  const autoTradeAccount = availableAccounts.find(a => a.accountNumber === autoTradeAccountNumber);
+
   const { data: statusData, isLoading: sLoading, refetch: refetchStatus } = useQuery({
-    queryKey: ['tos-status'],
-    queryFn:  () => api.tos.status(),
+    queryKey: ['tos-status', viewAccountNumber],
+    queryFn:  () => api.tos.status(viewAccountNumber || undefined),
     staleTime: 15_000,
     refetchInterval: 30_000,
   });
 
   const { data: accountData } = useQuery({
-    queryKey: ['tos-account'],
-    queryFn:  () => api.tos.account(),
+    queryKey: ['tos-account', viewAccountNumber],
+    queryFn:  () => api.tos.account(viewAccountNumber || undefined),
     staleTime: 20_000,
     refetchInterval: 60_000,
     enabled: !!(statusData as any)?.data?.hasCredentials || tosConnected,
@@ -917,7 +1035,7 @@ export default function TosDashboard() {
   return (
     <div className="flex flex-col h-full overflow-hidden">
       <div className="flex-shrink-0 border-b border-surface-border bg-surface-1 px-6 py-4">
-        <div className="flex items-center justify-between">
+        <div className="flex items-center justify-between flex-wrap gap-3">
           <div className="flex items-center gap-3">
             <div className="w-9 h-9 rounded-lg bg-accent-green/10 border border-accent-green/20 flex items-center justify-center">
               <Activity className="h-4 w-4 text-accent-green" />
@@ -935,6 +1053,47 @@ export default function TosDashboard() {
               </div>
             </div>
           </div>
+
+          {tosConnected && availableAccounts.length > 0 && (
+            <div className="flex items-center gap-3 flex-wrap">
+              <div className="flex flex-col gap-1">
+                <span className="text-xs text-slate-600 font-mono uppercase tracking-wider px-1">Viewing</span>
+                <AccountSwitcher
+                  accounts={availableAccounts}
+                  selectedAccountNumber={viewAccountNumber}
+                  onSelect={(acctNum) => {
+                    (api.credentials as any).tosSetViewAccount({ accountNumber: acctNum })
+                      .then(() => { refetchAccounts(); qc.invalidateQueries({ queryKey: ['tos-status'] }); });
+                  }}
+                  label="Select account to view"
+                  refetchAccounts={refetchAccounts}
+                />
+              </div>
+              <div className="w-px h-10 bg-surface-border self-center hidden sm:block" />
+              <div className="flex flex-col gap-1">
+                <span className="text-xs text-slate-600 font-mono uppercase tracking-wider px-1">Auto Trader</span>
+                <AccountSwitcher
+                  accounts={availableAccounts}
+                  selectedAccountNumber={autoTradeAccountNumber}
+                  onSelect={(acctNum) => {
+                    (api.credentials as any).tosSetAutoTradeAccount({ accountNumber: acctNum })
+                      .then((result: any) => {
+                        refetchAccounts();
+                        qc.invalidateQueries({ queryKey: ['tos-status'] });
+                        if (result?.data?.warning) {
+                          toast.warning(result.data.warning);
+                        } else {
+                          toast.success(result?.data?.message ?? 'Auto Trader account updated');
+                        }
+                      });
+                  }}
+                  label="Select auto trader account"
+                  showAutoTradeWarning={true}
+                  refetchAccounts={refetchAccounts}
+                />
+              </div>
+            </div>
+          )}
 
           <div className="flex items-center gap-2">
             {tosConnected && (
@@ -983,6 +1142,31 @@ export default function TosDashboard() {
             </div>
             <p className="text-xs text-red-400/70">Reason: {status?.killswitch?.reason ?? 'Unknown'}</p>
             <p className="text-xs text-red-400/50 mt-0.5">Trigger: {status?.killswitch?.trigger?.toUpperCase()} · {status?.killswitch?.activatedAt ? new Date(status.killswitch.activatedAt).toLocaleString() : '—'}</p>
+          </div>
+        )}
+
+        {viewAccountNumber && autoTradeAccountNumber && viewAccountNumber !== autoTradeAccountNumber && (
+          <div className="mx-6 mt-4 flex items-center gap-2 p-2.5 rounded-lg bg-amber-500/10 border border-amber-500/20 text-xs text-amber-400">
+            <AlertTriangle className="h-3.5 w-3.5 flex-shrink-0" />
+            Viewing a different account than the Auto Trader. Trades execute on{' '}
+            <strong className="font-mono">{availableAccounts.find(a => a.accountNumber === autoTradeAccountNumber)?.accountNumberMasked ?? `...${autoTradeAccountNumber.slice(-4)}`}</strong>.
+          </div>
+        )}
+
+        {autoTradeAccountNumber && tosConnected && (
+          <div className={cn(
+            'mx-6 mt-4 flex items-center gap-2 px-3 py-2 rounded-lg text-xs border',
+            autoTradeAccount?.isPaper
+              ? 'bg-accent-blue/5 border-accent-blue/20 text-accent-blue'
+              : 'bg-accent-green/5 border-accent-green/20 text-accent-green'
+          )}>
+            {autoTradeAccount?.isPaper
+              ? <><FlaskConical className="h-3 w-3 flex-shrink-0" /> Auto Trader using paperMoney — no real funds at risk</>
+              : <><Zap className="h-3 w-3 flex-shrink-0" /> Auto Trader using LIVE account — real funds</>
+            }
+            {status?.dryRun && (
+              <span className="ml-auto font-mono bg-amber-500/20 text-amber-400 px-1.5 py-0.5 rounded">DRY RUN ON</span>
+            )}
           </div>
         )}
 

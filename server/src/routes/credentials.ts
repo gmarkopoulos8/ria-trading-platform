@@ -181,6 +181,14 @@ router.post('/tos/connect', requireAuth, async (req, res) => {
     await loadDefaultCredentials();
     await credentialService.markConnected(req.session.userId!, 'tos');
 
+    let availableAccounts: any[] = [];
+    try {
+      availableAccounts = await credentialService.fetchAndStoreAccounts(req.session.userId!);
+      await loadDefaultCredentials();
+    } catch (fetchErr) {
+      console.warn('[TOS-Connect] Could not fetch accounts after connect:', (fetchErr as Error).message);
+    }
+
     return res.json({
       success: true,
       data: {
@@ -188,6 +196,7 @@ router.post('/tos/connect', requireAuth, async (req, res) => {
         accountNumber: `...${accountNumber.slice(-4)}`,
         equity,
         dryRun: true,
+        availableAccounts,
       },
     });
   } catch (err) {
@@ -225,6 +234,69 @@ router.patch('/tos/settings', requireAuth, async (req, res) => {
     await credentialService.updateTOSSettings(req.session.userId!, { dryRun, maxDrawdownPct });
     await loadDefaultCredentials();
     return res.json({ success: true, data: { message: 'Settings updated' } });
+  } catch (err) {
+    return res.status(500).json({ success: false, error: (err as Error).message });
+  }
+});
+
+router.get('/tos/accounts', requireAuth, async (req, res) => {
+  try {
+    const accounts = await credentialService.getAvailableAccounts(req.session.userId!);
+    const { prisma } = await import('../lib/prisma');
+    const cred = await prisma.exchangeCredential.findUnique({
+      where: { userId_exchange: { userId: req.session.userId!, exchange: 'tos' } },
+    });
+    return res.json({
+      success: true,
+      data: {
+        accounts,
+        viewAccountNumber: cred?.viewAccountNumber ?? null,
+        autoTradeAccountNumber: cred?.autoTradeAccountNumber ?? null,
+      },
+    });
+  } catch (err) {
+    return res.status(500).json({ success: false, error: (err as Error).message });
+  }
+});
+
+router.post('/tos/accounts/refresh', requireAuth, async (req, res) => {
+  try {
+    const accounts = await credentialService.fetchAndStoreAccounts(req.session.userId!);
+    await loadDefaultCredentials();
+    return res.json({ success: true, data: { accounts } });
+  } catch (err) {
+    return res.status(500).json({ success: false, error: (err as Error).message });
+  }
+});
+
+router.put('/tos/accounts/view', requireAuth, async (req, res) => {
+  const { accountNumber } = req.body;
+  if (!accountNumber) return res.status(400).json({ success: false, error: 'accountNumber required' });
+  try {
+    await credentialService.setViewAccount(req.session.userId!, accountNumber);
+    await loadDefaultCredentials();
+    return res.json({ success: true, data: { message: `View account set to ...${accountNumber.slice(-4)}` } });
+  } catch (err) {
+    return res.status(500).json({ success: false, error: (err as Error).message });
+  }
+});
+
+router.put('/tos/accounts/autotrade', requireAuth, async (req, res) => {
+  const { accountNumber } = req.body;
+  if (!accountNumber) return res.status(400).json({ success: false, error: 'accountNumber required' });
+  try {
+    const summary = await credentialService.setAutoTradeAccount(req.session.userId!, accountNumber);
+    await loadDefaultCredentials();
+    return res.json({
+      success: true,
+      data: {
+        message: `Auto Trader account set to ${summary.label}`,
+        account: summary,
+        warning: !summary.isPaper
+          ? 'Auto Trader is now targeting a LIVE account. Real money will be used.'
+          : null,
+      },
+    });
   } catch (err) {
     return res.status(500).json({ success: false, error: (err as Error).message });
   }
