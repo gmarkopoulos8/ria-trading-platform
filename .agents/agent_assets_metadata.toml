@@ -1,0 +1,8 @@
+uploads = []
+generated = []
+
+[[outputs]]
+id = "qpWu_cX2397hUXEET-qTp"
+uri = "file://mycode.tar.gz"
+type = "unspecified"
+title = "mycode.tar.gz — RIA BOT source code"
