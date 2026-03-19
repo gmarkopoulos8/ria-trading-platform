@@ -26,6 +26,12 @@ import { runTestSuite, getLastTestResult } from '../services/alpaca/AlpacaTestSu
 import { runStrategyReplay } from '../services/alpaca/StrategyReplayService';
 import { getLatencyStats } from '../services/alpaca/LatencyMonitor';
 import { hasAlpacaCredentials } from '../services/alpaca/alpacaConfig';
+import {
+  computeAdaptiveParameters,
+  getCurrentParams,
+  registerUserForAdaptation,
+  type ParameterBounds,
+} from '../services/alpaca/AdaptiveParameterEngine';
 import { prisma } from '../lib/prisma';
 
 const router = Router();
@@ -290,62 +296,93 @@ router.post('/auto/start', requireAuth, requireAlpacaCredentials, async (req: Re
   try {
     const userId = (req as any).session?.userId as string;
     const {
-      capitalTotal = 500,
-      maxPositions = 3,
+      capitalTotal       = 500,
+      maxPositions       = 3,
       capitalPerTrade,
-      stopLossPct = 3.0,
-      takeProfitPct = 6.0,
+      stopLossPct        = 3.0,
+      takeProfitPct      = 6.0,
       minConvictionScore = 75,
-      minConfidenceScore = 60,
-      dryRun = false,
+      dryRun             = false,
+      useAdaptive        = true,
+      bounds,
     } = req.body;
 
     const perTrade = Math.floor(capitalPerTrade ?? capitalTotal / maxPositions);
 
     if (!dryRun) {
       const account = await getAccount();
-      const buyingPower = parseFloat(account.buying_power ?? '0');
-      if (buyingPower < perTrade) {
+      const bp = parseFloat(account.buying_power ?? '0');
+      if (bp < perTrade) {
         return res.status(400).json({
           success: false,
-          error: `Insufficient buying power. Need $${perTrade}, available $${buyingPower.toFixed(2)}`,
+          error: `Insufficient buying power. Need $${perTrade}, have $${bp.toFixed(2)}`,
         });
       }
     }
 
+    const effectiveBounds: ParameterBounds = bounds ?? {
+      stopLoss:    { min: 1.5, max: 8.0 },
+      takeProfit:  { min: 3.0, max: 20.0 },
+      conviction:  { min: 65,  max: 92   },
+      positionPct: { min: 0.3, max: 1.0  },
+    };
+
+    let activeStop       = stopLossPct;
+    let activeTarget     = takeProfitPct;
+    let activeConviction = minConvictionScore;
+    let activeSizeMult   = 1.0;
+    let adaptiveParams   = null;
+
+    if (useAdaptive) {
+      registerUserForAdaptation(userId, { stopLossPct, takeProfitPct, minConvictionScore }, effectiveBounds);
+      adaptiveParams   = await computeAdaptiveParameters(userId, { stopLossPct, takeProfitPct, minConvictionScore }, effectiveBounds);
+      activeStop       = adaptiveParams.stopLossPct;
+      activeTarget     = adaptiveParams.takeProfitPct;
+      activeConviction = adaptiveParams.minConvictionScore;
+      activeSizeMult   = adaptiveParams.positionSizeMultiplier;
+    }
+
+    const adjustedPerTrade = Math.floor(perTrade * activeSizeMult);
+    if (adjustedPerTrade < 10) {
+      return res.status(400).json({
+        success: false,
+        error: `Adjusted position size ($${adjustedPerTrade}) too small after AI sizing. Increase capital or relax bounds.`,
+      });
+    }
+
     const { buildSignalsFromLatestScan } = await import('../services/scans/dynamicUniverseService');
     const rawSignals = await buildSignalsFromLatestScan({
-      minConvictionScore,
-      minConfidenceScore,
-      allowedBiases: ['BULLISH'],
-      maxSymbols: maxPositions * 3,
+      minConvictionScore:  activeConviction,
+      minConfidenceScore:  60,
+      allowedBiases:       ['BULLISH'],
+      maxSymbols:          maxPositions * 3,
     });
 
     if (!rawSignals || rawSignals.length === 0) {
       return res.status(400).json({
         success: false,
-        error: 'No qualifying signals found. Run a Daily Scan first, or lower your conviction threshold.',
+        error: 'No qualifying signals. Run a Daily Scan first, or the AI raised conviction threshold too high — try widening your bounds.',
       });
     }
 
     const signals = rawSignals.slice(0, maxPositions).map((s: any) => ({
       ...s,
-      exchange: 'PAPER' as const,
-      fixedDollarAmount: perTrade,
+      exchange:          'PAPER' as const,
+      fixedDollarAmount: adjustedPerTrade,
     }));
 
     const config = {
-      enabled: true,
-      exchange: 'PAPER' as const,
-      maxPositionPct: 100,
-      dailyLossLimit: capitalTotal * 0.20,
-      maxDrawdownPct: 25,
-      maxOpenPositions: maxPositions,
-      minConvictionScore,
-      minConfidenceScore,
-      allowedBiases: ['BULLISH'],
-      stopLossPct,
-      takeProfitPct,
+      enabled:            true,
+      exchange:           'PAPER' as const,
+      maxPositionPct:     100,
+      dailyLossLimit:     capitalTotal * 0.20,
+      maxDrawdownPct:     25,
+      maxOpenPositions:   maxPositions,
+      minConvictionScore: activeConviction,
+      minConfidenceScore: 60,
+      allowedBiases:      ['BULLISH'],
+      stopLossPct:        activeStop,
+      takeProfitPct:      activeTarget,
       dryRun,
     };
 
@@ -353,19 +390,26 @@ router.post('/auto/start', requireAuth, requireAlpacaCredentials, async (req: Re
     let settings = await prisma.userSettings.findUnique({ where: { userId } });
     if (!settings) settings = await prisma.userSettings.create({ data: { userId } });
 
-    const results = await runTradingCycle(settings.id, config, signals);
-
-    const placed   = results.filter((r: any) => r.status === 'FILLED' || r.status === 'DRY_RUN');
+    const results  = await runTradingCycle(settings.id, config, signals);
+    const placed   = results.filter((r: any) => ['FILLED', 'DRY_RUN'].includes(r.status));
     const rejected = results.filter((r: any) => !['FILLED', 'DRY_RUN'].includes(r.status));
 
     return res.json({
       success: true,
       data: {
-        signalsEvaluated: results.length,
-        ordersPlaced: placed.length,
-        ordersRejected: rejected.length,
+        signalsEvaluated:  results.length,
+        ordersPlaced:      placed.length,
+        ordersRejected:    rejected.length,
         dryRun,
-        placed: placed.map((r: any) => ({ symbol: r.symbol, status: r.status, dollarAmount: r.dollarAmount, entryPrice: r.entryPrice })),
+        adaptiveParams,
+        activeParams: {
+          stopLossPct:            activeStop,
+          takeProfitPct:          activeTarget,
+          minConvictionScore:     activeConviction,
+          positionSizeMultiplier: activeSizeMult,
+          perTradeAmount:         adjustedPerTrade,
+        },
+        placed:   placed.map((r: any)   => ({ symbol: r.symbol, status: r.status, dollarAmount: r.dollarAmount, entryPrice: r.entryPrice })),
         rejected: rejected.map((r: any) => ({ symbol: r.symbol, reason: r.reason })),
       },
     });
@@ -377,7 +421,12 @@ router.post('/auto/start', requireAuth, requireAlpacaCredentials, async (req: Re
 
 router.post('/auto/monitor', requireAuth, requireAlpacaCredentials, async (req: Request, res: Response) => {
   try {
-    const { stopLossPct = 3.0, takeProfitPct = 6.0, dryRun = false } = req.body;
+    const userId        = (req as any).session?.userId as string;
+    const { dryRun = false } = req.body;
+
+    const adapted       = getCurrentParams(userId);
+    const stopLossPct   = adapted?.stopLossPct   ?? (req.body.stopLossPct   ?? 3.0);
+    const takeProfitPct = adapted?.takeProfitPct ?? (req.body.takeProfitPct ?? 6.0);
 
     const positions = await getPositions();
     if (!positions || positions.length === 0) {
@@ -385,10 +434,9 @@ router.post('/auto/monitor', requireAuth, requireAlpacaCredentials, async (req: 
     }
 
     const actions: any[] = [];
-
     for (const pos of positions) {
       const entry   = parseFloat((pos as any).avg_entry_price ?? '0');
-      const current = parseFloat((pos as any).current_price ?? '0');
+      const current = parseFloat((pos as any).current_price  ?? '0');
       if (entry <= 0 || current <= 0) continue;
 
       const pnlPct = ((current - entry) / entry) * 100;
@@ -397,15 +445,15 @@ router.post('/auto/monitor', requireAuth, requireAlpacaCredentials, async (req: 
 
       if (pnlPct <= -stopLossPct) {
         shouldClose = true;
-        closeReason = `Stop loss: ${pnlPct.toFixed(2)}% (limit -${stopLossPct}%)`;
+        closeReason = `Stop loss: ${pnlPct.toFixed(2)}% ≤ -${stopLossPct}%`;
       } else if (pnlPct >= takeProfitPct) {
         shouldClose = true;
-        closeReason = `Take profit: +${pnlPct.toFixed(2)}% (target +${takeProfitPct}%)`;
+        closeReason = `Take profit: +${pnlPct.toFixed(2)}% ≥ +${takeProfitPct}%`;
       }
 
       if (shouldClose && !dryRun) {
         await closePosition((pos as any).symbol).catch((e: any) =>
-          console.warn(`[Alpaca Monitor] Close ${(pos as any).symbol} failed:`, e?.message)
+          console.warn(`[Alpaca Monitor] Close ${(pos as any).symbol}:`, e?.message)
         );
       }
 
@@ -417,7 +465,7 @@ router.post('/auto/monitor', requireAuth, requireAlpacaCredentials, async (req: 
       });
     }
 
-    return res.json({ success: true, data: { actions, dryRun } });
+    return res.json({ success: true, data: { actions, dryRun, stopLossPct, takeProfitPct, usingAdaptive: !!adapted } });
   } catch (err: any) {
     res.status(500).json({ success: false, error: err?.message ?? 'Monitor failed' });
   }
@@ -426,28 +474,39 @@ router.post('/auto/monitor', requireAuth, requireAlpacaCredentials, async (req: 
 router.get('/auto/status', requireAuth, async (req: Request, res: Response) => {
   try {
     const userId = (req as any).session?.userId as string;
-    const today = new Date();
-    today.setHours(0, 0, 0, 0);
+    const today  = new Date(); today.setHours(0, 0, 0, 0);
 
     let settings = await prisma.userSettings.findUnique({ where: { userId } });
     if (!settings) settings = await prisma.userSettings.create({ data: { userId } });
 
     const logs = await prisma.autoTradeLog.findMany({
-      where: {
-        userSettingsId: settings.id,
-        exchange: 'PAPER',
-        executedAt: { gte: today },
-      },
+      where: { userSettingsId: settings.id, exchange: 'PAPER', executedAt: { gte: today } },
       orderBy: { executedAt: 'desc' },
       take: 20,
     });
 
-    const placed = logs.filter((l: any) => ['FILLED', 'DRY_RUN'].includes(l.status));
-    const totalDeployed = placed.reduce((sum: number, l: any) => sum + (Number(l.dollarAmount) || 0), 0);
+    const placed         = logs.filter((l: any) => ['FILLED', 'DRY_RUN'].includes(l.status));
+    const totalDeployed  = placed.reduce((s: number, l: any) => s + (Number(l.dollarAmount) || 0), 0);
+    const adaptiveParams = getCurrentParams(userId);
 
-    return res.json({ success: true, data: { todayTrades: placed.length, totalDeployed, logs } });
+    return res.json({ success: true, data: { todayTrades: placed.length, totalDeployed, logs, adaptiveParams } });
   } catch (err: any) {
     res.status(500).json({ success: false, error: err?.message ?? 'Status failed' });
+  }
+});
+
+router.post('/auto/adjust', requireAuth, async (req: Request, res: Response) => {
+  try {
+    const userId        = (req as any).session?.userId as string;
+    const { base, bounds } = req.body;
+    if (!base || !bounds) {
+      return res.status(400).json({ success: false, error: 'base and bounds are required' });
+    }
+    registerUserForAdaptation(userId, base, bounds);
+    const params = await computeAdaptiveParameters(userId, base, bounds);
+    return res.json({ success: true, data: params });
+  } catch (err: any) {
+    res.status(500).json({ success: false, error: err?.message ?? 'Adjust failed' });
   }
 });
 

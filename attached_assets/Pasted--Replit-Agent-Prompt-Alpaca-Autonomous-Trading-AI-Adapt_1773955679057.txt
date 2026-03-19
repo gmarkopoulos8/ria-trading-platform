@@ -1,0 +1,1121 @@
+# Replit Agent Prompt — Alpaca Autonomous Trading + AI Adaptive Parameters
+
+Apply on top of everything already built. Only modify the files listed below. Do not change anything else.
+
+-----
+
+## OVERVIEW
+
+This prompt does three things:
+
+1. **Wires the `PAPER` exchange** in `AutoTradeExecutor` to actually call Alpaca’s paper API instead of returning DRY_RUN
+1. **Adds the auto trading backend routes** (`/auto/start`, `/auto/monitor`, `/auto/status`, `/auto/adjust`)
+1. **Builds the `AdaptiveParameterEngine`** — a service that runs every 30 minutes during market hours, analyzes recent trade performance and current market regime, and adjusts stop loss %, take profit %, position size, and conviction threshold within bounds the user sets
+1. **Builds the one-button UI** on the Alpaca dashboard including live display of what parameters the AI has chosen and why
+
+-----
+
+## PHASE 1 — Wire PAPER Exchange to Alpaca
+
+**File**: `server/src/services/autotrader/AutoTradeExecutor.ts`
+
+Find this exact block:
+
+```typescript
+if (config.dryRun || exchange === 'PAPER') {
+  await prisma.autoTradeLog.update({ where: { id: log.id }, data: { status: 'DRY_RUN' } });
+  return {
+    success: true,
+    status: 'DRY_RUN',
+```
+
+Replace the entire `if (config.dryRun || exchange === 'PAPER')` block with two separate blocks:
+
+```typescript
+// ── Dry run ──────────────────────────────────────────────────────────────
+if (config.dryRun) {
+  await prisma.autoTradeLog.update({
+    where: { id: log.id },
+    data: { status: 'DRY_RUN', entryPrice, stopLoss, takeProfit, quantity: sized.quantity, dollarAmount: sized.dollarAmount },
+  });
+  return { success: true, status: 'DRY_RUN', symbol: signal.symbol, exchange, logId: log.id, quantity: sized.quantity, entryPrice, dollarAmount: sized.dollarAmount };
+}
+
+// ── PAPER — route to Alpaca paper API ────────────────────────────────────
+if (exchange === 'PAPER') {
+  try {
+    const { placeOrder: alpacaPlace }                          = await import('../alpaca/alpacaExchangeService');
+    const { hasAlpacaCredentials, isPauseActive, isKillswitchActive } = await import('../alpaca/alpacaConfig');
+
+    if (!hasAlpacaCredentials()) {
+      await prisma.autoTradeLog.update({ where: { id: log.id }, data: { status: 'REJECTED', reason: 'Alpaca not connected' } });
+      return { success: false, status: 'REJECTED', symbol: signal.symbol, exchange, reason: 'Alpaca not connected' };
+    }
+    if (isPauseActive() || isKillswitchActive()) {
+      await prisma.autoTradeLog.update({ where: { id: log.id }, data: { status: 'BLOCKED', reason: 'Alpaca paused or stopped' } });
+      return { success: false, status: 'BLOCKED', symbol: signal.symbol, exchange, reason: 'Alpaca trading is paused' };
+    }
+
+    const dollarAmount = (signal as any).fixedDollarAmount ?? sized.dollarAmount;
+
+    const alpacaResult = await alpacaPlace({
+      symbol:         signal.symbol.toUpperCase(),
+      notional:       dollarAmount,
+      side:           'buy',
+      type:           'market',
+      timeInForce:    'day',
+      userId:         userSettingsId,
+      scanRunId:      signal.scanRunId,
+      submittedPrice: entryPrice,
+    });
+
+    if (!alpacaResult.success) {
+      await prisma.autoTradeLog.update({ where: { id: log.id }, data: { status: 'ERROR', reason: alpacaResult.error ?? 'Alpaca order failed' } });
+      return { success: false, status: 'ERROR', symbol: signal.symbol, exchange, reason: alpacaResult.error };
+    }
+
+    await prisma.autoTradeLog.update({
+      where: { id: log.id },
+      data: {
+        status: 'FILLED', entryPrice, stopLoss, takeProfit,
+        quantity: sized.quantity, dollarAmount,
+        orderId: alpacaResult.orderId,
+        executedAt: new Date(),
+      },
+    });
+
+    return { success: true, status: 'FILLED', symbol: signal.symbol, exchange, logId: log.id, quantity: sized.quantity, entryPrice, dollarAmount };
+  } catch (err: any) {
+    await prisma.autoTradeLog.update({ where: { id: log.id }, data: { status: 'ERROR', reason: err?.message ?? 'PAPER order error' } });
+    return { success: false, status: 'ERROR', symbol: signal.symbol, exchange, reason: err?.message };
+  }
+}
+```
+
+Also add `fixedDollarAmount?: number` to the `AutoTradeSignal` interface at the top of the file:
+
+```typescript
+export interface AutoTradeSignal {
+  // ... existing fields ...
+  fixedDollarAmount?: number;
+}
+```
+
+-----
+
+## PHASE 2 — Adaptive Parameter Engine
+
+**File**: `server/src/services/alpaca/AdaptiveParameterEngine.ts`
+
+This is the core of the feature. It analyzes performance data and market conditions every 30 minutes and adjusts trading parameters within the user’s defined bounds.
+
+```typescript
+import { prisma } from '../../lib/prisma';
+import { detectRegime } from '../market/RegimeDetector';
+import { getPositions } from './alpacaInfoService';
+
+export interface ParameterBounds {
+  // User-defined allowed ranges — AI stays within these
+  stopLoss:    { min: number; max: number };   // e.g. { min: 1.5, max: 8.0 }
+  takeProfit:  { min: number; max: number };   // e.g. { min: 3.0, max: 20.0 }
+  conviction:  { min: number; max: number };   // e.g. { min: 65, max: 92 }
+  positionPct: { min: number; max: number };   // e.g. { min: 0.3, max: 1.0 } (multiplier on base size)
+}
+
+export interface AdaptiveParameters {
+  stopLossPct:        number;
+  takeProfitPct:      number;
+  minConvictionScore: number;
+  positionSizeMultiplier: number;
+  reasoning: string[];          // human-readable explanation of each adjustment
+  regime: string;
+  adjustedAt: Date;
+  nextAdjustAt: Date;
+}
+
+// In-memory store of current adapted parameters per user
+const _adapted = new Map<string, AdaptiveParameters>();
+
+export function getCurrentParams(userId: string): AdaptiveParameters | null {
+  return _adapted.get(userId) ?? null;
+}
+
+export async function computeAdaptiveParameters(
+  userId:    string,
+  base:      { stopLossPct: number; takeProfitPct: number; minConvictionScore: number },
+  bounds:    ParameterBounds,
+  lookbackHours = 24,
+): Promise<AdaptiveParameters> {
+
+  const reasoning: string[] = [];
+
+  // ── 1. Market Regime ───────────────────────────────────────────────────────
+  const regime = await detectRegime();
+  const regimeAdj = regime.autoTraderAdjustments;
+
+  let stopLoss   = base.stopLossPct;
+  let takeProfit = base.takeProfitPct;
+  let conviction = Math.max(base.minConvictionScore, regimeAdj.minConvictionOverride);
+  let sizeMult   = regimeAdj.positionSizeMultiplier;
+
+  reasoning.push(`Market regime: ${regime.regime} (VIX ${regime.vix?.toFixed(1) ?? 'N/A'})`);
+
+  if (regime.regime === 'CHOPPY') {
+    stopLoss   = Math.min(stopLoss * 0.8, bounds.stopLoss.max);   // tighten stops in choppy market
+    takeProfit = Math.min(takeProfit * 0.75, bounds.takeProfit.max); // lower targets
+    reasoning.push('Choppy regime → tightened stops and targets, reduced size');
+  } else if (regime.regime === 'ELEVATED_VOLATILITY') {
+    stopLoss   = Math.min(stopLoss * 1.3, bounds.stopLoss.max);   // widen stops for volatility
+    takeProfit = Math.min(takeProfit * 1.2, bounds.takeProfit.max);
+    reasoning.push('Elevated volatility → widened stops to avoid noise-outs, strict conviction');
+  } else if (regime.regime === 'BULL_TREND') {
+    takeProfit = Math.min(takeProfit * 1.1, bounds.takeProfit.max); // let winners run in bull
+    reasoning.push('Bull trend → extended take-profit targets');
+  }
+
+  // ── 2. Recent Trade Performance ────────────────────────────────────────────
+  const settings = await prisma.userSettings.findUnique({ where: { userId } });
+  if (settings) {
+    const since = new Date(Date.now() - lookbackHours * 3600_000);
+    const recentLogs = await prisma.autoTradeLog.findMany({
+      where: {
+        userSettingsId: settings.id,
+        exchange: 'PAPER',
+        status: { in: ['FILLED'] },
+        executedAt: { gte: since },
+      },
+      orderBy: { executedAt: 'desc' },
+      take: 20,
+    });
+
+    if (recentLogs.length >= 3) {
+      const withPnl  = recentLogs.filter(l => l.pnl !== null);
+      const wins     = withPnl.filter(l => (l.pnl ?? 0) > 0);
+      const losses   = withPnl.filter(l => (l.pnl ?? 0) < 0);
+      const winRate  = withPnl.length > 0 ? wins.length / withPnl.length : 0.5;
+      const avgWin   = wins.length  > 0 ? wins.reduce((s, l)   => s + (l.pnl ?? 0), 0) / wins.length  : 0;
+      const avgLoss  = losses.length > 0 ? Math.abs(losses.reduce((s, l) => s + (l.pnl ?? 0), 0) / losses.length) : 0;
+      const profitFactor = avgLoss > 0 ? avgWin / avgLoss : (avgWin > 0 ? 2 : 1);
+
+      reasoning.push(`Last ${withPnl.length} closed trades: ${Math.round(winRate * 100)}% win rate, ${profitFactor.toFixed(2)} profit factor`);
+
+      // Losing streak — tighten everything
+      const last3 = withPnl.slice(0, 3);
+      const recentLosses = last3.filter(l => (l.pnl ?? 0) < 0).length;
+      if (recentLosses >= 3) {
+        stopLoss   = Math.max(stopLoss * 0.7, bounds.stopLoss.min);
+        takeProfit = Math.max(takeProfit * 0.8, bounds.takeProfit.min);
+        conviction = Math.min(conviction + 5, bounds.conviction.max);
+        sizeMult   = Math.max(sizeMult * 0.6, bounds.positionPct.min);
+        reasoning.push('3 consecutive losses → tightened stops, raised conviction bar, reduced size');
+      }
+      // Winning streak — be slightly more aggressive
+      else if (last3.every(l => (l.pnl ?? 0) > 0) && profitFactor > 1.8) {
+        takeProfit = Math.min(takeProfit * 1.1, bounds.takeProfit.max);
+        sizeMult   = Math.min(sizeMult * 1.1, bounds.positionPct.max);
+        reasoning.push('3 consecutive wins with strong profit factor → extended targets, slight size increase');
+      }
+
+      // Low profit factor — raise conviction threshold
+      if (profitFactor < 1.0 && withPnl.length >= 5) {
+        conviction = Math.min(conviction + 4, bounds.conviction.max);
+        reasoning.push(`Low profit factor (${profitFactor.toFixed(2)}) → raised conviction threshold`);
+      }
+    } else if (recentLogs.length === 0) {
+      reasoning.push('No recent trades — using base parameters');
+    }
+  }
+
+  // ── 3. Current Open Position P&L ──────────────────────────────────────────
+  try {
+    const openPositions = await getPositions();
+    if (openPositions.length > 0) {
+      const totalPnlPct = openPositions.reduce((sum, p) => {
+        return sum + parseFloat(p.unrealized_plpc ?? '0') * 100;
+      }, 0) / openPositions.length;
+
+      if (totalPnlPct < -2.5) {
+        // Open positions are bleeding — don't add more risk
+        conviction = Math.min(conviction + 5, bounds.conviction.max);
+        sizeMult   = Math.max(sizeMult * 0.7, bounds.positionPct.min);
+        reasoning.push(`Open positions avg -${Math.abs(totalPnlPct).toFixed(1)}% → raised bar and reduced new size`);
+      } else if (totalPnlPct > 3.0) {
+        // Profitable open book — slight loosening
+        takeProfit = Math.min(takeProfit * 1.05, bounds.takeProfit.max);
+        reasoning.push(`Open positions avg +${totalPnlPct.toFixed(1)}% → slightly extended take-profit`);
+      }
+    }
+  } catch {
+    // position fetch can fail — ignore
+  }
+
+  // ── 4. Time of Day ────────────────────────────────────────────────────────
+  const nyHour = parseInt(new Date().toLocaleString('en-US', { timeZone: 'America/New_York', hour: 'numeric', hour12: false }), 10);
+
+  if (nyHour >= 9 && nyHour < 10) {
+    // First 30 min — most volatile, be cautious
+    stopLoss   = Math.max(stopLoss * 0.85, bounds.stopLoss.min);
+    conviction = Math.min(conviction + 3, bounds.conviction.max);
+    reasoning.push('First 30 min of session (high spread/volatility) → tighter stops, stricter conviction');
+  } else if (nyHour >= 15) {
+    // Last hour — reduce new entries, tighten targets
+    takeProfit = Math.max(takeProfit * 0.9, bounds.takeProfit.min);
+    reasoning.push('Last hour of session → lowered take-profit targets to secure gains before close');
+  } else if (nyHour >= 11 && nyHour < 14) {
+    // Midday lull — normal parameters, no adjustment
+    reasoning.push('Midday session — base parameters active');
+  }
+
+  // ── 5. Clamp everything to user's bounds ─────────────────────────────────
+  stopLoss   = Math.min(Math.max(stopLoss,   bounds.stopLoss.min),   bounds.stopLoss.max);
+  takeProfit = Math.min(Math.max(takeProfit, bounds.takeProfit.min), bounds.takeProfit.max);
+  conviction = Math.min(Math.max(Math.round(conviction), bounds.conviction.min), bounds.conviction.max);
+  sizeMult   = Math.min(Math.max(sizeMult,  bounds.positionPct.min), bounds.positionPct.max);
+
+  const result: AdaptiveParameters = {
+    stopLossPct:            Math.round(stopLoss * 10) / 10,
+    takeProfitPct:          Math.round(takeProfit * 10) / 10,
+    minConvictionScore:     conviction,
+    positionSizeMultiplier: Math.round(sizeMult * 100) / 100,
+    reasoning,
+    regime: regime.regime,
+    adjustedAt:  new Date(),
+    nextAdjustAt: new Date(Date.now() + 30 * 60_000),
+  };
+
+  _adapted.set(userId, result);
+  return result;
+}
+
+// ── Background loop ────────────────────────────────────────────────────────
+
+let _loopTimer: NodeJS.Timeout | null = null;
+const _userBounds = new Map<string, { bounds: ParameterBounds; base: any }>();
+
+export function registerUserForAdaptation(userId: string, base: any, bounds: ParameterBounds) {
+  _userBounds.set(userId, { bounds, base });
+}
+
+export function unregisterUser(userId: string) {
+  _userBounds.delete(userId);
+  _adapted.delete(userId);
+}
+
+export function startAdaptiveLoop() {
+  if (_loopTimer) return;
+  console.info('[AdaptiveParams] Loop started — adjusting every 30 min during market hours');
+  _loopTimer = setInterval(async () => {
+    const nyHour = parseInt(new Date().toLocaleString('en-US', { timeZone: 'America/New_York', hour: 'numeric', hour12: false }), 10);
+    const isMarketHours = nyHour >= 9 && nyHour < 16;
+    // Run during market hours, and also at 8:50 AM for pre-market prep
+    if (!isMarketHours && nyHour !== 8) return;
+
+    for (const [userId, { base, bounds }] of _userBounds) {
+      try {
+        await computeAdaptiveParameters(userId, base, bounds);
+        console.info(`[AdaptiveParams] Updated params for user ${userId.slice(0, 8)}…`);
+      } catch (err: any) {
+        console.warn(`[AdaptiveParams] Failed for ${userId.slice(0, 8)}:`, err?.message);
+      }
+    }
+  }, 30 * 60_000); // every 30 minutes
+}
+
+export function stopAdaptiveLoop() {
+  if (_loopTimer) { clearInterval(_loopTimer); _loopTimer = null; }
+}
+```
+
+-----
+
+## PHASE 3 — Backend Routes
+
+**File**: `server/src/routes/alpaca.ts`
+
+Add these imports at the top of the file if not already present:
+
+```typescript
+import { prisma } from '../lib/prisma';
+import { getPositions, getAccount } from '../services/alpaca/alpacaInfoService';
+import { closePosition } from '../services/alpaca/alpacaExchangeService';
+import {
+  computeAdaptiveParameters,
+  getCurrentParams,
+  registerUserForAdaptation,
+  unregisterUser,
+  type ParameterBounds,
+} from '../services/alpaca/AdaptiveParameterEngine';
+```
+
+Add these routes before `export default router`:
+
+### Route 1 — Start Trading
+
+```typescript
+router.post('/auto/start', requireAuth, requireAlpacaCredentials, async (req: Request, res: Response) => {
+  try {
+    const userId = (req as any).session?.userId as string;
+    const {
+      capitalTotal        = 500,
+      maxPositions        = 3,
+      capitalPerTrade,
+      stopLossPct         = 3.0,
+      takeProfitPct       = 6.0,
+      minConvictionScore  = 75,
+      dryRun              = false,
+      useAdaptive         = true,
+      bounds,                        // ParameterBounds from UI
+    } = req.body;
+
+    const perTrade = Math.floor(capitalPerTrade ?? capitalTotal / maxPositions);
+
+    // Check buying power
+    if (!dryRun) {
+      const account = await getAccount();
+      const bp = parseFloat(account.buying_power ?? '0');
+      if (bp < perTrade) {
+        return res.status(400).json({
+          success: false,
+          error: `Insufficient buying power. Need $${perTrade}, have $${bp.toFixed(2)}`,
+        });
+      }
+    }
+
+    // Resolve parameters — adaptive or base
+    const effectiveBounds: ParameterBounds = bounds ?? {
+      stopLoss:    { min: 1.5, max: 8.0 },
+      takeProfit:  { min: 3.0, max: 20.0 },
+      conviction:  { min: 65,  max: 92   },
+      positionPct: { min: 0.3, max: 1.0  },
+    };
+
+    let activeStop       = stopLossPct;
+    let activeTarget     = takeProfitPct;
+    let activeConviction = minConvictionScore;
+    let activeSizeMult   = 1.0;
+    let adaptiveParams   = null;
+
+    if (useAdaptive) {
+      registerUserForAdaptation(userId, { stopLossPct, takeProfitPct, minConvictionScore }, effectiveBounds);
+      adaptiveParams = await computeAdaptiveParameters(
+        userId,
+        { stopLossPct, takeProfitPct, minConvictionScore },
+        effectiveBounds,
+      );
+      activeStop       = adaptiveParams.stopLossPct;
+      activeTarget     = adaptiveParams.takeProfitPct;
+      activeConviction = adaptiveParams.minConvictionScore;
+      activeSizeMult   = adaptiveParams.positionSizeMultiplier;
+    }
+
+    const adjustedPerTrade = Math.floor(perTrade * activeSizeMult);
+    if (adjustedPerTrade < 10) {
+      return res.status(400).json({
+        success: false,
+        error: `Adjusted position size ($${adjustedPerTrade}) too small after AI sizing. Increase capital or relax bounds.`,
+      });
+    }
+
+    // Build signals from latest scan
+    const { buildSignalsFromLatestScan } = await import('../services/scans/dynamicUniverseService');
+    const rawSignals = await buildSignalsFromLatestScan({
+      minConvictionScore:  activeConviction,
+      minConfidenceScore:  60,
+      allowedBiases:       ['BULLISH'],
+      maxSymbols:          maxPositions * 3,
+    });
+
+    if (!rawSignals || rawSignals.length === 0) {
+      return res.status(400).json({
+        success: false,
+        error: 'No qualifying signals. Run a Daily Scan first, or the AI raised conviction threshold too high — try widening your bounds.',
+      });
+    }
+
+    const signals = rawSignals.slice(0, maxPositions).map((s: any) => ({
+      ...s,
+      exchange:          'PAPER' as const,
+      fixedDollarAmount: adjustedPerTrade,
+    }));
+
+    const config = {
+      enabled:           true,
+      exchange:          'PAPER' as const,
+      maxPositionPct:    100,
+      dailyLossLimit:    capitalTotal * 0.20,
+      maxDrawdownPct:    25,
+      maxOpenPositions:  maxPositions,
+      minConvictionScore: activeConviction,
+      minConfidenceScore: 60,
+      allowedBiases:     ['BULLISH'],
+      stopLossPct:       activeStop,
+      takeProfitPct:     activeTarget,
+      dryRun,
+    };
+
+    const { runTradingCycle } = await import('../services/autotrader/AutoTradeExecutor');
+    let settings = await prisma.userSettings.findUnique({ where: { userId } });
+    if (!settings) settings = await prisma.userSettings.create({ data: { userId } });
+
+    const results = await runTradingCycle(settings.id, config, signals);
+
+    const placed   = results.filter((r: any) => ['FILLED', 'DRY_RUN'].includes(r.status));
+    const rejected = results.filter((r: any) => !['FILLED', 'DRY_RUN'].includes(r.status));
+
+    return res.json({
+      success: true,
+      data: {
+        signalsEvaluated:   results.length,
+        ordersPlaced:       placed.length,
+        ordersRejected:     rejected.length,
+        dryRun,
+        adaptiveParams,
+        activeParams: {
+          stopLossPct:         activeStop,
+          takeProfitPct:       activeTarget,
+          minConvictionScore:  activeConviction,
+          positionSizeMultiplier: activeSizeMult,
+          perTradeAmount:      adjustedPerTrade,
+        },
+        placed:   placed.map((r: any)   => ({ symbol: r.symbol, status: r.status, dollarAmount: r.dollarAmount, entryPrice: r.entryPrice })),
+        rejected: rejected.map((r: any) => ({ symbol: r.symbol, reason: r.reason })),
+      },
+    });
+  } catch (err: any) {
+    console.error('[Alpaca Auto Start]', err?.message);
+    res.status(500).json({ success: false, error: err?.message ?? 'Auto trade failed' });
+  }
+});
+```
+
+### Route 2 — Monitor / Exit Positions
+
+```typescript
+router.post('/auto/monitor', requireAuth, requireAlpacaCredentials, async (req: Request, res: Response) => {
+  try {
+    const userId = (req as any).session?.userId as string;
+    const { dryRun = false } = req.body;
+
+    // Get current adaptive params if available, otherwise use defaults
+    const adapted = getCurrentParams(userId);
+    const stopLossPct   = adapted?.stopLossPct   ?? (req.body.stopLossPct   ?? 3.0);
+    const takeProfitPct = adapted?.takeProfitPct ?? (req.body.takeProfitPct ?? 6.0);
+
+    const positions = await getPositions();
+    if (!positions || positions.length === 0) {
+      return res.json({ success: true, data: { message: 'No open positions', actions: [] } });
+    }
+
+    const actions: any[] = [];
+    for (const pos of positions) {
+      const entry   = parseFloat(pos.avg_entry_price ?? '0');
+      const current = parseFloat(pos.current_price  ?? '0');
+      if (entry <= 0 || current <= 0) continue;
+
+      const pnlPct = ((current - entry) / entry) * 100;
+      let shouldClose = false;
+      let closeReason = '';
+
+      if (pnlPct <= -stopLossPct) {
+        shouldClose = true;
+        closeReason = `Stop loss: ${pnlPct.toFixed(2)}% ≤ -${stopLossPct}%`;
+      } else if (pnlPct >= takeProfitPct) {
+        shouldClose = true;
+        closeReason = `Take profit: +${pnlPct.toFixed(2)}% ≥ +${takeProfitPct}%`;
+      }
+
+      if (shouldClose && !dryRun) {
+        await closePosition(pos.symbol).catch((e: any) =>
+          console.warn(`[Alpaca Monitor] Close ${pos.symbol}:`, e?.message)
+        );
+      }
+
+      actions.push({
+        symbol:  pos.symbol,
+        action:  shouldClose ? (dryRun ? 'WOULD_CLOSE' : 'CLOSED') : 'HOLD',
+        reason:  shouldClose ? closeReason : `Holding at ${pnlPct.toFixed(2)}%`,
+        pnlPct,
+      });
+    }
+
+    return res.json({ success: true, data: { actions, dryRun, stopLossPct, takeProfitPct, usingAdaptive: !!adapted } });
+  } catch (err: any) {
+    res.status(500).json({ success: false, error: err?.message ?? 'Monitor failed' });
+  }
+});
+```
+
+### Route 3 — Today’s Status
+
+```typescript
+router.get('/auto/status', requireAuth, async (req: Request, res: Response) => {
+  try {
+    const userId = (req as any).session?.userId as string;
+    const today = new Date(); today.setHours(0, 0, 0, 0);
+
+    let settings = await prisma.userSettings.findUnique({ where: { userId } });
+    if (!settings) settings = await prisma.userSettings.create({ data: { userId } });
+
+    const logs = await prisma.autoTradeLog.findMany({
+      where: { userSettingsId: settings.id, exchange: 'PAPER', executedAt: { gte: today } },
+      orderBy: { executedAt: 'desc' },
+      take: 20,
+    });
+
+    const placed        = logs.filter((l: any) => ['FILLED', 'DRY_RUN'].includes(l.status));
+    const totalDeployed = placed.reduce((s: number, l: any) => s + (Number(l.dollarAmount) || 0), 0);
+    const adaptiveParams = getCurrentParams(userId);
+
+    return res.json({ success: true, data: { todayTrades: placed.length, totalDeployed, logs, adaptiveParams } });
+  } catch (err: any) {
+    res.status(500).json({ success: false, error: err?.message ?? 'Status failed' });
+  }
+});
+```
+
+### Route 4 — Refresh Adaptive Params on Demand
+
+```typescript
+router.post('/auto/adjust', requireAuth, async (req: Request, res: Response) => {
+  try {
+    const userId = (req as any).session?.userId as string;
+    const { base, bounds } = req.body;
+
+    if (!base || !bounds) {
+      return res.status(400).json({ success: false, error: 'base and bounds are required' });
+    }
+
+    registerUserForAdaptation(userId, base, bounds);
+    const params = await computeAdaptiveParameters(userId, base, bounds);
+    return res.json({ success: true, data: params });
+  } catch (err: any) {
+    res.status(500).json({ success: false, error: err?.message ?? 'Adjust failed' });
+  }
+});
+```
+
+-----
+
+## PHASE 4 — Persist Dry Run Setting
+
+**File**: `server/src/routes/credentials.ts`
+
+Add immediately before `export default router`:
+
+```typescript
+router.patch('/alpaca/settings', requireAuth, async (req: Request, res: Response) => {
+  try {
+    const userId = (req as any).session?.userId;
+    if (!userId) return res.status(401).json({ success: false, error: 'Not authenticated' });
+    const { dryRun, maxDrawdownPct } = req.body;
+    const existing = await credentialService.getAlpacaCredentials(userId);
+    if (!existing) return res.status(400).json({ success: false, error: 'Alpaca not connected' });
+    const updatedDryRun   = typeof dryRun === 'boolean'      ? dryRun         : existing.dryRun;
+    const updatedDrawdown = typeof maxDrawdownPct === 'number'? maxDrawdownPct : existing.maxDrawdownPct;
+    await credentialService.saveAlpacaCredentials(userId, { apiKeyId: existing.apiKeyId, secretKey: existing.secretKey, dryRun: updatedDryRun, maxDrawdownPct: updatedDrawdown });
+    const { setAlpacaRuntimeCredentials } = await import('../services/alpaca/alpacaConfig');
+    setAlpacaRuntimeCredentials({ apiKeyId: existing.apiKeyId, secretKey: existing.secretKey, dryRun: updatedDryRun, maxDrawdownPct: updatedDrawdown });
+    return res.json({ success: true, data: { dryRun: updatedDryRun } });
+  } catch (err) {
+    return res.status(500).json({ success: false, error: (err as Error).message });
+  }
+});
+```
+
+-----
+
+## PHASE 5 — Start Adaptive Loop at Server Startup
+
+**File**: `server/src/index.ts`
+
+Add this import near the other service imports:
+
+```typescript
+import { startAdaptiveLoop } from './services/alpaca/AdaptiveParameterEngine';
+```
+
+Add this call after the server starts (near where other loops are started):
+
+```typescript
+startAdaptiveLoop();
+```
+
+-----
+
+## PHASE 6 — API Client Methods
+
+**File**: `client/src/api/client.ts`
+
+In the `alpaca` section, add:
+
+```typescript
+autoStart: (params: {
+  capitalTotal?: number; maxPositions?: number; capitalPerTrade?: number;
+  stopLossPct?: number; takeProfitPct?: number; minConvictionScore?: number;
+  dryRun?: boolean; useAdaptive?: boolean; bounds?: any;
+}) => post('/alpaca/auto/start', params),
+autoMonitor:  (params: { stopLossPct?: number; takeProfitPct?: number; dryRun?: boolean }) => post('/alpaca/auto/monitor', params),
+autoStatus:   () => get('/alpaca/auto/status'),
+autoAdjust:   (params: { base: any; bounds: any }) => post('/alpaca/auto/adjust', params),
+```
+
+In the `credentials` section, add:
+
+```typescript
+alpacaUpdateSettings: (data: { dryRun?: boolean; maxDrawdownPct?: number }) =>
+  patch('/credentials/alpaca/settings', data),
+```
+
+-----
+
+## PHASE 7 — One-Button UI with Adaptive Parameters
+
+**File**: `client/src/pages/alpaca/AlpacaDashboard.tsx`
+
+### Step A — Add imports at top of file
+
+Ensure these are in the import list:
+
+```tsx
+import { useState, useEffect } from 'react';
+import { CheckCircle2, XCircle, Brain } from 'lucide-react';
+```
+
+### Step B — Add AutoTradingPanel component
+
+Add this entire component before `AlpacaDashboardInner`:
+
+```tsx
+function AutoTradingPanel({ isDryRun: externalDryRun }: { isDryRun: boolean }) {
+  const qc = useQueryClient();
+
+  // ── Base parameters (user-set) ──
+  const [capitalTotal,   setCapitalTotal]   = useState(500);
+  const [maxPositions,   setMaxPositions]   = useState(3);
+  const [stopLossBase,   setStopLossBase]   = useState(3.0);
+  const [takeProfitBase, setTakeProfitBase] = useState(6.0);
+  const [convictionBase, setConvictionBase] = useState(75);
+
+  // ── Bounds (user-set allowed ranges for AI) ──
+  const [stopBounds,   setStopBounds]   = useState({ min: 1.5,  max: 8.0  });
+  const [tpBounds,     setTpBounds]     = useState({ min: 3.0,  max: 20.0 });
+  const [convBounds,   setConvBounds]   = useState({ min: 65,   max: 92   });
+  const [sizeBounds,   setSizeBounds]   = useState({ min: 0.3,  max: 1.0  });
+
+  const [useAdaptive,    setUseAdaptive]    = useState(true);
+  const [dryRun,         setDryRun]         = useState(externalDryRun);
+  const [showParams,     setShowParams]     = useState(false);
+  const [showBounds,     setShowBounds]     = useState(false);
+  const [lastResult,     setLastResult]     = useState<any>(null);
+
+  useEffect(() => { setDryRun(externalDryRun); }, [externalDryRun]);
+
+  const perTrade = Math.floor(capitalTotal / maxPositions);
+  const rrRatio  = (takeProfitBase / stopLossBase).toFixed(1);
+
+  const bounds = {
+    stopLoss:    stopBounds,
+    takeProfit:  tpBounds,
+    conviction:  convBounds,
+    positionPct: sizeBounds,
+  };
+
+  const { data: autoStatus, refetch: refetchStatus } = useQuery({
+    queryKey:      ['alpaca-auto-status'],
+    queryFn:       () => api.alpaca.autoStatus().then((r: any) => r.data),
+    refetchInterval: 30_000,
+  });
+
+  const adapted: any = autoStatus?.adaptiveParams ?? lastResult?.adaptiveParams ?? null;
+
+  const startMutation = useMutation({
+    mutationFn: () => api.alpaca.autoStart({
+      capitalTotal, maxPositions, stopLossPct: stopLossBase,
+      takeProfitPct: takeProfitBase, minConvictionScore: convictionBase,
+      dryRun, useAdaptive, bounds,
+    }),
+    onSuccess: (r: any) => {
+      const d = r?.data ?? r;
+      setLastResult(d);
+      const n = d?.ordersPlaced ?? 0;
+      if (n > 0) toast.success(`${dryRun ? '[DRY RUN] ' : ''}${n} order${n !== 1 ? 's' : ''} placed`);
+      else       toast.info('No qualifying trades found. Run a Daily Scan first.');
+      qc.invalidateQueries({ queryKey: ['alpaca-positions', 'alpaca-status', 'alpaca-auto-status', 'alpaca-orders'] });
+    },
+    onError: (e: any) => toast.error(e?.response?.data?.error ?? e?.message ?? 'Trade cycle failed'),
+  });
+
+  const monitorMutation = useMutation({
+    mutationFn: () => api.alpaca.autoMonitor({ dryRun }),
+    onSuccess: (r: any) => {
+      const closed = (r?.data?.actions ?? []).filter((a: any) => ['CLOSED','WOULD_CLOSE'].includes(a.action));
+      if (closed.length > 0) toast.success(`${dryRun ? '[DRY RUN] Would close' : 'Closed'} ${closed.length} position${closed.length !== 1 ? 's' : ''}`);
+      else                   toast.info('All positions within range — holding');
+      qc.invalidateQueries({ queryKey: ['alpaca-positions', 'alpaca-status'] });
+    },
+    onError: (e: any) => toast.error(e?.response?.data?.error ?? 'Monitor failed'),
+  });
+
+  const refreshAdaptiveMutation = useMutation({
+    mutationFn: () => api.alpaca.autoAdjust({ base: { stopLossPct: stopLossBase, takeProfitPct: takeProfitBase, minConvictionScore: convictionBase }, bounds }),
+    onSuccess: () => { toast.success('AI parameters refreshed'); refetchStatus(); },
+    onError: (e: any) => toast.error(e?.response?.data?.error ?? 'Refresh failed'),
+  });
+
+  const toggleDryMutation = useMutation({
+    mutationFn: (val: boolean) => api.credentials.alpacaUpdateSettings({ dryRun: val }),
+    onSuccess: (_: any, val: boolean) => {
+      setDryRun(val);
+      qc.invalidateQueries({ queryKey: ['alpaca-status'] });
+      toast.success(val ? 'Dry Run ON' : 'Live paper mode — orders go to Alpaca');
+    },
+    onError: (e: any) => toast.error(e?.response?.data?.error ?? 'Failed'),
+  });
+
+  const isRunning = startMutation.isPending || monitorMutation.isPending;
+
+  // Active params (adaptive if enabled, else base)
+  const active = useAdaptive && adapted ? {
+    stop:       adapted.stopLossPct,
+    target:     adapted.takeProfitPct,
+    conviction: adapted.minConvictionScore,
+    sizeMult:   adapted.positionSizeMultiplier,
+  } : {
+    stop:       stopLossBase,
+    target:     takeProfitBase,
+    conviction: convictionBase,
+    sizeMult:   1.0,
+  };
+  const activePerTrade = Math.floor(perTrade * active.sizeMult);
+
+  return (
+    <Card className="p-5 border border-violet-500/20 bg-gradient-to-br from-violet-950/20 to-zinc-900/50">
+      {/* Header */}
+      <div className="flex items-start justify-between mb-4">
+        <div className="flex items-center gap-3">
+          <div className="w-9 h-9 rounded-xl bg-violet-500/20 border border-violet-500/30 flex items-center justify-center flex-shrink-0">
+            <Zap className="w-5 h-5 text-violet-400" />
+          </div>
+          <div>
+            <h2 className="text-base font-bold text-white">Autonomous Trading</h2>
+            <p className="text-xs text-zinc-400">AI analyzes market · picks stocks · adapts parameters · executes trades</p>
+          </div>
+        </div>
+        {(autoStatus?.todayTrades ?? 0) > 0 && (
+          <div className="text-right flex-shrink-0">
+            <p className="text-[10px] text-zinc-500 uppercase tracking-wider">Today</p>
+            <p className="text-sm font-bold text-violet-400">{autoStatus.todayTrades} trades · ${(autoStatus.totalDeployed ?? 0).toFixed(0)}</p>
+          </div>
+        )}
+      </div>
+
+      {/* Capital Summary */}
+      <div className="grid grid-cols-4 gap-2 mb-4">
+        <div className="bg-zinc-900/60 rounded-lg p-2.5 text-center">
+          <p className="text-[10px] text-zinc-500 uppercase tracking-wider mb-1">Capital</p>
+          <p className="text-sm font-bold text-white font-mono">${capitalTotal}</p>
+        </div>
+        <div className="bg-zinc-900/60 rounded-lg p-2.5 text-center">
+          <p className="text-[10px] text-zinc-500 uppercase tracking-wider mb-1">Per Trade</p>
+          <p className={cn('text-sm font-bold font-mono', active.sizeMult < 1 ? 'text-amber-400' : 'text-violet-400')}>
+            ${activePerTrade}
+            {useAdaptive && active.sizeMult !== 1.0 && <span className="text-[9px] ml-1">{active.sizeMult < 1 ? '▼' : '▲'}{Math.abs(Math.round((active.sizeMult - 1) * 100))}%</span>}
+          </p>
+        </div>
+        <div className="bg-zinc-900/60 rounded-lg p-2.5 text-center">
+          <p className="text-[10px] text-zinc-500 uppercase tracking-wider mb-1">Stop</p>
+          <p className={cn('text-sm font-bold font-mono', active.stop !== stopLossBase ? 'text-amber-400' : 'text-red-400')}>
+            -{active.stop}%
+          </p>
+        </div>
+        <div className="bg-zinc-900/60 rounded-lg p-2.5 text-center">
+          <p className="text-[10px] text-zinc-500 uppercase tracking-wider mb-1">Target</p>
+          <p className={cn('text-sm font-bold font-mono', active.target !== takeProfitBase ? 'text-amber-400' : 'text-emerald-400')}>
+            +{active.target}%
+          </p>
+        </div>
+      </div>
+
+      {/* AI REASONING — shown when adaptive is on and params exist */}
+      {useAdaptive && adapted && (
+        <div className="mb-4 rounded-lg bg-violet-950/40 border border-violet-500/20 p-3">
+          <div className="flex items-center gap-2 mb-2">
+            <Brain className="w-3.5 h-3.5 text-violet-400" />
+            <span className="text-xs font-semibold text-violet-300">AI Adjustments Active</span>
+            <span className="ml-auto text-[10px] text-zinc-500">
+              {adapted.regime} · updated {new Date(adapted.adjustedAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
+            </span>
+            <button
+              onClick={() => refreshAdaptiveMutation.mutate()}
+              disabled={refreshAdaptiveMutation.isPending}
+              className="text-zinc-600 hover:text-violet-400 transition-colors ml-1"
+              title="Refresh AI parameters now"
+            >
+              <RefreshCw className={cn('w-3 h-3', refreshAdaptiveMutation.isPending && 'animate-spin')} />
+            </button>
+          </div>
+          <ul className="space-y-1">
+            {(adapted.reasoning ?? []).map((r: string, i: number) => (
+              <li key={i} className="flex items-start gap-1.5 text-[11px] text-zinc-400">
+                <span className="text-violet-500 mt-0.5 flex-shrink-0">·</span>
+                {r}
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
+
+      {useAdaptive && !adapted && (
+        <div className="mb-4 flex items-center gap-2 p-2.5 rounded-lg bg-zinc-900/40 border border-zinc-800 text-xs text-zinc-500">
+          <Brain className="w-3.5 h-3.5 text-zinc-600 flex-shrink-0" />
+          AI parameter adjustment will run on first trade cycle and every 30 min during market hours.
+        </div>
+      )}
+
+      {/* HOW IT WORKS */}
+      <div className="flex items-start gap-2 p-2.5 rounded-lg bg-zinc-900/40 border border-zinc-800 mb-4 text-[11px] text-zinc-500">
+        <Activity className="w-3.5 h-3.5 text-zinc-600 flex-shrink-0 mt-0.5" />
+        <span>Reads the latest daily scan, picks the highest-conviction stocks, and places paper market orders on Alpaca. The AI adjusts stop/target/size within your allowed ranges based on market regime and trade performance. Use <strong className="text-zinc-400">Check Exits</strong> to close positions that hit limits.</span>
+      </div>
+
+      {/* ACTION BUTTONS */}
+      <div className="flex gap-2 mb-3">
+        <button
+          onClick={() => startMutation.mutate()}
+          disabled={isRunning}
+          className={cn(
+            'flex-1 py-3 rounded-xl font-bold text-sm flex items-center justify-center gap-2 transition-all shadow-lg',
+            dryRun
+              ? 'bg-violet-600/30 hover:bg-violet-600/40 border border-violet-500/50 text-violet-300'
+              : 'bg-violet-600 hover:bg-violet-700 text-white shadow-violet-900/40',
+            isRunning && 'opacity-50 cursor-not-allowed',
+          )}
+        >
+          {startMutation.isPending
+            ? <><RefreshCw className="w-4 h-4 animate-spin" /> Analyzing &amp; trading…</>
+            : <><Zap className="w-4 h-4" /> {dryRun ? 'Simulate Trades' : 'Start Trading'}</>
+          }
+        </button>
+        <button
+          onClick={() => monitorMutation.mutate()}
+          disabled={isRunning}
+          title="Check if any positions hit their stop or take-profit"
+          className="px-4 py-3 rounded-xl bg-zinc-800 hover:bg-zinc-700 border border-zinc-700 text-zinc-300 text-sm font-medium transition-colors disabled:opacity-40 flex items-center gap-1.5 flex-shrink-0"
+        >
+          {monitorMutation.isPending ? <RefreshCw className="w-4 h-4 animate-spin" /> : <Activity className="w-4 h-4" />}
+          <span className="hidden sm:inline">Check Exits</span>
+        </button>
+      </div>
+
+      {/* TOGGLES ROW */}
+      <div className="flex items-center gap-4 px-1 mb-3">
+        {/* Dry Run */}
+        <div className="flex items-center gap-2 flex-1">
+          <button
+            onClick={() => toggleDryMutation.mutate(!dryRun)}
+            disabled={toggleDryMutation.isPending}
+            className={cn('relative w-10 h-5 rounded-full transition-colors flex-shrink-0', dryRun ? 'bg-violet-600' : 'bg-emerald-600')}
+          >
+            <span className={cn('absolute top-0.5 w-4 h-4 bg-white rounded-full shadow transition-all', dryRun ? 'left-0.5' : 'left-5')} />
+          </button>
+          <span className="text-xs text-zinc-400">Dry Run</span>
+        </div>
+        {/* AI Adaptive */}
+        <div className="flex items-center gap-2 flex-1">
+          <button
+            onClick={() => setUseAdaptive(v => !v)}
+            className={cn('relative w-10 h-5 rounded-full transition-colors flex-shrink-0', useAdaptive ? 'bg-violet-600' : 'bg-zinc-600')}
+          >
+            <span className={cn('absolute top-0.5 w-4 h-4 bg-white rounded-full shadow transition-all', useAdaptive ? 'left-5' : 'left-0.5')} />
+          </button>
+          <span className="text-xs text-zinc-400">AI Adapt</span>
+          <Brain className={cn('w-3 h-3', useAdaptive ? 'text-violet-400' : 'text-zinc-600')} />
+        </div>
+      </div>
+
+      {!dryRun && (
+        <div className="mb-3 flex items-start gap-2 p-2.5 bg-amber-500/10 border border-amber-500/30 rounded-lg">
+          <AlertTriangle className="w-3.5 h-3.5 text-amber-400 flex-shrink-0 mt-0.5" />
+          <p className="text-[11px] text-amber-400">Live paper mode — orders execute on Alpaca. Still paper money, not real funds.</p>
+        </div>
+      )}
+
+      {/* BASE PARAMETERS */}
+      <button onClick={() => setShowParams(p => !p)} className="w-full flex items-center gap-1.5 text-xs text-zinc-500 hover:text-zinc-300 py-1">
+        {showParams ? <ChevronUp className="w-3.5 h-3.5" /> : <ChevronDown className="w-3.5 h-3.5" />}
+        Base parameters {useAdaptive ? '(AI will adjust within bounds)' : '(used directly)'}
+      </button>
+
+      {showParams && (
+        <div className="space-y-3 pt-3 border-t border-zinc-800 mt-1">
+          {[
+            { label: 'Total Capital ($)',    val: capitalTotal,   set: setCapitalTotal,   min: 100,  max: 10000, step: 100,  fmt: (v: number) => `$${v}` },
+            { label: 'Max Positions',        val: maxPositions,   set: setMaxPositions,   min: 1,    max: 10,    step: 1,    fmt: (v: number) => `${v}` },
+            { label: 'Base Stop Loss (%)',   val: stopLossBase,   set: setStopLossBase,   min: 1,    max: 12,    step: 0.5,  fmt: (v: number) => `-${v}%` },
+            { label: 'Base Take Profit (%)', val: takeProfitBase, set: setTakeProfitBase, min: 2,    max: 30,    step: 0.5,  fmt: (v: number) => `+${v}%` },
+            { label: 'Base Conviction',      val: convictionBase, set: setConvictionBase, min: 50,   max: 92,    step: 1,    fmt: (v: number) => `${v}/100` },
+          ].map(({ label, val, set, min, max, step, fmt }) => (
+            <div key={label}>
+              <div className="flex justify-between mb-1">
+                <label className="text-xs text-zinc-400">{label}</label>
+                <span className="text-xs font-mono text-white">{fmt(val)}</span>
+              </div>
+              <input type="range" min={min} max={max} step={step} value={val}
+                onChange={e => set(Number(e.target.value))} className="w-full accent-violet-500" />
+            </div>
+          ))}
+        </div>
+      )}
+
+      {/* AI BOUNDS */}
+      {useAdaptive && (
+        <>
+          <button onClick={() => setShowBounds(p => !p)} className="w-full flex items-center gap-1.5 text-xs text-zinc-500 hover:text-zinc-300 py-1 mt-1">
+            {showBounds ? <ChevronUp className="w-3.5 h-3.5" /> : <ChevronDown className="w-3.5 h-3.5" />}
+            <Brain className="w-3 h-3 text-violet-500" />
+            AI allowed ranges (bounds)
+          </button>
+          {showBounds && (
+            <div className="pt-3 border-t border-zinc-800 mt-1 space-y-3">
+              <p className="text-[11px] text-zinc-500">The AI will only adjust parameters within these ranges. Set wider ranges for more flexibility, narrower for more control.</p>
+              {[
+                { label: 'Stop Loss range (%)',    min: stopBounds.min,   max: stopBounds.max,   setMin: (v: number) => setStopBounds(b => ({...b, min: v})),   setMax: (v: number) => setStopBounds(b => ({...b, max: v})),   absMin: 1,   absMax: 15,  step: 0.5, color: 'text-red-400'     },
+                { label: 'Take Profit range (%)',  min: tpBounds.min,     max: tpBounds.max,     setMin: (v: number) => setTpBounds(b => ({...b, min: v})),     setMax: (v: number) => setTpBounds(b => ({...b, max: v})),     absMin: 2,   absMax: 30,  step: 0.5, color: 'text-emerald-400' },
+                { label: 'Conviction range',       min: convBounds.min,   max: convBounds.max,   setMin: (v: number) => setConvBounds(b => ({...b, min: v})),   setMax: (v: number) => setConvBounds(b => ({...b, max: v})),   absMin: 55,  absMax: 95,  step: 1,   color: 'text-violet-400'  },
+                { label: 'Position size range (×)',min: sizeBounds.min,   max: sizeBounds.max,   setMin: (v: number) => setSizeBounds(b => ({...b, min: v})),   setMax: (v: number) => setSizeBounds(b => ({...b, max: v})),   absMin: 0.2, absMax: 1.5, step: 0.1, color: 'text-blue-400'    },
+              ].map(({ label, min, max, setMin, setMax, absMin, absMax, step, color }) => (
+                <div key={label}>
+                  <div className="flex justify-between mb-1">
+                    <label className="text-xs text-zinc-400">{label}</label>
+                    <span className={cn('text-xs font-mono', color)}>{min} – {max}</span>
+                  </div>
+                  <div className="flex gap-2">
+                    <div className="flex-1">
+                      <p className="text-[10px] text-zinc-600 mb-0.5">Min</p>
+                      <input type="range" min={absMin} max={max - step} step={step} value={min}
+                        onChange={e => setMin(Number(e.target.value))} className="w-full accent-violet-500" />
+                    </div>
+                    <div className="flex-1">
+                      <p className="text-[10px] text-zinc-600 mb-0.5">Max</p>
+                      <input type="range" min={min + step} max={absMax} step={step} value={max}
+                        onChange={e => setMax(Number(e.target.value))} className="w-full accent-violet-500" />
+                    </div>
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
+        </>
+      )}
+
+      {/* LAST RUN RESULTS */}
+      {lastResult && (
+        <div className="mt-3 pt-3 border-t border-zinc-800">
+          <div className="flex items-center gap-3 text-xs mb-2 flex-wrap">
+            <span className="text-zinc-500">Last run:</span>
+            <span>Evaluated <strong className="text-white">{lastResult.signalsEvaluated}</strong></span>
+            <span>Placed <strong className="text-violet-400">{lastResult.ordersPlaced}</strong></span>
+            {lastResult.ordersRejected > 0 && <span>Skipped <strong className="text-zinc-500">{lastResult.ordersRejected}</strong></span>}
+            {lastResult.dryRun && <span className="text-[10px] text-violet-400 bg-violet-900/40 px-1.5 py-0.5 rounded">DRY RUN</span>}
+            {lastResult.activeParams && (
+              <span className="text-[10px] text-zinc-500 ml-auto">
+                AI used: stop -{lastResult.activeParams.stopLossPct}% / target +{lastResult.activeParams.takeProfitPct}% / conviction {lastResult.activeParams.minConvictionScore}
+              </span>
+            )}
+          </div>
+          {(lastResult.placed ?? []).map((p: any) => (
+            <div key={p.symbol} className="flex items-center gap-2 text-xs bg-zinc-900/60 rounded px-2 py-1.5 mb-1">
+              <CheckCircle2 className="w-3 h-3 text-emerald-400 flex-shrink-0" />
+              <span className="font-mono font-bold text-white w-16">{p.symbol}</span>
+              <span className="text-zinc-400">${Number(p.dollarAmount ?? 0).toFixed(0)}</span>
+              {p.entryPrice && <span className="text-zinc-500">@ ${Number(p.entryPrice).toFixed(2)}</span>}
+            </div>
+          ))}
+          {(lastResult.rejected ?? []).slice(0, 3).map((r: any) => (
+            <div key={r.symbol} className="flex items-center gap-2 text-xs opacity-50 bg-zinc-900/30 rounded px-2 py-1.5 mb-1">
+              <XCircle className="w-3 h-3 text-zinc-500 flex-shrink-0" />
+              <span className="font-mono text-zinc-400 w-16">{r.symbol}</span>
+              <span className="text-zinc-600 truncate text-[10px]">{r.reason}</span>
+            </div>
+          ))}
+        </div>
+      )}
+    </Card>
+  );
+}
+```
+
+### Step C — Add toggleDryRun mutation and clickable header badge to AlpacaDashboardInner
+
+Inside `AlpacaDashboardInner`, after `const qc = useQueryClient()`, add:
+
+```typescript
+const toggleDryRunHeader = useMutation({
+  mutationFn: (val: boolean) => api.credentials.alpacaUpdateSettings({ dryRun: val }),
+  onSuccess: () => qc.invalidateQueries({ queryKey: ['alpaca-status'] }),
+  onError:   (e: any) => toast.error(e?.response?.data?.error ?? 'Failed'),
+});
+```
+
+Replace the existing read-only dry run badge in the header:
+
+```tsx
+// FIND (the existing read-only span):
+<span className={cn('flex items-center gap-1 text-xs px-2 py-0.5 rounded-full', ...)}>
+  <Activity className="w-3 h-3" />
+  {isDryRun ? 'Dry Run Mode' : 'Live Paper'}
+</span>
+
+// REPLACE WITH:
+<button
+  onClick={() => toggleDryRunHeader.mutate(!isDryRun)}
+  disabled={toggleDryRunHeader.isPending}
+  className={cn(
+    'flex items-center gap-1.5 text-xs px-2.5 py-1 rounded-full border transition-all',
+    isDryRun ? 'bg-violet-900/50 border-violet-500/40 text-violet-300 hover:bg-violet-900/70'
+             : 'bg-emerald-900/50 border-emerald-500/40 text-emerald-300 hover:bg-emerald-900/70',
+    toggleDryRunHeader.isPending && 'opacity-50 cursor-not-allowed',
+  )}
+>
+  {toggleDryRunHeader.isPending ? <RefreshCw className="w-3 h-3 animate-spin" /> : <Activity className="w-3 h-3" />}
+  {isDryRun ? 'Dry Run' : 'Live Paper'}
+  <span className={cn('w-1.5 h-1.5 rounded-full', isDryRun ? 'bg-violet-400' : 'bg-emerald-400 animate-pulse')} />
+</button>
+```
+
+### Step D — Insert AutoTradingPanel in the dashboard
+
+After the Stats Row `</div>` and before the Equity Curve Card, add:
+
+```tsx
+<AutoTradingPanel isDryRun={isDryRun} />
+```
+
+-----
+
+## HOW TO USE AFTER THIS IS APPLIED
+
+1. **Run a Daily Scan** → Daily Scan tab → Run Scan (wait 2–5 min). This feeds the AI’s picks.
+1. **Go to Alpaca Paper tab** → the Autonomous Trading panel appears at the top
+1. **Turn Dry Run OFF** (toggle in header or panel)
+1. **Set your capital** with the slider (e.g. $500)
+1. **Leave AI Adapt ON** — it will auto-adjust parameters based on market regime, time of day, and trade performance
+1. Optionally expand “AI allowed ranges” to set how much flexibility the AI has
+1. Click **Start Trading** — the AI picks stocks, adjusts parameters, and places orders
+1. Click **Check Exits** periodically to close positions at stop/target
+
+The AI reasoning panel shows exactly what it changed and why — e.g. “Choppy regime → tightened stops and targets” or “3 consecutive losses → raised conviction bar, reduced size”.
+
+-----
+
+## FILES MODIFIED
+
+```
+server/src/services/autotrader/AutoTradeExecutor.ts      → wire PAPER to Alpaca
+server/src/services/alpaca/AdaptiveParameterEngine.ts    → NEW — adaptive AI engine
+server/src/routes/alpaca.ts                              → /auto/start /auto/monitor /auto/status /auto/adjust
+server/src/routes/credentials.ts                         → PATCH /alpaca/settings
+server/src/index.ts                                      → start adaptive loop
+client/src/api/client.ts                                 → autoStart, autoMonitor, autoStatus, autoAdjust, alpacaUpdateSettings
+client/src/pages/alpaca/AlpacaDashboard.tsx              → AutoTradingPanel, header toggle, Brain icon
+```

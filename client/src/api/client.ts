@@ -271,10 +271,13 @@ export const api = {
       takeProfitPct?: number;
       minConvictionScore?: number;
       dryRun?: boolean;
+      useAdaptive?: boolean;
+      bounds?: any;
     }) => post('/alpaca/auto/start', params),
     autoMonitor: (params: { stopLossPct?: number; takeProfitPct?: number; dryRun?: boolean }) =>
       post('/alpaca/auto/monitor', params),
-    autoStatus: () => get('/alpaca/auto/status'),
+    autoStatus:  () => get('/alpaca/auto/status'),
+    autoAdjust:  (params: { base: any; bounds: any }) => post('/alpaca/auto/adjust', params),
   },
 
   credentials: {

@@ -28,6 +28,7 @@ import { isEncryptionConfigured } from './lib/encryption';
 import { loadDefaultCredentials } from './services/credentials/CredentialLoader';
 import { startLatencyMonitor } from './services/alpaca/LatencyMonitor';
 import { startDrawdownMonitor } from './services/alpaca/alpacaKillswitchService';
+import { startAdaptiveLoop } from './services/alpaca/AdaptiveParameterEngine';
 
 const app = express();
 const PORT = process.env.PORT ?? 3001;
@@ -152,6 +153,7 @@ app.listen(PORT, async () => {
   startIntradayMonitor();
   startLatencyMonitor(5_000);
   startDrawdownMonitor(60_000);
+  startAdaptiveLoop();
 
   setInterval(() => {
     monitorAllOpenPositions().catch((err) => {

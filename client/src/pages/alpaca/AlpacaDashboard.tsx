@@ -6,7 +6,7 @@ import {
   RefreshCw, CheckCircle2, XCircle, Clock, DollarSign, BarChart3,
   Zap, Power, PowerOff, FlaskConical, Play, PauseCircle, StopCircle,
   AlertOctagon, Eye, EyeOff, ChevronDown, ChevronUp, Layers, Timer,
-  Target, ArrowUpRight, ArrowDownRight,
+  Target, ArrowUpRight, ArrowDownRight, Brain,
 } from 'lucide-react';
 import {
   LineChart, Line, XAxis, YAxis, Tooltip, ResponsiveContainer, ReferenceLine, CartesianGrid,
@@ -843,73 +843,105 @@ function DisconnectButton({ onDisconnected }: { onDisconnected: () => void }) {
 
 function AutoTradingPanel({ isDryRun: externalDryRun }: { isDryRun: boolean }) {
   const qc = useQueryClient();
-  const [dryRun, setDryRun]               = useState(externalDryRun);
-  const [capitalTotal, setCapitalTotal]   = useState(500);
-  const [maxPositions, setMaxPositions]   = useState(3);
-  const [stopLossPct, setStopLossPct]     = useState(3.0);
-  const [takeProfitPct, setTakeProfitPct] = useState(6.0);
-  const [minConviction, setMinConviction] = useState(75);
-  const [showParams, setShowParams]       = useState(false);
-  const [lastResult, setLastResult]       = useState<any>(null);
+
+  const [capitalTotal,   setCapitalTotal]   = useState(500);
+  const [maxPositions,   setMaxPositions]   = useState(3);
+  const [stopLossBase,   setStopLossBase]   = useState(3.0);
+  const [takeProfitBase, setTakeProfitBase] = useState(6.0);
+  const [convictionBase, setConvictionBase] = useState(75);
+
+  const [stopBounds,  setStopBounds]  = useState({ min: 1.5, max: 8.0  });
+  const [tpBounds,    setTpBounds]    = useState({ min: 3.0, max: 20.0 });
+  const [convBounds,  setConvBounds]  = useState({ min: 65,  max: 92   });
+  const [sizeBounds,  setSizeBounds]  = useState({ min: 0.3, max: 1.0  });
+
+  const [useAdaptive, setUseAdaptive] = useState(true);
+  const [dryRun,      setDryRun]      = useState(externalDryRun);
+  const [showParams,  setShowParams]  = useState(false);
+  const [showBounds,  setShowBounds]  = useState(false);
+  const [lastResult,  setLastResult]  = useState<any>(null);
 
   useEffect(() => { setDryRun(externalDryRun); }, [externalDryRun]);
 
   const perTrade = Math.floor(capitalTotal / maxPositions);
-  const rrRatio  = (takeProfitPct / stopLossPct).toFixed(2);
+  const rrRatio  = (takeProfitBase / stopLossBase).toFixed(1);
 
-  const { data: autoStatus } = useQuery({
-    queryKey: ['alpaca-auto-status'],
-    queryFn:  () => api.alpaca.autoStatus().then((r: any) => r.data),
+  const bounds = {
+    stopLoss:    stopBounds,
+    takeProfit:  tpBounds,
+    conviction:  convBounds,
+    positionPct: sizeBounds,
+  };
+
+  const { data: autoStatus, refetch: refetchStatus } = useQuery({
+    queryKey:        ['alpaca-auto-status'],
+    queryFn:         () => api.alpaca.autoStatus().then((r: any) => r.data),
     refetchInterval: 30_000,
   });
 
+  const adapted: any = (autoStatus as any)?.adaptiveParams ?? lastResult?.adaptiveParams ?? null;
+
   const startMutation = useMutation({
-    mutationFn: () => api.alpaca.autoStart({ capitalTotal, maxPositions, stopLossPct, takeProfitPct, minConvictionScore: minConviction, dryRun }),
+    mutationFn: () => api.alpaca.autoStart({
+      capitalTotal, maxPositions,
+      stopLossPct: stopLossBase, takeProfitPct: takeProfitBase, minConvictionScore: convictionBase,
+      dryRun, useAdaptive, bounds,
+    }),
     onSuccess: (r: any) => {
       const d = r?.data ?? r;
       setLastResult(d);
       const n = d?.ordersPlaced ?? 0;
-      if (n > 0) {
-        toast.success(`${dryRun ? '[DRY RUN] ' : ''}${n} order${n !== 1 ? 's' : ''} placed`);
-      } else {
-        toast.info('No qualifying trades found. Try running a Daily Scan first.');
-      }
+      if (n > 0) toast.success(`${dryRun ? '[DRY RUN] ' : ''}${n} order${n !== 1 ? 's' : ''} placed`);
+      else       toast.info('No qualifying trades found. Run a Daily Scan first.');
       qc.invalidateQueries({ queryKey: ['alpaca-positions', 'alpaca-status', 'alpaca-auto-status', 'alpaca-orders'] });
     },
     onError: (e: any) => toast.error(e?.response?.data?.error ?? e?.message ?? 'Trade cycle failed'),
   });
 
   const monitorMutation = useMutation({
-    mutationFn: () => api.alpaca.autoMonitor({ stopLossPct, takeProfitPct, dryRun }),
+    mutationFn: () => api.alpaca.autoMonitor({ dryRun }),
     onSuccess: (r: any) => {
-      const actions: any[] = r?.data?.actions ?? [];
-      const closed = actions.filter((a: any) => a.action === 'CLOSED' || a.action === 'WOULD_CLOSE');
-      if (closed.length > 0) {
-        toast.success(`${dryRun ? '[DRY RUN] Would close' : 'Closed'} ${closed.length} position${closed.length !== 1 ? 's' : ''}`);
-      } else {
-        toast.info('All positions within range — holding');
-      }
+      const closed = (r?.data?.actions ?? []).filter((a: any) => ['CLOSED', 'WOULD_CLOSE'].includes(a.action));
+      if (closed.length > 0) toast.success(`${dryRun ? '[DRY RUN] Would close' : 'Closed'} ${closed.length} position${closed.length !== 1 ? 's' : ''}`);
+      else                   toast.info('All positions within range — holding');
       qc.invalidateQueries({ queryKey: ['alpaca-positions', 'alpaca-status'] });
     },
     onError: (e: any) => toast.error(e?.response?.data?.error ?? 'Monitor failed'),
   });
 
-  const toggleDryRunMutation = useMutation({
+  const refreshAdaptiveMutation = useMutation({
+    mutationFn: () => api.alpaca.autoAdjust({ base: { stopLossPct: stopLossBase, takeProfitPct: takeProfitBase, minConvictionScore: convictionBase }, bounds }),
+    onSuccess: () => { toast.success('AI parameters refreshed'); refetchStatus(); },
+    onError: (e: any) => toast.error(e?.response?.data?.error ?? 'Refresh failed'),
+  });
+
+  const toggleDryMutation = useMutation({
     mutationFn: (val: boolean) => api.credentials.alpacaUpdateSettings({ dryRun: val }),
     onSuccess: (_: any, val: boolean) => {
       setDryRun(val);
       qc.invalidateQueries({ queryKey: ['alpaca-status'] });
-      toast.success(val ? 'Dry Run enabled' : 'Live paper mode — orders go to Alpaca');
+      toast.success(val ? 'Dry Run ON' : 'Live paper mode — orders go to Alpaca');
     },
-    onError: (e: any) => toast.error(e?.response?.data?.error ?? 'Failed to update'),
+    onError: (e: any) => toast.error(e?.response?.data?.error ?? 'Failed'),
   });
 
   const isRunning = startMutation.isPending || monitorMutation.isPending;
-  const todayTrades   = (autoStatus as any)?.todayTrades ?? 0;
-  const totalDeployed = (autoStatus as any)?.totalDeployed ?? 0;
+
+  const active = useAdaptive && adapted ? {
+    stop:       adapted.stopLossPct,
+    target:     adapted.takeProfitPct,
+    conviction: adapted.minConvictionScore,
+    sizeMult:   adapted.positionSizeMultiplier,
+  } : {
+    stop:       stopLossBase,
+    target:     takeProfitBase,
+    conviction: convictionBase,
+    sizeMult:   1.0,
+  };
+  const activePerTrade = Math.floor(perTrade * active.sizeMult);
 
   return (
-    <Card className="p-5 border border-violet-500/20 bg-gradient-to-br from-violet-950/20 to-zinc-900/40">
+    <Card className="p-5 border border-violet-500/20 bg-gradient-to-br from-violet-950/20 to-zinc-900/50">
       <div className="flex items-start justify-between mb-4">
         <div className="flex items-center gap-3">
           <div className="w-9 h-9 rounded-xl bg-violet-500/20 border border-violet-500/30 flex items-center justify-center flex-shrink-0">
@@ -917,37 +949,81 @@ function AutoTradingPanel({ isDryRun: externalDryRun }: { isDryRun: boolean }) {
           </div>
           <div>
             <h2 className="text-base font-bold text-white">Autonomous Trading</h2>
-            <p className="text-xs text-zinc-400">Scans markets · picks stocks · executes paper trades</p>
+            <p className="text-xs text-zinc-400">AI analyzes market · picks stocks · adapts parameters · executes trades</p>
           </div>
         </div>
-        {todayTrades > 0 && (
+        {((autoStatus as any)?.todayTrades ?? 0) > 0 && (
           <div className="text-right flex-shrink-0">
-            <p className="text-xs text-zinc-500">Today</p>
-            <p className="text-sm font-bold text-violet-400">{todayTrades} trades · ${totalDeployed.toFixed(0)}</p>
+            <p className="text-[10px] text-zinc-500 uppercase tracking-wider">Today</p>
+            <p className="text-sm font-bold text-violet-400">{(autoStatus as any).todayTrades} trades · ${((autoStatus as any).totalDeployed ?? 0).toFixed(0)}</p>
           </div>
         )}
       </div>
 
-      <div className="grid grid-cols-3 gap-2 mb-4">
-        <div className="bg-zinc-900/60 rounded-lg p-3 text-center">
+      <div className="grid grid-cols-4 gap-2 mb-4">
+        <div className="bg-zinc-900/60 rounded-lg p-2.5 text-center">
           <p className="text-[10px] text-zinc-500 uppercase tracking-wider mb-1">Capital</p>
-          <p className="text-base font-bold text-white font-mono">${capitalTotal}</p>
+          <p className="text-sm font-bold text-white font-mono">${capitalTotal}</p>
         </div>
-        <div className="bg-zinc-900/60 rounded-lg p-3 text-center">
+        <div className="bg-zinc-900/60 rounded-lg p-2.5 text-center">
           <p className="text-[10px] text-zinc-500 uppercase tracking-wider mb-1">Per Trade</p>
-          <p className="text-base font-bold text-violet-400 font-mono">${perTrade}</p>
+          <p className={cn('text-sm font-bold font-mono', active.sizeMult < 1 ? 'text-amber-400' : 'text-violet-400')}>
+            ${activePerTrade}
+            {useAdaptive && active.sizeMult !== 1.0 && <span className="text-[9px] ml-1">{active.sizeMult < 1 ? '▼' : '▲'}{Math.abs(Math.round((active.sizeMult - 1) * 100))}%</span>}
+          </p>
         </div>
-        <div className="bg-zinc-900/60 rounded-lg p-3 text-center">
-          <p className="text-[10px] text-zinc-500 uppercase tracking-wider mb-1">R:R</p>
-          <p className={cn('text-base font-bold font-mono', Number(rrRatio) >= 2 ? 'text-emerald-400' : Number(rrRatio) >= 1.5 ? 'text-yellow-400' : 'text-red-400')}>
-            {rrRatio}:1
+        <div className="bg-zinc-900/60 rounded-lg p-2.5 text-center">
+          <p className="text-[10px] text-zinc-500 uppercase tracking-wider mb-1">Stop</p>
+          <p className={cn('text-sm font-bold font-mono', active.stop !== stopLossBase ? 'text-amber-400' : 'text-red-400')}>
+            -{active.stop}%
+          </p>
+        </div>
+        <div className="bg-zinc-900/60 rounded-lg p-2.5 text-center">
+          <p className="text-[10px] text-zinc-500 uppercase tracking-wider mb-1">Target</p>
+          <p className={cn('text-sm font-bold font-mono', active.target !== takeProfitBase ? 'text-amber-400' : 'text-emerald-400')}>
+            +{active.target}%
           </p>
         </div>
       </div>
 
+      {useAdaptive && adapted && (
+        <div className="mb-4 rounded-lg bg-violet-950/40 border border-violet-500/20 p-3">
+          <div className="flex items-center gap-2 mb-2">
+            <Brain className="w-3.5 h-3.5 text-violet-400" />
+            <span className="text-xs font-semibold text-violet-300">AI Adjustments Active</span>
+            <span className="ml-auto text-[10px] text-zinc-500">
+              {adapted.regime} · updated {new Date(adapted.adjustedAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
+            </span>
+            <button
+              onClick={() => refreshAdaptiveMutation.mutate()}
+              disabled={refreshAdaptiveMutation.isPending}
+              className="text-zinc-600 hover:text-violet-400 transition-colors ml-1"
+              title="Refresh AI parameters now"
+            >
+              <RefreshCw className={cn('w-3 h-3', refreshAdaptiveMutation.isPending && 'animate-spin')} />
+            </button>
+          </div>
+          <ul className="space-y-1">
+            {(adapted.reasoning ?? []).map((r: string, i: number) => (
+              <li key={i} className="flex items-start gap-1.5 text-[11px] text-zinc-400">
+                <span className="text-violet-500 mt-0.5 flex-shrink-0">·</span>
+                {r}
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
+
+      {useAdaptive && !adapted && (
+        <div className="mb-4 flex items-center gap-2 p-2.5 rounded-lg bg-zinc-900/40 border border-zinc-800 text-xs text-zinc-500">
+          <Brain className="w-3.5 h-3.5 text-zinc-600 flex-shrink-0" />
+          AI parameter adjustment will run on first trade cycle and every 30 min during market hours.
+        </div>
+      )}
+
       <div className="flex items-start gap-2 p-2.5 rounded-lg bg-zinc-900/40 border border-zinc-800 mb-4 text-[11px] text-zinc-500">
         <Activity className="w-3.5 h-3.5 text-zinc-600 flex-shrink-0 mt-0.5" />
-        <span>Reads the latest daily scan, picks the top stocks by conviction score, sizes each trade using your parameters, and places market orders on Alpaca paper. Use <strong className="text-zinc-400">Check Exits</strong> to close positions that hit their stop or target.</span>
+        <span>Reads the latest daily scan, picks the highest-conviction stocks, and places paper market orders on Alpaca. The AI adjusts stop/target/size within your allowed ranges based on market regime and trade performance. Use <strong className="text-zinc-400">Check Exits</strong> to close positions that hit limits.</span>
       </div>
 
       <div className="flex gap-2 mb-3">
@@ -955,10 +1031,10 @@ function AutoTradingPanel({ isDryRun: externalDryRun }: { isDryRun: boolean }) {
           onClick={() => startMutation.mutate()}
           disabled={isRunning}
           className={cn(
-            'flex-1 py-3 rounded-xl font-bold text-sm transition-all flex items-center justify-center gap-2 shadow-lg',
+            'flex-1 py-3 rounded-xl font-bold text-sm flex items-center justify-center gap-2 transition-all shadow-lg',
             dryRun
               ? 'bg-violet-600/30 hover:bg-violet-600/40 border border-violet-500/50 text-violet-300'
-              : 'bg-violet-600 hover:bg-violet-700 text-white shadow-violet-900/50',
+              : 'bg-violet-600 hover:bg-violet-700 text-white shadow-violet-900/40',
             isRunning && 'opacity-50 cursor-not-allowed',
           )}
         >
@@ -973,88 +1049,133 @@ function AutoTradingPanel({ isDryRun: externalDryRun }: { isDryRun: boolean }) {
           title="Check if any positions hit their stop or take-profit"
           className="px-4 py-3 rounded-xl bg-zinc-800 hover:bg-zinc-700 border border-zinc-700 text-zinc-300 text-sm font-medium transition-colors disabled:opacity-40 flex items-center gap-1.5 flex-shrink-0"
         >
-          {monitorMutation.isPending
-            ? <RefreshCw className="w-4 h-4 animate-spin" />
-            : <Activity className="w-4 h-4" />
-          }
+          {monitorMutation.isPending ? <RefreshCw className="w-4 h-4 animate-spin" /> : <Activity className="w-4 h-4" />}
           <span className="hidden sm:inline">Check Exits</span>
         </button>
       </div>
 
-      <div className="flex items-center justify-between px-1 mb-3">
-        <div>
-          <p className="text-xs font-medium text-zinc-300">Dry Run Mode</p>
-          <p className="text-[10px] text-zinc-600">When on: simulates trades without sending to Alpaca</p>
+      <div className="flex items-center gap-4 px-1 mb-3">
+        <div className="flex items-center gap-2 flex-1">
+          <button
+            onClick={() => toggleDryMutation.mutate(!dryRun)}
+            disabled={toggleDryMutation.isPending}
+            className={cn('relative w-10 h-5 rounded-full transition-colors flex-shrink-0', dryRun ? 'bg-violet-600' : 'bg-emerald-600')}
+          >
+            <span className={cn('absolute top-0.5 w-4 h-4 bg-white rounded-full shadow transition-all', dryRun ? 'left-0.5' : 'left-5')} />
+          </button>
+          <span className="text-xs text-zinc-400">Dry Run</span>
         </div>
-        <button
-          onClick={() => toggleDryRunMutation.mutate(!dryRun)}
-          disabled={toggleDryRunMutation.isPending}
-          className={cn('relative w-11 h-6 rounded-full transition-colors flex-shrink-0', dryRun ? 'bg-violet-600' : 'bg-emerald-600')}
-        >
-          <span className={cn('absolute top-1 w-4 h-4 bg-white rounded-full shadow transition-all duration-200', dryRun ? 'left-1' : 'left-6')} />
-        </button>
+        <div className="flex items-center gap-2 flex-1">
+          <button
+            onClick={() => setUseAdaptive(v => !v)}
+            className={cn('relative w-10 h-5 rounded-full transition-colors flex-shrink-0', useAdaptive ? 'bg-violet-600' : 'bg-zinc-600')}
+          >
+            <span className={cn('absolute top-0.5 w-4 h-4 bg-white rounded-full shadow transition-all', useAdaptive ? 'left-5' : 'left-0.5')} />
+          </button>
+          <span className="text-xs text-zinc-400">AI Adapt</span>
+          <Brain className={cn('w-3 h-3', useAdaptive ? 'text-violet-400' : 'text-zinc-600')} />
+        </div>
       </div>
 
       {!dryRun && (
         <div className="mb-3 flex items-start gap-2 p-2.5 bg-amber-500/10 border border-amber-500/30 rounded-lg">
           <AlertTriangle className="w-3.5 h-3.5 text-amber-400 flex-shrink-0 mt-0.5" />
-          <p className="text-[11px] text-amber-400">Live paper mode — orders will execute on Alpaca. This is still paper money, not real funds.</p>
+          <p className="text-[11px] text-amber-400">Live paper mode — orders execute on Alpaca. Still paper money, not real funds.</p>
         </div>
       )}
 
-      <button
-        onClick={() => setShowParams(p => !p)}
-        className="w-full flex items-center gap-1.5 text-xs text-zinc-500 hover:text-zinc-300 transition-colors py-1 mb-1"
-      >
+      <button onClick={() => setShowParams(p => !p)} className="w-full flex items-center gap-1.5 text-xs text-zinc-500 hover:text-zinc-300 py-1">
         {showParams ? <ChevronUp className="w-3.5 h-3.5" /> : <ChevronDown className="w-3.5 h-3.5" />}
-        {showParams ? 'Hide parameters' : 'Adjust parameters'}
+        Base parameters {useAdaptive ? '(AI will adjust within bounds)' : '(used directly)'}
       </button>
 
       {showParams && (
-        <div className="space-y-4 pt-3 border-t border-zinc-800">
+        <div className="space-y-3 pt-3 border-t border-zinc-800 mt-1">
           {[
-            { label: 'Total Capital ($)', value: capitalTotal, set: setCapitalTotal, min: 100, max: 10000, step: 100, fmt: (v: number) => `$${v}`, color: 'accent-violet-500' },
-            { label: 'Max Positions', value: maxPositions, set: setMaxPositions, min: 1, max: 10, step: 1, fmt: (v: number) => `${v}`, color: 'accent-violet-500' },
-            { label: 'Stop Loss (%)', value: stopLossPct, set: setStopLossPct, min: 1, max: 15, step: 0.5, fmt: (v: number) => `-${v}%`, color: 'accent-red-500' },
-            { label: 'Take Profit (%)', value: takeProfitPct, set: setTakeProfitPct, min: 2, max: 30, step: 0.5, fmt: (v: number) => `+${v}%`, color: 'accent-emerald-500' },
-            { label: 'Min Conviction Score', value: minConviction, set: setMinConviction, min: 50, max: 95, step: 1, fmt: (v: number) => `${v}/100`, color: 'accent-violet-500' },
-          ].map(({ label, value, set, min, max, step, fmt, color }) => (
+            { label: 'Total Capital ($)',    val: capitalTotal,   set: setCapitalTotal,   min: 100, max: 10000, step: 100,  fmt: (v: number) => `$${v}` },
+            { label: 'Max Positions',        val: maxPositions,   set: setMaxPositions,   min: 1,   max: 10,    step: 1,    fmt: (v: number) => `${v}` },
+            { label: 'Base Stop Loss (%)',   val: stopLossBase,   set: setStopLossBase,   min: 1,   max: 12,    step: 0.5,  fmt: (v: number) => `-${v}%` },
+            { label: 'Base Take Profit (%)', val: takeProfitBase, set: setTakeProfitBase, min: 2,   max: 30,    step: 0.5,  fmt: (v: number) => `+${v}%` },
+            { label: 'Base Conviction',      val: convictionBase, set: setConvictionBase, min: 50,  max: 92,    step: 1,    fmt: (v: number) => `${v}/100` },
+          ].map(({ label, val, set, min, max, step, fmt }) => (
             <div key={label}>
               <div className="flex justify-between mb-1">
                 <label className="text-xs text-zinc-400">{label}</label>
-                <span className="text-xs font-mono text-white">{fmt(value)}</span>
+                <span className="text-xs font-mono text-white">{fmt(val)}</span>
               </div>
-              <input
-                type="range" min={min} max={max} step={step} value={value}
-                onChange={e => set(Number(e.target.value))}
-                className={`w-full ${color}`}
-              />
+              <input type="range" min={min} max={max} step={step} value={val}
+                onChange={e => set(Number(e.target.value))} className="w-full accent-violet-500" />
             </div>
           ))}
         </div>
       )}
 
+      {useAdaptive && (
+        <>
+          <button onClick={() => setShowBounds(p => !p)} className="w-full flex items-center gap-1.5 text-xs text-zinc-500 hover:text-zinc-300 py-1 mt-1">
+            {showBounds ? <ChevronUp className="w-3.5 h-3.5" /> : <ChevronDown className="w-3.5 h-3.5" />}
+            <Brain className="w-3 h-3 text-violet-500" />
+            AI allowed ranges (bounds)
+          </button>
+          {showBounds && (
+            <div className="pt-3 border-t border-zinc-800 mt-1 space-y-3">
+              <p className="text-[11px] text-zinc-500">The AI will only adjust parameters within these ranges. Set wider ranges for more flexibility, narrower for more control.</p>
+              {[
+                { label: 'Stop Loss range (%)',     min: stopBounds.min, max: stopBounds.max, setMin: (v: number) => setStopBounds(b => ({...b, min: v})), setMax: (v: number) => setStopBounds(b => ({...b, max: v})), absMin: 1,   absMax: 15,  step: 0.5, color: 'text-red-400'     },
+                { label: 'Take Profit range (%)',   min: tpBounds.min,   max: tpBounds.max,   setMin: (v: number) => setTpBounds(b => ({...b, min: v})),   setMax: (v: number) => setTpBounds(b => ({...b, max: v})),   absMin: 2,   absMax: 30,  step: 0.5, color: 'text-emerald-400' },
+                { label: 'Conviction range',        min: convBounds.min, max: convBounds.max, setMin: (v: number) => setConvBounds(b => ({...b, min: v})), setMax: (v: number) => setConvBounds(b => ({...b, max: v})), absMin: 55,  absMax: 95,  step: 1,   color: 'text-violet-400'  },
+                { label: 'Position size range (×)', min: sizeBounds.min, max: sizeBounds.max, setMin: (v: number) => setSizeBounds(b => ({...b, min: v})), setMax: (v: number) => setSizeBounds(b => ({...b, max: v})), absMin: 0.2, absMax: 1.5, step: 0.1, color: 'text-blue-400'    },
+              ].map(({ label, min, max, setMin, setMax, absMin, absMax, step, color }) => (
+                <div key={label}>
+                  <div className="flex justify-between mb-1">
+                    <label className="text-xs text-zinc-400">{label}</label>
+                    <span className={cn('text-xs font-mono', color)}>{min} – {max}</span>
+                  </div>
+                  <div className="flex gap-2">
+                    <div className="flex-1">
+                      <p className="text-[10px] text-zinc-600 mb-0.5">Min</p>
+                      <input type="range" min={absMin} max={max - step} step={step} value={min}
+                        onChange={e => setMin(Number(e.target.value))} className="w-full accent-violet-500" />
+                    </div>
+                    <div className="flex-1">
+                      <p className="text-[10px] text-zinc-600 mb-0.5">Max</p>
+                      <input type="range" min={min + step} max={absMax} step={step} value={max}
+                        onChange={e => setMax(Number(e.target.value))} className="w-full accent-violet-500" />
+                    </div>
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
+        </>
+      )}
+
       {lastResult && (
         <div className="mt-3 pt-3 border-t border-zinc-800">
-          <div className="flex items-center gap-3 text-xs mb-2">
+          <div className="flex items-center gap-3 text-xs mb-2 flex-wrap">
             <span className="text-zinc-500">Last run:</span>
             <span>Evaluated <strong className="text-white">{lastResult.signalsEvaluated}</strong></span>
             <span>Placed <strong className="text-violet-400">{lastResult.ordersPlaced}</strong></span>
             {lastResult.ordersRejected > 0 && <span>Skipped <strong className="text-zinc-500">{lastResult.ordersRejected}</strong></span>}
-            {lastResult.dryRun && <span className="ml-auto text-[10px] text-violet-400 bg-violet-900/40 px-1.5 py-0.5 rounded">DRY RUN</span>}
+            {lastResult.dryRun && <span className="text-[10px] text-violet-400 bg-violet-900/40 px-1.5 py-0.5 rounded">DRY RUN</span>}
+            {lastResult.activeParams && (
+              <span className="text-[10px] text-zinc-500 ml-auto">
+                AI used: stop -{lastResult.activeParams.stopLossPct}% / target +{lastResult.activeParams.takeProfitPct}% / conviction {lastResult.activeParams.minConvictionScore}
+              </span>
+            )}
           </div>
           {(lastResult.placed ?? []).map((p: any) => (
             <div key={p.symbol} className="flex items-center gap-2 text-xs bg-zinc-900/60 rounded px-2 py-1.5 mb-1">
               <CheckCircle2 className="w-3 h-3 text-emerald-400 flex-shrink-0" />
-              <span className="font-mono font-bold text-white w-14">{p.symbol}</span>
+              <span className="font-mono font-bold text-white w-16">{p.symbol}</span>
               <span className="text-zinc-400">${Number(p.dollarAmount ?? 0).toFixed(0)}</span>
               {p.entryPrice && <span className="text-zinc-500">@ ${Number(p.entryPrice).toFixed(2)}</span>}
             </div>
           ))}
           {(lastResult.rejected ?? []).slice(0, 3).map((r: any) => (
-            <div key={r.symbol} className="flex items-center gap-2 text-xs bg-zinc-900/30 rounded px-2 py-1.5 mb-1 opacity-50">
+            <div key={r.symbol} className="flex items-center gap-2 text-xs opacity-50 bg-zinc-900/30 rounded px-2 py-1.5 mb-1">
               <XCircle className="w-3 h-3 text-zinc-500 flex-shrink-0" />
-              <span className="font-mono text-zinc-400 w-14">{r.symbol}</span>
+              <span className="font-mono text-zinc-400 w-16">{r.symbol}</span>
               <span className="text-zinc-600 truncate text-[10px]">{r.reason}</span>
             </div>
           ))}
