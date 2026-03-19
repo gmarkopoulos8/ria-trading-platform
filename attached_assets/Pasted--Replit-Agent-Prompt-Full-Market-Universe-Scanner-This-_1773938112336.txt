@@ -1,0 +1,619 @@
+# Replit Agent Prompt — Full Market Universe Scanner
+
+This is an addendum to the previous prompts. Apply on top of everything already built. Do not re-implement, rename, or remove any existing files, models, routes, or services. Extend only.
+
+-----
+
+## WHAT THIS BUILDS
+
+The Opportunity Scanner currently scans a hardcoded list of ~34 tickers. This replaces that with:
+
+1. **A Finnhub-powered pre-screener** that pulls the entire NYSE/NASDAQ common stock list (~8,000 symbols) and all major crypto from Hyperliquid, applies fast liquid filters to cut it to ~200–400 tradable candidates, then runs the full thesis engine on those candidates
+1. **A two-phase scan architecture** — Phase 1 is a fast bulk filter using Finnhub quote data (price, volume, market cap). Phase 2 is deep thesis analysis on the survivors only. This keeps runtime under 20 minutes on the free Finnhub tier
+1. **Intelligent rate limiting** that stays safely within Finnhub’s 60 calls/minute free limit with automatic backoff
+1. **A new `FullUniverseScanner` service** that replaces the static lists in `scanUniverseService.ts` without breaking the existing `buildUniverse()` function (which still works as a fallback)
+1. **A new `FinnhubDataProvider`** for stock quote/history/profile data that the scanner uses instead of Yahoo Finance during bulk scans (Yahoo Finance blocks bulk requests with 429s)
+
+-----
+
+## PHASE 1 — Finnhub Data Provider
+
+**File**: `server/src/services/market/stocks/FinnhubProvider.ts`
+
+This provider implements `IStocksProvider` and is used **exclusively by the scanner** for bulk data fetching. Yahoo Finance remains the primary provider for individual quote lookups and chart history in the UI.
+
+```typescript
+import axios from 'axios';
+import { IStocksProvider, NormalizedQuote, OHLCVBar, SearchResult, Timeframe } from '../types';
+
+const FINNHUB_BASE = 'https://finnhub.io/api/v1';
+const API_KEY = process.env.FINNHUB_API_KEY ?? '';
+
+// Token bucket: 55 calls/minute (safe under the 60/min free limit)
+// Shared across the entire module — all methods draw from the same bucket
+class RateLimiter {
+  private tokens: number;
+  private lastRefill: number;
+  private readonly maxTokens = 55;
+  private readonly refillIntervalMs = 60_000;
+
+  constructor() {
+    this.tokens = this.maxTokens;
+    this.lastRefill = Date.now();
+  }
+
+  async waitForToken(): Promise<void> {
+    const now = Date.now();
+    const elapsed = now - this.lastRefill;
+    if (elapsed >= this.refillIntervalMs) {
+      this.tokens = this.maxTokens;
+      this.lastRefill = now;
+    }
+
+    if (this.tokens > 0) {
+      this.tokens--;
+      return;
+    }
+
+    // Wait for refill
+    const waitMs = this.refillIntervalMs - elapsed + 100; // +100ms buffer
+    console.log(`[FinnhubProvider] Rate limit reached — waiting ${waitMs}ms`);
+    await new Promise((r) => setTimeout(r, waitMs));
+    this.tokens = this.maxTokens - 1;
+    this.lastRefill = Date.now();
+  }
+}
+
+export const finnhubRateLimiter = new RateLimiter(); // exported so other services share it
+```
+
+Implement these methods on `FinnhubProvider`:
+
+**`getStockSymbols(exchange: 'US' | 'NYSE' | 'NASDAQ' = 'US'): Promise<FinnhubSymbol[]>`**
+
+- `GET /stock/symbol?exchange=US&token={key}`
+- Returns array of `{ description, displaySymbol, symbol, type }` — filter to `type === 'Common Stock'` only
+- Cache result for 24 hours (this list changes slowly) using a module-level Map
+- This is a single API call for ~8,000 symbols — very efficient
+
+**`getQuote(symbol: string): Promise<FinnhubQuote | null>`**
+
+- `GET /quote?symbol={symbol}&token={key}`
+- Returns `{ c: currentPrice, h: dayHigh, l: dayLow, o: dayOpen, pc: prevClose, v: volume, t: timestamp }`
+- Always call `await finnhubRateLimiter.waitForToken()` before each HTTP request
+- Return null (not throw) on any error — scanner must never crash on a bad ticker
+
+**`getBasicFinancials(symbol: string): Promise<FinnhubMetric | null>`**
+
+- `GET /stock/metric?symbol={symbol}&metric=all&token={key}`
+- Returns market cap, 52-week high/low, avg volume, beta, P/E ratio
+- Key fields from response: `metric.marketCapitalization` (in millions), `metric.52WeekHigh`, `metric.52WeekLow`, `metric.10DayAverageTradingVolume` (in millions shares/day)
+- Cache per-symbol for 6 hours
+
+**`getCandles(symbol: string, resolution: string, from: number, to: number): Promise<OHLCVBar[]>`**
+
+- `GET /stock/candle?symbol={symbol}&resolution={resolution}&from={from}&to={to}&token={key}`
+- `resolution`: `'D'` for daily, `'W'` for weekly, `'60'` for hourly
+- Response: `{ c[], h[], l[], o[], v[], t[], s }` where `s === 'ok'` means success, `s === 'no_data'` means empty
+- Map to `OHLCVBar[]` — return empty array if `s !== 'ok'`
+
+**`quote(symbol: string): Promise<NormalizedQuote>`** (implements `IStocksProvider`)
+
+- Calls `getQuote()` and maps to `NormalizedQuote`
+- Needed to satisfy the interface — used when `FinnhubProvider` is injected into `ThesisEngine`
+
+**`history(symbol: string, timeframe: Timeframe): Promise<OHLCVBar[]>`** (implements `IStocksProvider`)
+
+- Maps `Timeframe` to `resolution` and date range:
+  - `'1D'` → resolution `'5'`, from = now-1day
+  - `'1W'` → resolution `'60'`, from = now-7days
+  - `'1M'` → resolution `'D'`, from = now-30days
+  - `'3M'` → resolution `'D'`, from = now-90days
+  - `'6M'` → resolution `'D'`, from = now-180days
+  - `'1Y'` → resolution `'W'`, from = now-365days
+- Calls `getCandles()`
+
+**`search(query: string): Promise<SearchResult[]>`** (implements `IStocksProvider`)
+
+- `GET /search?q={query}&token={key}` — Finnhub symbol search
+- Maps results to `SearchResult[]`
+
+-----
+
+## PHASE 2 — Full Universe Scanner Service
+
+**File**: `server/src/services/scans/FullUniverseScanner.ts`
+
+This is the core of the feature. It runs in two phases.
+
+### Phase 1: Symbol Fetch + Fast Filter
+
+```typescript
+export interface FilterCriteria {
+  minPrice: number;           // default: 1.00 (filter penny stocks)
+  maxPrice: number;           // default: 5000 (filter Berkshire-class outliers)
+  minMarketCapM: number;      // default: 300 (million USD — filter micro-caps)
+  minAvgVolumeM: number;      // default: 0.5 (million shares/day avg — filter illiquid)
+  maxAvgVolumeM?: number;     // optional upper bound
+  minPriceChangePct: number;  // default: -50 (filter halted/suspended stocks)
+  maxPriceChangePct: number;  // default: 50 (filter circuit-breaker events)
+  excludeExchanges: string[]; // default: ['PNK', 'OTC', 'GREY'] — OTC markets
+}
+```
+
+**`fetchAndFilterStocks(criteria: FilterCriteria): Promise<CandidateAsset[]>`**:
+
+1. Call `FinnhubProvider.getStockSymbols('US')` — get ~8,000 common stock symbols
+1. Filter immediately to only `displaySymbol` values that match `/^[A-Z]{1,5}$/` — removes warrants (`.WS`), preferred shares (`.PR`), rights (`.RT`), units (`.U`), and foreign ordinary shares (`.`). This cuts to ~4,000 pure common stocks.
+1. **Batch fetch metrics** in batches of 50, with rate limit spacing:
+- For each symbol, call `FinnhubProvider.getBasicFinancials()`
+- Apply filter: `marketCapM >= criteria.minMarketCapM` AND `avgVolume10D >= criteria.minAvgVolumeM`
+- This is the most expensive step — ~80 API calls for 4,000 symbols at 50/batch. Takes ~2 minutes at 55 calls/minute.
+- **Optimization**: cache the full filtered list for 4 hours. If cached, skip this entire step.
+1. **Batch fetch quotes** for survivors (typically ~400–800 stocks pass the market cap + volume filter):
+- Call `FinnhubProvider.getQuote()` for each
+- Apply price filters: `price >= minPrice`, `price <= maxPrice`, daily change within bounds
+- Deduplicate by symbol
+1. Return as `CandidateAsset[]` with `assetClass: 'stock'`
+
+**Important caching strategy**: Store the filtered candidate list in a module-level Map with a 4-hour TTL. The symbol list + metrics barely change intraday. Only quotes need to be fresh.
+
+### Phase 2: Deep Scoring Pre-Filter
+
+Before running the full `ThesisEngine` (which calls Yahoo Finance for history + news for each ticker), apply a **scoring pre-filter** using only Finnhub data to cut the ~400 candidates to the best ~150:
+
+**`prescoreCandidate(symbol: string, quote: FinnhubQuote, metrics: FinnhubMetric): PreScore`**:
+
+Compute a fast pre-score (0–100) using only already-fetched data — no additional API calls:
+
+```typescript
+interface PreScore {
+  symbol: string;
+  score: number;
+  reasons: string[];
+}
+```
+
+Score components (each 0–25, summed):
+
+1. **Momentum score** (0–25): based on today’s price change vs average
+- Change > +3%: 25 | Change +1–3%: 18 | Change +0–1%: 12 | Change -1–0%: 8 | Change < -1%: 3
+1. **Volume surge score** (0–25): today’s volume vs 10-day average
+- Volume ratio > 3x: 25 | 2–3x: 20 | 1.5–2x: 15 | 1–1.5x: 10 | < 1x: 5
+1. **52-week position score** (0–25): where current price sits in the 52-week range
+- Price in top 10% of range: 25 | top 25%: 20 | middle 50%: 12 | bottom 25%: 6 | bottom 10%: 2
+- *Rationale: stocks making new highs tend to continue making new highs*
+1. **Size/liquidity score** (0–25): based on market cap tier
+- Large cap (>$10B): 25 | Mid cap ($2B–$10B): 20 | Small cap ($300M–$2B): 15
+
+Keep only candidates with `prescore >= 45` (the top ~40% by this metric). This reduces the 400+ candidates to ~150, which is a manageable number for full thesis analysis.
+
+### Phase 3: Full Thesis Analysis on Survivors
+
+**`runFullUniverse(opts: FullScanOptions): Promise<RankedResult[]>`**:
+
+```typescript
+interface FullScanOptions {
+  assetScope: 'ALL' | 'STOCKS_ONLY' | 'CRYPTO_ONLY';
+  riskMode: 'ALL' | 'CONSERVATIVE' | 'AGGRESSIVE';
+  filterCriteria?: Partial<FilterCriteria>;
+  maxCandidates?: number;        // default: 200 (cap before thesis analysis)
+  maxFinalResults?: number;      // default: 100 (top results to return)
+  onProgress?: (phase: string, done: number, total: number) => void;
+}
+```
+
+Implementation:
+
+```
+Phase 1: Filter stocks (if scope includes stocks)
+  → fetchAndFilterStocks() → ~400 candidates → prescore → ~150 survivors
+  → Emit onProgress('FILTERING', done, total) as each batch completes
+
+Phase 2: Fetch crypto universe (if scope includes crypto)
+  → Call Hyperliquid getMeta() to get ALL available perp markets
+  → Call getAllMids() to get current prices  
+  → Filter: only coins with mid price > $0.001, available in universe
+  → Augment with CoinGecko market cap data for the top 100 by Hyperliquid OI
+  → Merge with static CRYPTO_UNIVERSE from scanUniverseService (deduplicated)
+
+Phase 3: Sort all candidates by prescore descending, take top maxCandidates
+
+Phase 4: Run rankCandidates() from dailyRankingService with CONCURRENCY = 5
+  → This calls thesisEngine.analyze() for each candidate
+  → thesisEngine uses Yahoo Finance for history (already integrated)  
+  → Emit onProgress('ANALYZING', done, total) continuously
+  → Each thesis analysis takes ~2-4 seconds (3 API calls in parallel)
+  → 150 stocks × 3s avg = ~7.5 minutes at concurrency 5
+
+Phase 5: Return top maxFinalResults sorted by compositeScore
+```
+
+**Concurrency of 5** in the thesis analysis phase is important. Too low (3) makes it too slow. Too high (10+) will hit Yahoo Finance rate limits. 5 is the right balance.
+
+**`getCryptoUniverse(): Promise<CandidateAsset[]>`**:
+
+- Call `getMeta()` from `hyperliquidInfoService` — returns all ~150+ available perp markets on Hyperliquid
+- Call `getAllMids()` — get current prices for all
+- Filter: price > $0.001 (filters dust tokens), name not ending in `-PERP` (normalize symbol)
+- Merge with the static `CRYPTO_UNIVERSE` from `scanUniverseService.ts` (keep all static ones, add new ones from HL)
+- Map HL asset names to CandidateAsset format: `{ ticker: coin, name: coin, assetClass: 'crypto', isCrypto: true }`
+- Deduplicate by ticker
+- Return up to 80 crypto candidates (more than this slows the scan significantly with CoinGecko rate limits)
+
+-----
+
+## PHASE 3 — Update Scan Orchestrator
+
+In `server/src/services/scans/dailyScanOrchestrator.ts`, update `runDailyScan()`:
+
+Replace:
+
+```typescript
+const universe = buildUniverse(assetScope, riskMode);
+```
+
+With:
+
+```typescript
+let universe: CandidateAsset[];
+const useFullUniverse = process.env.ENABLE_FULL_UNIVERSE_SCAN === 'true';
+
+if (useFullUniverse && process.env.FINNHUB_API_KEY) {
+  console.log('[DailyScan] Full universe scan mode active');
+  // runFullUniverse handles its own ranking internally
+  const fullResults = await fullUniverseScanner.runFullUniverse({
+    assetScope,
+    riskMode,
+    maxCandidates: 200,
+    maxFinalResults: 100,
+    onProgress: (phase, done, total) => {
+      if (done % 10 === 0 || done === total) {
+        console.log(`[DailyScan] ${phase}: ${done}/${total}`);
+      }
+    },
+  });
+  // fullResults is already ranked — skip the normal rankCandidates() call
+  await persistRankedResults(scanRun.id, fullResults);
+  // ... mark completed, generate report, etc.
+  return scanRun.id;
+} else {
+  // Fallback: existing static universe
+  console.log('[DailyScan] Static universe mode (set ENABLE_FULL_UNIVERSE_SCAN=true to enable full scan)');
+  universe = buildUniverse(assetScope, riskMode);
+}
+```
+
+The full universe path handles its own flow end-to-end. The static path continues exactly as before. This ensures existing functionality is never broken.
+
+Add `ENABLE_FULL_UNIVERSE_SCAN=true` to Replit Secrets (user must set this manually to opt in).
+
+-----
+
+## PHASE 4 — ThesisEngine Finnhub Integration
+
+The `ThesisEngine.analyze()` currently calls `marketService.history()` which uses Yahoo Finance. For bulk scans with hundreds of tickers, Yahoo Finance starts returning 429 errors after ~50 consecutive requests.
+
+**Solution**: Add a `scanMode` flag to `ThesisEngine.analyze()` that switches the history provider:
+
+In `server/src/services/thesis/ThesisEngine.ts`:
+
+```typescript
+async analyze(ticker: string, assetClass?: string, opts?: { scanMode?: boolean }): Promise<FullThesisResult> {
+  // ... existing cache check ...
+  
+  // Use Finnhub for history in scan mode, Yahoo Finance otherwise
+  const historyProvider = (opts?.scanMode && process.env.FINNHUB_API_KEY && assetClass !== 'crypto')
+    ? () => finnhubProvider.history(ticker, '3M')
+    : () => marketService.history(ticker, '3M', resolvedClass as any);
+  
+  const [quote, historyResult, catalystAnalysis] = await Promise.allSettled([
+    marketService.quote(ticker, resolvedClass as any),
+    historyProvider(),
+    newsService.getCatalysts(ticker, { limit: 15 }),
+  ]);
+  
+  // ... rest unchanged ...
+}
+```
+
+In `dailyRankingService.ts`, update the `rankCandidates()` call to pass `{ scanMode: true }` when called from the full universe scanner.
+
+-----
+
+## PHASE 5 — Scan Progress WebSocket
+
+During a full universe scan (which takes 10–20 minutes), the user needs real-time progress feedback. Add a server-sent events (SSE) endpoint — simpler than WebSocket for one-way progress streaming:
+
+**Add to `server/src/routes/daily-scans.ts`**:
+
+```typescript
+// Store active scan progress for SSE streaming
+const scanProgress = new Map<string, { phase: string; done: number; total: number; log: string[] }>();
+export function updateScanProgress(scanRunId: string, phase: string, done: number, total: number, logMsg?: string) {
+  const existing = scanProgress.get(scanRunId) ?? { phase, done, total, log: [] };
+  existing.phase = phase;
+  existing.done = done;
+  existing.total = total;
+  if (logMsg) existing.log = [...existing.log.slice(-20), logMsg]; // keep last 20 log lines
+  scanProgress.set(scanRunId, existing);
+}
+
+// SSE endpoint
+router.get('/runs/:id/progress', requireAuth, (req, res) => {
+  res.setHeader('Content-Type', 'text/event-stream');
+  res.setHeader('Cache-Control', 'no-cache');
+  res.setHeader('Connection', 'keep-alive');
+  res.flushHeaders();
+
+  const send = () => {
+    const progress = scanProgress.get(req.params.id);
+    if (progress) {
+      res.write(`data: ${JSON.stringify(progress)}\n\n`);
+    }
+  };
+
+  send();
+  const interval = setInterval(send, 2000); // push every 2 seconds
+  req.on('close', () => clearInterval(interval));
+});
+```
+
+Pass `updateScanProgress` as the `onProgress` callback in `dailyScanOrchestrator.ts`.
+
+-----
+
+## PHASE 6 — Updated Daily Scan UI
+
+In `client/src/pages/DailyScan.tsx`, update the scan trigger flow for full universe scans:
+
+**Scan Mode Selector** — add a toggle above the “Run Scan” button:
+
+```
+○ Quick Scan (34 curated tickers, ~2 min)
+● Full Universe (NYSE + all crypto, ~15 min)  ← only shown if FINNHUB connected
+```
+
+Store the selected mode in component state. When “Full Universe” is selected, pass `{ fullUniverse: true }` to the trigger endpoint.
+
+**Live Progress Panel** — when a full universe scan is running, show a progress card instead of a spinner:
+
+```
+┌─────────────────────────────────────────────────────┐
+│  🔍 Full Universe Scan in Progress                  │
+│                                                      │
+│  Phase: ANALYZING CANDIDATES                         │
+│  ████████████░░░░░░░░░░░░░░░  87 / 156              │
+│                                                      │
+│  Recent activity:                                    │
+│  ✓ NVDA — conviction 84, BULLISH                    │
+│  ✓ AAPL — conviction 71, NEUTRAL                    │
+│  ✓ MSFT — conviction 78, BULLISH                    │
+│  → Analyzing AMD...                                  │
+│                                                      │
+│  Elapsed: 4:32  |  Est. remaining: ~8 min           │
+└─────────────────────────────────────────────────────┘
+```
+
+Implementation: use `EventSource` (browser native SSE API, no library needed):
+
+```typescript
+const [progress, setProgress] = useState<ScanProgress | null>(null);
+
+useEffect(() => {
+  if (!activeScanId) return;
+  const es = new EventSource(`/api/scans/runs/${activeScanId}/progress`);
+  es.onmessage = (e) => setProgress(JSON.parse(e.data));
+  es.onerror = () => es.close();
+  return () => es.close();
+}, [activeScanId]);
+```
+
+Show elapsed time using a `useEffect` timer that increments every second.
+
+-----
+
+## PHASE 7 — Opportunity Scanner Page Update
+
+In `client/src/pages/OpportunityScanner.tsx`, the existing scanner page shows curated picks. Update it to:
+
+1. Show a **“Universe Stats”** banner at the top when a full universe scan has been run:
+   
+   ```
+   Last full scan: Today 9:32 AM  |  Screened: 8,247 stocks  |  Passed filters: 156  |  Fully analyzed: 156  |  Top picks: 100
+   ```
+1. Add **filter controls** to the results table (these filter the already-scanned results, not re-trigger a scan):
+- Sector dropdown (All Sectors | Technology | Healthcare | Financials | Energy | …)
+- Asset class filter (All | Stocks | Crypto | ETFs)
+- Min conviction slider (50 → 99)
+- Bias filter (All | Bullish | Bearish | Neutral)
+- Min market cap (Any | $300M+ | $1B+ | $5B+ | $10B+)
+- Min volume (Any | 500K+ | 1M+ | 5M+)
+1. Add a **“New to Watchlist”** button on each result row that calls the existing watchlist API
+1. Show the **sector label** on each result card (it’s already in `RankedResult.sector` from the scan)
+
+-----
+
+## PHASE 8 — New API Route Parameters
+
+In `server/src/routes/daily-scans.ts`, update the trigger endpoint to accept full universe options:
+
+```typescript
+router.post('/trigger', async (req, res) => {
+  const {
+    runType = 'MANUAL',
+    marketSession = 'MARKET_OPEN',
+    assetScope = 'ALL',
+    riskMode = 'ALL',
+    force = false,
+    fullUniverse = false,    // NEW
+    filterCriteria = {},     // NEW — partial FilterCriteria overrides
+  } = req.body ?? {};
+
+  const scanRunId = await runDailyScan({
+    runType,
+    marketSession,
+    assetScope,
+    riskMode,
+    skipDuplicateCheck: force === true,
+    fullUniverse,           // NEW — passed through to orchestrator
+    filterCriteria,         // NEW
+  });
+
+  res.json({ success: true, data: { scanRunId } });
+});
+```
+
+Update `RunScanOptions` in `dailyScanOrchestrator.ts` to include `fullUniverse?: boolean` and `filterCriteria?: Partial<FilterCriteria>`.
+
+-----
+
+## PHASE 9 — Filter Criteria Defaults and Risk Mode Integration
+
+In `FullUniverseScanner.ts`, map `riskMode` to filter criteria adjustments:
+
+```typescript
+function getFilterCriteriaForRiskMode(riskMode: RiskMode, overrides: Partial<FilterCriteria> = {}): FilterCriteria {
+  const defaults: FilterCriteria = {
+    minPrice: 1.00,
+    maxPrice: 5000,
+    minMarketCapM: 300,
+    minAvgVolumeM: 0.5,
+    minPriceChangePct: -50,
+    maxPriceChangePct: 50,
+    excludeExchanges: ['PNK', 'OTC', 'GREY'],
+  };
+
+  if (riskMode === 'CONSERVATIVE') {
+    return { ...defaults, minMarketCapM: 5000, minAvgVolumeM: 2.0, ...overrides };
+    // Conservative: only large caps ($5B+) with high daily volume
+  }
+
+  if (riskMode === 'AGGRESSIVE') {
+    return { ...defaults, minMarketCapM: 100, minAvgVolumeM: 0.2, ...overrides };
+    // Aggressive: allow small caps and lower-volume names
+  }
+
+  return { ...defaults, ...overrides };
+}
+```
+
+Also apply prescore threshold adjustment by risk mode:
+
+- CONSERVATIVE: prescore >= 55 (stricter — only clearly strong candidates)
+- MODERATE: prescore >= 45 (default)
+- AGGRESSIVE: prescore >= 35 (wider net — catches early movers)
+
+-----
+
+## PHASE 10 — Scheduled Full Universe Scans
+
+In `server/src/services/scans/dailyScanScheduler.ts`, update the scheduler to run full universe scans on the scheduled runs (not manual):
+
+```typescript
+// Market open (9:30 AM ET) — full universe if enabled
+if (isMarketOpenTime(nyTime)) {
+  await runDailyScan({
+    runType: 'SCHEDULED',
+    marketSession: 'MARKET_OPEN',
+    scheduledFor: nyTime,
+    fullUniverse: process.env.ENABLE_FULL_UNIVERSE_SCAN === 'true',
+  });
+}
+
+// Premarket (9:00 AM ET) — always quick scan (full scan takes too long pre-market)
+if (isPremarketTime(nyTime)) {
+  await runDailyScan({
+    runType: 'PREMARKET',
+    marketSession: 'PREMARKET',
+    scheduledFor: nyTime,
+    fullUniverse: false,  // always quick in premarket
+  });
+}
+```
+
+The mid-day and pre-close scans (added in previous prompts) should also run as full universe when `ENABLE_FULL_UNIVERSE_SCAN=true`.
+
+-----
+
+## PHASE 11 — Database: Store Universe Stats
+
+Add fields to `DailyScanRun` in `server/prisma/schema.prisma`:
+
+```prisma
+// Add to existing DailyScanRun model:
+totalSymbolsScreened  Int?      // how many raw symbols were fetched from Finnhub
+totalPassedFilter     Int?      // how many passed the market cap/volume filter
+totalPrescored        Int?      // how many passed the prescore threshold
+isFullUniverseScan    Boolean   @default(false)
+filterCriteriaJson    Json?     // the FilterCriteria used
+```
+
+Run `npx prisma migrate dev --name add_universe_scan_fields`.
+
+Update `markRunCompleted()` in `scanPersistenceService.ts` to accept and persist these new fields.
+
+Update the orchestrator to pass them when marking the run complete.
+
+-----
+
+## IMPORTANT IMPLEMENTATION NOTES
+
+**Rate limit math**: At 55 calls/minute (conservative):
+
+- Fetching symbols: 1 call (instant)
+- Fetching metrics for 4,000 symbols in batches: each `getBasicFinancials()` is 1 call → ~73 calls = ~80 seconds with rate limiting. BUT this is cached for 4 hours, so it only happens once per 4-hour window.
+- Fetching quotes for ~400 survivors: ~400 calls = ~7.3 minutes. Also cached for 30 minutes.
+- History for ~150 thesis analyses: 1 call each = ~2.7 minutes
+- Total fresh (no cache): ~10–12 minutes. With 4-hour cache on metrics: ~4–5 minutes.
+
+**Yahoo Finance in thesis analysis**: Each `thesisEngine.analyze()` call fetches 3M history from Yahoo Finance (1 call) plus news. Yahoo Finance has no official rate limit but blocks above ~30 req/min. With CONCURRENCY=5 and each analysis taking 2-4 seconds, the effective rate is ~75–150 req/min across all concurrent analyses — this will trigger 429s. Solutions:
+
+- Add a 500ms delay between each batch in `rankCandidates()` when `scanMode=true`
+- Or use Finnhub’s `getCandles()` instead of Yahoo Finance for history when `scanMode=true` (preferred — use the FinnhubProvider.history() method added in Phase 1)
+- The Finnhub history calls count against the rate limit bucket, so at CONCURRENCY=5 with 5 history calls in-flight, add a per-call delay of `60000ms / 55 calls * 5 concurrent = 5.5s` between batches. This is handled by `finnhubRateLimiter.waitForToken()` which each call awaits individually.
+
+**Symbol filtering regex**: `/^[A-Z]{1,5}$/` filters:
+
+- `BRK.B` (dot = foreign/class shares) ✓ filtered out
+- `AAPLW` (5 letters = warrant) — wait, actually warrants are usually `AAPLWS` or end in `.WS`. Use `/^[A-Z]{1,4}$|^[A-Z]{5}$/` and additionally filter where `type !== 'Common Stock'` per Finnhub’s own type field. Trust Finnhub’s `type === 'Common Stock'` classification as the primary filter.
+
+**Never modify**: `buildUniverse()` in `scanUniverseService.ts`, the existing `ThesisEngine.analyze()` public signature (only add optional `opts` param), `rankCandidates()` public signature, any existing routes or models.
+
+**Error resilience**: Every Finnhub call must be wrapped in try/catch and return a safe default (null / empty array) rather than throwing. A single bad symbol must never abort a scan of 400 symbols. Log errors at `warn` level with the symbol name for debugging.
+
+**Memory**: Scanning 400 tickers × full thesis results × JSON = potentially 50–100MB in-memory during a scan. After persisting to DB and returning results, clear the in-memory results array. The module-level candidate cache (4-hour TTL) should only store `CandidateAsset[]` (lightweight), not full thesis results.
+
+-----
+
+## SECRETS REQUIRED
+
+Add to Replit Secrets:
+
+- `FINNHUB_API_KEY` — required for full universe scanning (already added in previous prompt)
+- `ENABLE_FULL_UNIVERSE_SCAN=true` — opt-in flag to activate this feature
+
+If `FINNHUB_API_KEY` is not set or `ENABLE_FULL_UNIVERSE_SCAN` is not `'true'`, the scanner falls back to the existing static 34-ticker universe silently. No errors thrown, no UI changes — the feature degrades gracefully.
+
+-----
+
+## NEW FILES
+
+```
+server/src/services/market/stocks/FinnhubProvider.ts
+server/src/services/scans/FullUniverseScanner.ts
+```
+
+## MODIFIED FILES
+
+```
+server/src/services/scans/dailyScanOrchestrator.ts  → full universe branch
+server/src/services/scans/dailyScanScheduler.ts     → pass fullUniverse flag
+server/src/services/scans/dailyRankingService.ts    → pass scanMode=true to ThesisEngine
+server/src/services/thesis/ThesisEngine.ts          → add optional scanMode param, swap history provider
+server/src/routes/daily-scans.ts                    → accept fullUniverse param + SSE progress endpoint
+server/src/services/scans/scanPersistenceService.ts → persist new universe stats fields
+server/prisma/schema.prisma                         → add fields to DailyScanRun
+client/src/pages/DailyScan.tsx                      → scan mode toggle + live progress panel
+client/src/pages/OpportunityScanner.tsx             → universe stats banner + filter controls + watchlist button
+```
