@@ -183,7 +183,7 @@ router.get('/regime', async (req: Request, res: Response) => {
   try {
     const { detectRegime } = await import('../services/market/RegimeDetector');
     const regime = await detectRegime();
-    return res.json(regime);
+    return res.json({ success: true, data: regime });
   } catch (err) {
     console.error('[/market/regime]', err);
     return res.status(500).json({ error: 'Failed to detect regime' });
