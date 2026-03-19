@@ -4,8 +4,8 @@ import { sizePosition, computeStopLoss, computeTakeProfit } from '../portfolio/P
 import { getPortfolioState } from '../portfolio/PortfolioStateService';
 import { placeOrder as tosPlaceOrder, type TosOrderRequest } from '../tos/tosExchangeService';
 import { placeOrder as hlPlaceOrder, type OrderRequest as HlOrderRequest } from '../hyperliquid/hyperliquidExchangeService';
-import { TOS_CONFIG } from '../tos/tosConfig';
-import { HL_CONFIG } from '../hyperliquid/hyperliquidConfig';
+import { TOS_CONFIG, isKillswitchActive as isTOSStopped, isPauseActive as isTOSPaused } from '../tos/tosConfig';
+import { HL_CONFIG, isKillswitchActive as isHLStopped, isPauseActive as isHLPaused } from '../hyperliquid/hyperliquidConfig';
 import { getConfig, checkSessionActive } from './ExchangeAutoConfigService';
 
 export type AutoTradeExchange = 'TOS' | 'HYPERLIQUID' | 'PAPER';
@@ -101,6 +101,14 @@ export async function executeAutoTrade(
 
   if (!config.enabled) {
     return { success: false, status: 'BLOCKED', symbol: signal.symbol, exchange, reason: 'Auto-trading is disabled' };
+  }
+
+  // ─── Exchange-level pause / hard stop checks ─────────────────────────────
+  if (exchange === 'HYPERLIQUID' && (isHLPaused() || isHLStopped())) {
+    return { success: false, status: 'BLOCKED', symbol: signal.symbol, exchange, reason: `HL trading ${isHLStopped() ? 'hard-stopped' : 'paused'}` };
+  }
+  if (exchange === 'TOS' && (isTOSPaused() || isTOSStopped())) {
+    return { success: false, status: 'BLOCKED', symbol: signal.symbol, exchange, reason: `TOS trading ${isTOSStopped() ? 'hard-stopped' : 'paused'}` };
   }
 
   // ─── Per-Exchange Config Enforcement ─────────────────────────────────────

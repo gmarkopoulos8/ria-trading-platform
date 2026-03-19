@@ -251,6 +251,17 @@ export default function Dashboard() {
               </div>
             </div>
             <div className="flex items-center gap-2">
+              {hlCred?.isConnected && (() => {
+                const lvl: string = hlStatus?.killswitch?.controlLevel ?? 'ACTIVE';
+                return lvl !== 'ACTIVE' ? (
+                  <span className={cn(
+                    'text-[10px] font-bold px-1.5 py-0.5 rounded font-mono',
+                    lvl === 'HARD_STOP' ? 'bg-red-500/20 text-red-400' : 'bg-amber-500/20 text-amber-400'
+                  )}>
+                    {lvl === 'HARD_STOP' ? '⛔ STOP' : '⏸ PAUSED'}
+                  </span>
+                ) : null;
+              })()}
               {hlCred?.isConnected
                 ? <CheckCircle2 className="h-4 w-4 text-accent-green" />
                 : <WifiOff className="h-4 w-4 text-slate-600" />}
@@ -284,6 +295,17 @@ export default function Dashboard() {
                 </div>
               </div>
               <div className="flex items-center gap-2">
+                {tosCred?.isConnected && (() => {
+                  const lvl: string = tosStatus?.killswitch?.controlLevel ?? 'ACTIVE';
+                  return lvl !== 'ACTIVE' ? (
+                    <span className={cn(
+                      'text-[10px] font-bold px-1.5 py-0.5 rounded font-mono',
+                      lvl === 'HARD_STOP' ? 'bg-red-500/20 text-red-400' : 'bg-amber-500/20 text-amber-400'
+                    )}>
+                      {lvl === 'HARD_STOP' ? '⛔ STOP' : '⏸ PAUSED'}
+                    </span>
+                  ) : null;
+                })()}
                 {tosCred?.isConnected
                   ? <CheckCircle2 className="h-4 w-4 text-accent-green" />
                   : <WifiOff className="h-4 w-4 text-slate-600" />}

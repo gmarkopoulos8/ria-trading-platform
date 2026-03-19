@@ -10,7 +10,7 @@ import {
 } from '../services/hyperliquid/hyperliquidExchangeService';
 import {
   executeKillswitch, resetKillswitch, getKillswitchStatus,
-  startDrawdownMonitor,
+  startDrawdownMonitor, pauseTrading, hardStop, resumeTrading,
 } from '../services/hyperliquid/hyperliquidKillswitchService';
 import {
   HL_CONFIG, isKillswitchActive, hasCredentials, hasSigningKey,
@@ -174,6 +174,50 @@ router.post('/leverage', async (req: Request, res: Response) => {
     res.json({ success: result.success, data: result });
   } catch (err) {
     res.status(500).json({ success: false, error: err instanceof Error ? err.message : 'Failed' });
+  }
+});
+
+// ─── Three-Level Trading Controls ────────────────────────────────
+
+router.post('/controls/pause', async (req: Request, res: Response) => {
+  try {
+    const { reason = 'Manual pause' } = req.body;
+    const result = await pauseTrading(reason, req.session.userId);
+    res.json({ success: true, data: result });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err instanceof Error ? err.message : 'Pause failed' });
+  }
+});
+
+router.post('/controls/hard-stop', async (req: Request, res: Response) => {
+  try {
+    const { reason = 'Manual hard stop' } = req.body;
+    const result = await hardStop(reason, req.session.userId);
+    res.json({ success: true, data: result });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err instanceof Error ? err.message : 'Hard stop failed' });
+  }
+});
+
+router.post('/controls/emergency-exit', async (req: Request, res: Response) => {
+  try {
+    const { reason = 'Emergency exit — manual trigger', confirmText } = req.body;
+    if (confirmText !== 'CONFIRM') {
+      return res.status(400).json({ success: false, error: 'Must send confirmText: "CONFIRM" to execute emergency exit' });
+    }
+    const result = await executeKillswitch(reason, 'manual', req.session.userId);
+    res.json({ success: true, data: result });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err instanceof Error ? err.message : 'Emergency exit failed' });
+  }
+});
+
+router.post('/controls/resume', async (req: Request, res: Response) => {
+  try {
+    await resumeTrading(req.session.userId);
+    res.json({ success: true, message: 'Trading resumed' });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err instanceof Error ? err.message : 'Resume failed' });
   }
 });
 

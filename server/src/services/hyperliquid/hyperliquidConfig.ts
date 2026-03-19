@@ -104,3 +104,26 @@ export function hasCredentials(): boolean {
 export function hasSigningKey(): boolean {
   return !!(HL_CONFIG.PRIVATE_KEY ?? HL_CONFIG.AGENT_PRIVATE_KEY);
 }
+
+// ─── In-memory pause state ────────────────────────────────────────
+
+let _pauseActive = false;
+let _pauseReason: string | null = null;
+let _pauseTime: Date | null = null;
+
+export function isPauseActive(): boolean { return _pauseActive; }
+export function activatePause(reason: string): void {
+  _pauseActive = true;
+  _pauseReason = reason;
+  _pauseTime = new Date();
+  console.info(`[HL-PAUSE] Activated: ${reason}`);
+}
+export function deactivatePause(): void {
+  _pauseActive = false;
+  _pauseReason = null;
+  _pauseTime = null;
+  console.info('[HL-PAUSE] Deactivated');
+}
+export function getPauseState() {
+  return { active: _pauseActive, reason: _pauseReason, activatedAt: _pauseTime };
+}

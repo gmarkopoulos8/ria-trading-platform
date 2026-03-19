@@ -1,6 +1,8 @@
 import { prisma } from '../../lib/prisma';
 import { DEFAULT_AUTO_TRADE_CONFIG, type AutoTradeConfig } from './AutoTradeExecutor';
 import { checkSessionActive, pauseSession } from './ExchangeAutoConfigService';
+import { isKillswitchActive as isHLStopped } from '../hyperliquid/hyperliquidConfig';
+import { isKillswitchActive as isTOSStopped } from '../tos/tosConfig';
 
 let monitorInterval: NodeJS.Timeout | null = null;
 
@@ -44,6 +46,12 @@ async function monitorOpenAutoTrades(userSettingsId: string, config: AutoTradeCo
       const pnl = (currentPrice - log.entryPrice) * (log.quantity ?? 0);
       const hitTP = currentPrice >= log.takeProfit;
       const hitSL = currentPrice <= log.stopLoss;
+
+      // Hard stop blocks auto-exits (user has taken manual control); pause does not
+      const isHardStopped = log.assetClass === 'crypto' || log.assetClass === 'CRYPTO'
+        ? isHLStopped()
+        : isTOSStopped();
+      if (isHardStopped) continue;
 
       if (hitTP || hitSL) {
         const exitReason = hitTP ? 'TAKE_PROFIT' : 'STOP_LOSS';

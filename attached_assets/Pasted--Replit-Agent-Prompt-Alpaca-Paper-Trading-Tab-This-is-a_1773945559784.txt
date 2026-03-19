@@ -1,0 +1,858 @@
+# Replit Agent Prompt — Alpaca Paper Trading Tab
+
+This is an addendum to all previous prompts. Apply on top of everything already built. Do not remove, rename, or break any existing functionality.
+
+-----
+
+## OVERVIEW
+
+Add a full **“Alpaca Paper”** tab to the platform that integrates with Alpaca’s paper trading API at `https://paper-api.alpaca.markets`. This tab mirrors the ThinkorSwim tab in structure and follows all the same patterns (connection card, three-level controls, killswitch, drawdown monitor, order placement) but is purpose-built for testing. It adds five testing-specific features not present on any other tab:
+
+1. **Test Suite** — automated sequence of test orders that verifies all order types work end-to-end
+1. **Strategy Replay** — re-run a past daily scan through the auto trader against Alpaca paper
+1. **Fill Simulator panel** — shows submitted price vs actual fill price for every order (slippage tracking)
+1. **Latency Monitor** — tracks order submission → fill confirmation time in milliseconds
+1. **Paper vs Live Comparison** — split view of Alpaca paper positions alongside live TOS/HL positions
+
+The Alpaca paper URL is hardcoded as `https://paper-api.alpaca.markets` — this tab **never** connects to `https://api.alpaca.markets` (live). This is enforced at the service level, not just the UI.
+
+-----
+
+## ALPACA API REFERENCE
+
+**Base URL (hardcoded, never changes)**: `https://paper-api.alpaca.markets`
+**Market Data URL**: `https://data.alpaca.markets`
+
+**Authentication**: Every request sends two headers:
+
+```
+APCA-API-KEY-ID: {apiKeyId}
+APCA-API-SECRET-KEY: {secretKey}
+```
+
+**Key endpoints used:**
+
+```
+GET  /v2/account                          → account info, equity, buying power, P&L
+GET  /v2/positions                        → all open positions
+DELETE /v2/positions                      → close all positions at market
+DELETE /v2/positions/{symbol}             → close a specific position
+GET  /v2/orders?status=open               → open orders
+GET  /v2/orders?status=all&limit=50       → order history
+POST /v2/orders                           → place order
+DELETE /v2/orders/{order_id}              → cancel order
+DELETE /v2/orders                         → cancel all orders
+GET  /v2/account/portfolio/history        → portfolio value over time (for equity curve)
+GET  /v2/clock                            → market clock (is_open, next_open, next_close)
+GET  /v2/assets/{symbol}                  → asset info (tradable, fractionable, shortable)
+```
+
+**Order placement body** (`POST /v2/orders`):
+
+```json
+{
+  "symbol": "AAPL",
+  "qty": "1",               // or "notional": "100" for dollar-based
+  "side": "buy",            // "buy" | "sell"
+  "type": "market",         // "market" | "limit" | "stop" | "stop_limit" | "trailing_stop"
+  "time_in_force": "day",   // "day" | "gtc" | "ioc" | "fok"
+  "limit_price": "150.00",  // required for limit/stop_limit
+  "stop_price": "148.00",   // required for stop/stop_limit
+  "order_class": "bracket", // "" | "bracket" | "oco" | "oto"
+  "take_profit": { "limit_price": "160.00" },  // for bracket orders
+  "stop_loss": { "stop_price": "145.00" },     // for bracket orders
+  "extended_hours": false,
+  "client_order_id": "riabot-{uuid}"  // always set this for tracking
+}
+```
+
+**Account response fields used:**
+
+- `equity` — total account value
+- `buying_power` — available buying power
+- `cash` — cash balance
+- `last_equity` — equity at last market close (for daily P&L)
+- `daytrade_count` — number of day trades in last 5 days
+- `pattern_day_trader` — PDT flag
+- `trading_blocked` — account restricted
+
+**Position response fields used:**
+
+- `symbol`, `qty`, `side` (`long`/`short`)
+- `avg_entry_price` — average entry price
+- `current_price` — current market price
+- `unrealized_pl` — unrealized P&L in dollars
+- `unrealized_plpc` — unrealized P&L as decimal (multiply by 100 for %)
+- `market_value` — current position value
+
+**Order response fields used:**
+
+- `id` — Alpaca order ID
+- `client_order_id` — our tracking ID
+- `symbol`, `qty`, `side`, `type`, `status`
+- `limit_price`, `stop_price`
+- `filled_qty`, `filled_avg_price`
+- `submitted_at`, `filled_at` — timestamps for latency tracking
+- `legs` — child orders for bracket orders
+
+-----
+
+## PHASE 1 — Alpaca Service Layer
+
+### 1A. Config
+
+**File**: `server/src/services/alpaca/alpacaConfig.ts`
+
+```typescript
+// HARDCODED — never change to live URL
+export const ALPACA_PAPER_URL = 'https://paper-api.alpaca.markets';
+export const ALPACA_DATA_URL  = 'https://data.alpaca.markets';
+
+// Runtime credentials (same pattern as HL/TOS)
+let _runtimeCreds: {
+  apiKeyId: string;
+  secretKey: string;
+  dryRun: boolean;
+  maxDrawdownPct: number;
+} | null = null;
+
+export function setAlpacaRuntimeCredentials(creds: typeof _runtimeCreds): void {
+  _runtimeCreds = creds;
+}
+export function clearAlpacaRuntimeCredentials(): void { _runtimeCreds = null; }
+export function getAlpacaCredentials() { return _runtimeCreds; }
+export function hasAlpacaCredentials(): boolean {
+  return !!(_runtimeCreds?.apiKeyId && _runtimeCreds?.secretKey);
+}
+
+// In-memory pause/stop state (same pattern as HL/TOS)
+let _pauseActive = false;
+let _pauseReason: string | null = null;
+let _killswitchActive = false;
+let _killswitchReason: string | null = null;
+
+export function isPauseActive() { return _pauseActive; }
+export function isKillswitchActive() { return _killswitchActive; }
+export function activatePause(reason: string) { _pauseActive = true; _pauseReason = reason; }
+export function deactivatePause() { _pauseActive = false; _pauseReason = null; }
+export function activateKillswitch(reason: string) { _killswitchActive = true; _killswitchReason = reason; }
+export function deactivateKillswitch() { _killswitchActive = false; _killswitchReason = null; }
+export function getPauseState() { return { active: _pauseActive, reason: _pauseReason }; }
+export function getKillswitchState() { return { active: _killswitchActive, reason: _killswitchReason }; }
+export function getControlLevel(): 'ACTIVE' | 'PAUSE' | 'HARD_STOP' {
+  if (_killswitchActive) return 'HARD_STOP';
+  if (_pauseActive) return 'PAUSE';
+  return 'ACTIVE';
+}
+```
+
+### 1B. Info Service
+
+**File**: `server/src/services/alpaca/alpacaInfoService.ts`
+
+```typescript
+import axios from 'axios';
+import { ALPACA_PAPER_URL, getAlpacaCredentials } from './alpacaConfig';
+
+function authHeaders() {
+  const creds = getAlpacaCredentials();
+  if (!creds) throw new Error('Alpaca credentials not configured');
+  return {
+    'APCA-API-KEY-ID': creds.apiKeyId,
+    'APCA-API-SECRET-KEY': creds.secretKey,
+  };
+}
+
+async function alpacaGet<T>(path: string, params?: Record<string, unknown>): Promise<T> {
+  const { data } = await axios.get<T>(`${ALPACA_PAPER_URL}${path}`, {
+    headers: authHeaders(),
+    params,
+    timeout: 10_000,
+  });
+  return data;
+}
+```
+
+Implement these functions:
+
+**`getAccount(): Promise<AlpacaAccount>`** — `GET /v2/account`
+
+**`getPositions(): Promise<AlpacaPosition[]>`** — `GET /v2/positions`
+
+**`getOpenOrders(): Promise<AlpacaOrder[]>`** — `GET /v2/orders?status=open`
+
+**`getAllOrders(limit = 50): Promise<AlpacaOrder[]>`** — `GET /v2/orders?status=all&limit={limit}`
+
+**`getPortfolioHistory(period = '1M', timeframe = '1D'): Promise<AlpacaPortfolioHistory>`**
+
+- `GET /v2/account/portfolio/history?period={period}&timeframe={timeframe}`
+- Returns `{ timestamp[], equity[], profit_loss[], profit_loss_pct[], base_value }`
+
+**`getMarketClock(): Promise<{ is_open: boolean; next_open: string; next_close: string }>`**
+
+- `GET /v2/clock`
+
+**`getAsset(symbol: string): Promise<AlpacaAsset | null>`**
+
+- `GET /v2/assets/{symbol}` — returns tradability info
+- Catch 404 and return null
+
+**`computeDrawdownPct(account: AlpacaAccount): number`**
+
+- `(account.last_equity - account.equity) / account.last_equity * 100`
+- Return 0 if last_equity is 0 or equity > last_equity
+
+### 1C. Exchange Service
+
+**File**: `server/src/services/alpaca/alpacaExchangeService.ts`
+
+```typescript
+import axios from 'axios';
+import { v4 as uuidv4 } from 'uuid';
+import { ALPACA_PAPER_URL, getAlpacaCredentials, isKillswitchActive, isPauseActive } from './alpacaConfig';
+import { prisma } from '../../lib/prisma';
+```
+
+**Types:**
+
+```typescript
+export interface AlpacaOrderRequest {
+  symbol: string;
+  qty?: number;
+  notional?: number;       // dollar amount instead of qty
+  side: 'buy' | 'sell';
+  type: 'market' | 'limit' | 'stop' | 'stop_limit' | 'trailing_stop';
+  timeInForce?: 'day' | 'gtc' | 'ioc' | 'fok';
+  limitPrice?: number;
+  stopPrice?: number;
+  orderClass?: 'bracket' | 'oco' | 'oto' | '';
+  takeProfitPrice?: number;
+  stopLossPrice?: number;
+  extendedHours?: boolean;
+  userId?: string;
+}
+
+export interface AlpacaOrderResult {
+  success: boolean;
+  isDryRun: boolean;
+  orderId?: string;
+  clientOrderId?: string;
+  submittedAt?: Date;
+  error?: string;
+}
+```
+
+**`placeOrder(req: AlpacaOrderRequest): Promise<AlpacaOrderResult>`**:
+
+- Check `isKillswitchActive()` and `isPauseActive()` — throw if either active
+- Build body with `client_order_id: 'riabot-' + uuidv4().slice(0, 8)` always set
+- For bracket orders: include `order_class: 'bracket'`, `take_profit: { limit_price }`, `stop_loss: { stop_price }`
+- Record `submittedAt = Date.now()` before the HTTP call
+- `POST /v2/orders` with auth headers
+- Record `filledAt` timing — note: Alpaca paper fills asynchronously, so capture submit time here; fill time is tracked via order polling in the latency monitor
+- Persist to `AlpacaOrderLog` table (see Phase 2)
+- If `dryRun: true` in credentials: log but don’t POST, return `isDryRun: true`
+
+**`cancelOrder(orderId: string, userId?: string): Promise<boolean>`**:
+
+- `DELETE /v2/orders/{orderId}`
+- Update `AlpacaOrderLog` status
+
+**`cancelAllOrders(userId?: string): Promise<number>`**:
+
+- `DELETE /v2/orders`
+- Returns count of cancelled orders
+
+**`closePosition(symbol: string, userId?: string): Promise<AlpacaOrderResult>`**:
+
+- `DELETE /v2/positions/{symbol}`
+- Returns the closing order result
+
+**`closeAllPositions(userId?: string): Promise<{ closed: number; errors: string[] }>`**:
+
+- `DELETE /v2/positions`
+- Logs each closure
+
+### 1D. Killswitch Service
+
+**File**: `server/src/services/alpaca/alpacaKillswitchService.ts`
+
+Implement the same three-level pattern as HL/TOS:
+
+**`pauseTrading(reason, userId?)`** — activates pause only
+**`hardStop(reason, userId?)`** — activates killswitch + cancels all orders
+**`executeEmergencyExit(reason, userId?)`** — activates killswitch + cancels all orders + closes all positions
+**`resumeTrading(userId?)`** — deactivates both pause and killswitch
+
+Add a drawdown monitor that runs every 60 seconds and calls `executeEmergencyExit()` if drawdown exceeds `maxDrawdownPct`.
+
+**`getControlStatus()`** — returns full status including controlLevel, pause state, killswitch state, dryRun, monitorRunning.
+
+-----
+
+## PHASE 2 — Database Schema
+
+Add to `server/prisma/schema.prisma`:
+
+```prisma
+model AlpacaOrderLog {
+  id              String   @id @default(cuid())
+  userId          String
+  symbol          String
+  side            String
+  orderType       String
+  qty             String?
+  notional        String?
+  limitPrice      String?
+  stopPrice       String?
+  timeInForce     String   @default("day")
+  orderClass      String?
+  alpacaOrderId   String?
+  clientOrderId   String?
+  status          String   @default("pending")
+  filledQty       String?
+  filledAvgPrice  String?
+  isDryRun        Boolean  @default(true)
+  errorMessage    String?
+  submittedAt     DateTime @default(now())
+  filledAt        DateTime?
+  latencyMs       Int?     // milliseconds from submit to fill
+  submittedPrice  Float?   // price at time of submission (for slippage calc)
+  filledPrice     Float?   // actual fill price
+  slippagePct     Float?   // (filledPrice - submittedPrice) / submittedPrice * 100
+  scanRunId       String?  // populated when order came from a strategy replay
+  metadata        Json?
+
+  @@index([userId])
+  @@index([symbol])
+  @@index([submittedAt])
+}
+
+model AlpacaKillEvent {
+  id        String   @id @default(cuid())
+  userId    String?
+  reason    String
+  trigger   String   // 'pause' | 'hard_stop' | 'emergency_exit' | 'drawdown' | 'manual'
+  level     String
+  snapshot  Json?
+  createdAt DateTime @default(now())
+
+  @@map("alpaca_kill_events")
+}
+```
+
+Also add `alpacaApiKeyId` and `encryptedAlpacaSecret` to `ExchangeCredential` model:
+
+```prisma
+// Add to existing ExchangeCredential model:
+alpacaApiKeyId      String?   // stored plaintext (key ID is not sensitive alone)
+encryptedAlpacaSecret String? // encrypted secret key
+alpacaDryRun        Boolean   @default(true)
+alpacaMaxDrawdownPct Float    @default(8.0)
+```
+
+Run `npx prisma migrate dev --name add_alpaca_integration`.
+
+-----
+
+## PHASE 3 — Credential Service Update
+
+In `server/src/services/credentials/CredentialService.ts`, add:
+
+**`getAlpacaCredentials(userId: string)`** — loads from DB, decrypts secret
+**`saveAlpacaCredentials(userId, { apiKeyId, secretKey, dryRun?, maxDrawdownPct? })`** — encrypts secret, upserts
+**`deleteAlpacaCredentials(userId)`** — removes from DB
+
+In `server/src/services/credentials/CredentialLoader.ts`, load Alpaca credentials at startup using the same first-user pattern as HL/TOS.
+
+-----
+
+## PHASE 4 — API Routes
+
+**File**: `server/src/routes/alpaca.ts`
+
+```
+GET  /api/alpaca/status              → account, positions count, order count, control status
+GET  /api/alpaca/account             → full account detail
+GET  /api/alpaca/positions           → open positions
+GET  /api/alpaca/orders              → open orders
+GET  /api/alpaca/orders/history      → all orders (last 50)
+GET  /api/alpaca/portfolio/history   → equity curve data
+POST /api/alpaca/orders              → place order
+DELETE /api/alpaca/orders/:id        → cancel order
+DELETE /api/alpaca/orders            → cancel all orders
+DELETE /api/alpaca/positions/:symbol → close position
+POST /api/alpaca/controls/pause      → pause trading
+POST /api/alpaca/controls/hard-stop  → hard stop
+POST /api/alpaca/controls/emergency-exit → emergency exit (requires confirmText: "CONFIRM")
+POST /api/alpaca/controls/resume     → resume trading
+GET  /api/alpaca/order-log           → AlpacaOrderLog from DB (for slippage/latency data)
+GET  /api/alpaca/clock               → market clock
+```
+
+Also add credential routes to `server/src/routes/credentials.ts`:
+
+```
+POST /api/credentials/alpaca/connect    → save + verify Alpaca credentials
+POST /api/credentials/alpaca/disconnect → delete credentials
+GET  /api/credentials/alpaca/status     → connection status
+```
+
+**Connect route** (`POST /api/credentials/alpaca/connect`):
+
+```typescript
+// Body: { apiKeyId, secretKey, dryRun?, maxDrawdownPct? }
+// Validate: call GET /v2/account with provided credentials
+// If valid: save encrypted, load runtime creds, return account equity
+// If invalid: return 400 with "Invalid API credentials — check your key and secret"
+```
+
+Register in `server/src/index.ts`:
+
+```typescript
+import alpacaRoutes from './routes/alpaca';
+app.use('/api/alpaca', alpacaRoutes);
+```
+
+Add Alpaca methods to `client/src/api/client.ts` in an `alpaca` section.
+
+-----
+
+## PHASE 5 — Testing Features (Backend)
+
+### 5A. Test Suite Service
+
+**File**: `server/src/services/alpaca/AlpacaTestSuite.ts`
+
+```typescript
+export interface TestCase {
+  name: string;
+  description: string;
+  status: 'pending' | 'running' | 'passed' | 'failed' | 'skipped';
+  durationMs?: number;
+  error?: string;
+  result?: unknown;
+}
+
+export interface TestSuiteResult {
+  runId: string;
+  startedAt: Date;
+  completedAt?: Date;
+  passed: number;
+  failed: number;
+  skipped: number;
+  tests: TestCase[];
+}
+```
+
+**`runTestSuite(userId: string): Promise<TestSuiteResult>`**
+
+Runs these tests in sequence, each as its own `TestCase`. All orders use `qty: 1` for minimal capital usage. Wait up to 10 seconds for each fill before marking as timed out:
+
+1. **“Market Buy”** — Buy 1 share of SPY at market. Expect: order status transitions to `filled`.
+1. **“Market Sell”** — Sell the 1 share of SPY from test 1 at market. Expect: filled, position closed.
+1. **“Limit Order Place”** — Place a limit buy of AAPL 10% below current price (won’t fill). Expect: order status `new` or `pending_new`.
+1. **“Limit Order Cancel”** — Cancel the order from test 3. Expect: status becomes `canceled`.
+1. **“Bracket Order”** — Buy 1 share of MSFT at market with bracket: take profit +5%, stop loss -3%. Expect: parent order filled, two child orders (limit sell + stop sell) appear as legs.
+1. **“Bracket Order Close”** — Cancel the bracket and close the MSFT position. Expect: position flat.
+1. **“Fractional Order”** — Buy $10 notional of AAPL (fractional). Expect: filled with fractional qty.
+1. **“Account Balance Check”** — Verify equity > 0 and buying_power > 0. Expect: both values positive.
+1. **“Position Count Verification”** — After tests 1-7 close all positions, verify position count is 0. Expect: empty positions array.
+1. **“Latency Check”** — Place and immediately cancel a market order. Measure round-trip time. Expect: < 5000ms. Record actual latency.
+
+For each test: record `durationMs` as the time from start to completion. If a test throws, catch the error, mark as `failed`, store the error message, and continue to the next test. Never abort the suite on a single failure.
+
+Add route: `POST /api/alpaca/test-suite/run` → runs the suite, returns `TestSuiteResult`
+Add route: `GET /api/alpaca/test-suite/last` → returns the most recent result from a module-level variable
+
+### 5B. Strategy Replay Service
+
+**File**: `server/src/services/alpaca/StrategyReplayService.ts`
+
+```typescript
+export interface ReplayOptions {
+  scanRunId: string;          // which past scan to replay
+  userId: string;
+  maxPositions?: number;      // default 3
+  minConviction?: number;     // default 75
+  capitalPerTrade?: number;   // default 500 (USD notional)
+  useCurrentPrices?: boolean; // true = use today's prices, false = use prices from scan date
+}
+
+export interface ReplayResult {
+  replayId: string;
+  scanRunId: string;
+  scanDate: Date;
+  candidatesEvaluated: number;
+  ordersPlaced: number;
+  ordersSkipped: number;
+  skippedReasons: Array<{ symbol: string; reason: string }>;
+  placedOrders: Array<{ symbol: string; orderId: string; price: number; conviction: number }>;
+  startedAt: Date;
+}
+```
+
+**`runStrategyReplay(opts: ReplayOptions): Promise<ReplayResult>`**:
+
+1. Load the `DailyScanRun` and its `DailyScanResult` records for `opts.scanRunId`
+1. Verify the scan is completed — error if not
+1. Filter results: `convictionScore >= minConviction`, `bias === 'BULLISH'`, `recommendedAction IN ['STRONG_BUY', 'BUY']`
+1. Sort by `compositeScore` descending
+1. Take top `maxPositions` candidates
+1. For each candidate:
+- Check Alpaca account has enough buying power
+- Verify asset is tradable via `getAsset(symbol)` — skip if not tradable or not fractionable when using notional
+- Place a notional buy order via `alpacaExchangeService.placeOrder()` with `notional: opts.capitalPerTrade`, `type: 'market'`
+- Tag the `AlpacaOrderLog` with `scanRunId` for tracking
+1. Return the full `ReplayResult`
+
+Add route: `POST /api/alpaca/replay` → `{ scanRunId, options... }`
+Add route: `GET /api/alpaca/replay/history` → list past replays from DB (query `AlpacaOrderLog` where `scanRunId IS NOT NULL`, group by `scanRunId`)
+
+### 5C. Latency Monitor
+
+**File**: `server/src/services/alpaca/LatencyMonitor.ts`
+
+A polling service that checks recently submitted orders and measures time to fill:
+
+```typescript
+interface LatencyRecord {
+  orderId: string;
+  symbol: string;
+  submittedAt: Date;
+  filledAt: Date | null;
+  latencyMs: number | null;
+  status: string;
+}
+```
+
+**`startLatencyMonitor(intervalMs = 5000): void`**
+
+- Every 5 seconds: fetch all orders from `AlpacaOrderLog` where `status = 'submitted'` and `filledAt IS NULL` and `submittedAt > now - 5 minutes`
+- For each, call `GET /v2/orders/{alpacaOrderId}` to check current status
+- If `status === 'filled'` and `filled_at` is present:
+  - Compute `latencyMs = new Date(filled_at).getTime() - submittedAt.getTime()`
+  - Update `AlpacaOrderLog`: set `filledAt`, `latencyMs`, `filledPrice = filled_avg_price`
+  - Compute `slippagePct = ((filledPrice - submittedPrice) / submittedPrice) * 100`
+  - Update `slippagePct` in DB
+
+**`getLatencyStats(userId: string): Promise<LatencyStats>`**:
+
+```typescript
+interface LatencyStats {
+  avgLatencyMs: number;
+  minLatencyMs: number;
+  maxLatencyMs: number;
+  p95LatencyMs: number;
+  totalOrdersTracked: number;
+  avgSlippagePct: number;
+  lastUpdated: Date;
+}
+```
+
+Queries `AlpacaOrderLog` where `latencyMs IS NOT NULL` and `userId = userId`.
+
+Add route: `GET /api/alpaca/latency/stats`
+
+-----
+
+## PHASE 6 — Frontend: Alpaca Dashboard Page
+
+**File**: `client/src/pages/alpaca/AlpacaDashboard.tsx`
+
+This is a full-featured page styled identically to `HyperliquidDashboard.tsx` and `TosDashboard.tsx`. It follows all the same patterns: loading state, connection check, status cards, control panel.
+
+### 6A. Connection Card (shown when not connected)
+
+```tsx
+function AlpacaConnectCard({ onConnected }: { onConnected: () => void }) {
+  // Two inputs: API Key ID and Secret Key
+  // Network: hardcoded "Paper Trading" badge — no toggle (never live)
+  // "Connect & Verify" button
+  // Same security note as HL/TOS cards
+  // On success: show account equity confirmation
+}
+```
+
+### 6B. Main Dashboard Layout (when connected)
+
+**Header row:**
+
+```
+Alpaca Paper Trading    [PAPER badge]    [⏸ Pause] [🛑 Hard Stop]
+```
+
+No account switcher needed — paper account is always the same one.
+
+**Stat cards row** (4 cards):
+
+- Portfolio Value (equity)
+- Today’s P&L (equity - last_equity, green/red)
+- Buying Power
+- Open Positions count
+
+**Market clock badge** — shows “MARKET OPEN” (green) or “MARKET CLOSED” (grey) + time to next open/close. Updates every 60 seconds.
+
+**Equity curve chart** — uses `GET /api/alpaca/portfolio/history?period=1M&timeframe=1D`. Recharts `AreaChart` with the same styling as Performance Lab. Shows portfolio value over the last month.
+
+**Positions table** — same structure as TOS positions table:
+
+- Symbol, side (LONG/SHORT badge), qty, avg entry, current price, unrealized P&L (green/red), market value
+- “Close” button per position → calls `DELETE /api/alpaca/positions/{symbol}`
+
+**Open orders table** — symbol, type, side, qty, limit/stop price, status, submitted time
+
+- “Cancel” button per order
+
+**Three-level controls card** — identical to HL/TOS control panel with Pause, Hard Stop, Emergency Exit
+
+**Order history table** — last 25 orders from `GET /api/alpaca/orders/history`
+
+### 6C. Testing Features Panel
+
+Add a dedicated **“Testing Tools”** section at the bottom of the page, visually separated by a divider with a `FlaskConical` icon and “Testing Tools” label.
+
+#### Test Suite Card
+
+```tsx
+function TestSuiteCard() {
+  // Shows list of all 10 test cases with status icons:
+  // ● grey = pending, ⟳ blue spin = running, ✓ green = passed, ✗ red = failed
+  // "Run Test Suite" button → POST /api/alpaca/test-suite/run
+  // While running: disable button, show progress
+  // Results summary: "8/10 passed · 1 failed · 1 skipped"
+  // Expandable row for each test showing description + error if failed
+  // Last run timestamp
+  // Elapsed time per test in ms
+}
+```
+
+#### Strategy Replay Card
+
+```tsx
+function StrategyReplayCard() {
+  // Dropdown: "Select a past scan run" — fetches from GET /api/scans/runs
+  // Shows scan date and top ticker from the selected run
+  // Config inputs:
+  //   - Min Conviction (slider, default 75)
+  //   - Max Positions (1-5, default 3)
+  //   - Capital Per Trade ($, default 500)
+  // "Run Replay" button → POST /api/alpaca/replay
+  // Results panel shows after run:
+  //   - Candidates evaluated, orders placed, orders skipped
+  //   - Table of placed orders: symbol, conviction, entry price
+  //   - Table of skipped: symbol, reason
+  // History: last 3 replays shown as collapsible rows
+}
+```
+
+#### Fill Simulator / Slippage Panel
+
+```tsx
+function FillSimulatorCard() {
+  // Table of recent orders with slippage data from AlpacaOrderLog:
+  // Symbol | Submitted Price | Fill Price | Slippage % | Latency | Status
+  // Color-code slippage: green < 0.1%, yellow 0.1-0.5%, red > 0.5%
+  // Summary row: "Avg slippage: 0.12% · Avg latency: 847ms"
+  // "Refresh" button
+  // Note: "Slippage tracking requires orders to fill. Pending orders show — until filled."
+}
+```
+
+#### Latency Monitor Card
+
+```tsx
+function LatencyCard() {
+  // Stats from GET /api/alpaca/latency/stats:
+  //   Avg: Xms | Min: Xms | Max: Xms | P95: Xms
+  // Small bar chart (Recharts BarChart) showing last 10 order latencies
+  // Color coding: green < 500ms, yellow 500-2000ms, red > 2000ms
+  // Total orders tracked count
+  // "This measures paper trading fill simulation speed, not live exchange latency."
+}
+```
+
+#### Paper vs Live Comparison Panel
+
+```tsx
+function PaperVsLiveComparisonCard() {
+  // Two columns side by side: "Alpaca Paper" | "Live Accounts"
+  // Alpaca Paper column:
+  //   - Fetches from GET /api/alpaca/positions
+  //   - Lists each position: symbol, side, unrealized P&L
+  //   - Total paper P&L at bottom
+  // Live Accounts column:
+  //   - Fetches from GET /api/autotrader/portfolio
+  //   - Shows TOS positions and HL positions combined
+  //   - Total live unrealized P&L at bottom
+  // If no live accounts connected: shows "Connect TOS or Hyperliquid to compare"
+  // Refresh button — refetches both
+  // Note at bottom: "Paper positions use simulated fills. Live P&L reflects real market prices."
+}
+```
+
+-----
+
+## PHASE 7 — Navigation
+
+### 7A. Sidebar
+
+In `client/src/components/layout/Sidebar.tsx`, add after the Thinkorswim nav item:
+
+```typescript
+{ 
+  path: '/alpaca', 
+  label: 'Alpaca Paper', 
+  icon: FlaskConical, 
+  description: 'Paper trading · test environment' 
+}
+```
+
+Import `FlaskConical` from `lucide-react`.
+
+### 7B. Router
+
+In `client/src/App.tsx`, add:
+
+```tsx
+import AlpacaDashboard from './pages/alpaca/AlpacaDashboard';
+// ...
+<Route path="alpaca" element={<AlpacaDashboard />} />
+```
+
+### 7C. Dashboard Status Card
+
+In `client/src/pages/Dashboard.tsx`, add a third exchange status card for Alpaca Paper below the HL and TOS cards:
+
+```tsx
+<Card className="p-4">
+  <div className="flex items-center justify-between mb-3">
+    <div className="flex items-center gap-2">
+      <div className={cn('w-2 h-2 rounded-full', alpacaConnected ? 'bg-accent-blue animate-pulse' : 'bg-slate-600')} />
+      <span className="text-sm font-semibold text-white">Alpaca Paper</span>
+      <span className="text-xs px-1.5 py-0.5 rounded bg-accent-blue/20 text-accent-blue font-mono text-[10px] font-bold">PAPER</span>
+    </div>
+    <button onClick={() => navigate('/alpaca')} className="text-xs text-slate-500 hover:text-accent-blue flex items-center gap-1">
+      {alpacaConnected ? 'Manage' : 'Connect'} <ChevronRight className="h-3 w-3" />
+    </button>
+  </div>
+  {alpacaConnected ? (
+    <div className="space-y-2">
+      <div className="flex justify-between text-xs">
+        <span className="text-slate-500">Portfolio Value</span>
+        <span className="text-white font-mono font-semibold">{/* equity */}</span>
+      </div>
+      <div className="flex justify-between text-xs">
+        <span className="text-slate-500">Today's P&L</span>
+        <span className={cn('font-mono', dailyPnl >= 0 ? 'text-accent-green' : 'text-red-400')}>{/* P&L */}</span>
+      </div>
+    </div>
+  ) : (
+    <div className="flex items-center gap-2 py-2">
+      <FlaskConical className="h-4 w-4 text-slate-600" />
+      <span className="text-xs text-slate-500">Not connected · paper testing environment</span>
+    </div>
+  )}
+</Card>
+```
+
+-----
+
+## PHASE 8 — Credentials UI in Settings
+
+In `client/src/pages/Settings.tsx`, add Alpaca Paper to the notification/connections section:
+
+Simple two-field form — API Key ID and Secret Key — same encrypted storage pattern as HL. No OAuth flow needed.
+
+Add to `client/src/api/client.ts`:
+
+```typescript
+alpaca: {
+  status: () => apiGet('/alpaca/status'),
+  account: () => apiGet('/alpaca/account'),
+  positions: () => apiGet('/alpaca/positions'),
+  orders: () => apiGet('/alpaca/orders'),
+  orderHistory: (limit?: number) => apiGet(`/alpaca/orders/history${limit ? `?limit=${limit}` : ''}`),
+  portfolioHistory: (period?: string) => apiGet(`/alpaca/portfolio/history${period ? `?period=${period}` : ''}`),
+  placeOrder: (data: unknown) => apiPost('/alpaca/orders', data),
+  cancelOrder: (id: string) => apiDelete(`/alpaca/orders/${id}`),
+  cancelAllOrders: () => apiDelete('/alpaca/orders'),
+  closePosition: (symbol: string) => apiDelete(`/alpaca/positions/${symbol}`),
+  pause: (reason?: string) => apiPost('/alpaca/controls/pause', { reason }),
+  hardStop: (reason?: string) => apiPost('/alpaca/controls/hard-stop', { reason }),
+  emergencyExit: (confirmText: string) => apiPost('/alpaca/controls/emergency-exit', { confirmText }),
+  resume: () => apiPost('/alpaca/controls/resume', {}),
+  orderLog: () => apiGet('/alpaca/order-log'),
+  clock: () => apiGet('/alpaca/clock'),
+  latencyStats: () => apiGet('/alpaca/latency/stats'),
+  runTestSuite: () => apiPost('/alpaca/test-suite/run', {}),
+  lastTestSuite: () => apiGet('/alpaca/test-suite/last'),
+  runReplay: (data: unknown) => apiPost('/alpaca/replay', data),
+  replayHistory: () => apiGet('/alpaca/replay/history'),
+},
+credentials: {
+  // ... existing methods ...
+  alpacaConnect: (data: { apiKeyId: string; secretKey: string; dryRun?: boolean }) =>
+    apiPost('/credentials/alpaca/connect', data),
+  alpacaDisconnect: () => apiDelete('/credentials/alpaca/disconnect'),
+  alpacaStatus: () => apiGet('/credentials/alpaca/status'),
+},
+```
+
+-----
+
+## IMPORTANT NOTES
+
+**Never use live Alpaca URL.** The string `https://api.alpaca.markets` must never appear anywhere in the codebase. Only `https://paper-api.alpaca.markets`. Add a comment in `alpacaConfig.ts`: `// HARDCODED PAPER URL — do NOT change to live`.
+
+**Dry Run on Alpaca paper** still means something: when `dryRun: true`, order requests are logged to `AlpacaOrderLog` with `isDryRun: true` but not sent to Alpaca. This lets you see what the auto trader would do without even touching your paper balance. Default is `dryRun: true`.
+
+**The Test Suite should only run in paper mode.** Add a guard in `runTestSuite()` that throws if somehow called with live credentials (it won’t happen with hardcoded URL, but belt-and-suspenders).
+
+**Strategy Replay** operates independently from the Auto Trader’s normal scan cycle. It only affects the Alpaca paper account — it cannot place orders on TOS or Hyperliquid.
+
+**Latency numbers in paper trading** reflect Alpaca’s simulation speed, not real exchange latency. Add a tooltip on the latency card explaining this distinction.
+
+**`client_order_id` prefix** should always be `riabot-` to identify orders placed by this platform in Alpaca’s dashboard.
+
+-----
+
+## SUMMARY
+
+### New Files
+
+```
+server/src/services/alpaca/alpacaConfig.ts
+server/src/services/alpaca/alpacaInfoService.ts
+server/src/services/alpaca/alpacaExchangeService.ts
+server/src/services/alpaca/alpacaKillswitchService.ts
+server/src/services/alpaca/AlpacaTestSuite.ts
+server/src/services/alpaca/StrategyReplayService.ts
+server/src/services/alpaca/LatencyMonitor.ts
+server/src/routes/alpaca.ts
+client/src/pages/alpaca/AlpacaDashboard.tsx
+```
+
+### Modified Files
+
+```
+server/prisma/schema.prisma                          → AlpacaOrderLog, AlpacaKillEvent, ExchangeCredential fields
+server/src/services/credentials/CredentialService.ts → Alpaca credential methods
+server/src/services/credentials/CredentialLoader.ts  → load Alpaca creds at startup
+server/src/routes/credentials.ts                     → Alpaca connect/disconnect/status routes
+server/src/index.ts                                  → register /api/alpaca routes, start latency monitor
+client/src/App.tsx                                   → /alpaca route
+client/src/components/layout/Sidebar.tsx             → Alpaca Paper nav item
+client/src/pages/Dashboard.tsx                       → Alpaca paper status card
+client/src/pages/Settings.tsx                        → Alpaca connection in settings
+client/src/api/client.ts                             → alpaca API methods
+```
+
+### Secrets Required
+
+```
+ALPACA_PAPER_API_KEY_ID     → from Alpaca dashboard (paper account section)
+ALPACA_PAPER_SECRET_KEY     → from Alpaca dashboard (only shown once at creation)
+```
+
+These are entered through the UI connection form and stored encrypted — no need to set them as Replit Secrets manually.

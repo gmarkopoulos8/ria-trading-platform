@@ -9,7 +9,7 @@
  */
 
 import axios from 'axios';
-import { HL_CONFIG, isKillswitchActive, hasSigningKey } from './hyperliquidConfig';
+import { HL_CONFIG, isKillswitchActive, isPauseActive, hasSigningKey } from './hyperliquidConfig';
 import { signL1Action, nowNonce } from './hyperliquidSigningService';
 import { getAssetIndex, getAssetPrice } from './hyperliquidInfoService';
 import { prisma } from '../../lib/prisma';
@@ -48,7 +48,10 @@ async function postExchange(payload: object): Promise<unknown> {
 
 function assertSafe(action: string): void {
   if (isKillswitchActive()) {
-    throw new Error(`KILLSWITCH ACTIVE — ${action} blocked`);
+    throw new Error(`HARD STOP ACTIVE — ${action} blocked`);
+  }
+  if (isPauseActive()) {
+    throw new Error(`TRADING PAUSED — ${action} blocked. Resume trading to continue.`);
   }
 }
 

@@ -21,9 +21,14 @@ import {
   getKillswitchState,
   HL_CONFIG,
   hasSigningKey,
+  activatePause,
+  deactivatePause,
+  isPauseActive,
+  getPauseState,
 } from './hyperliquidConfig';
 import { getUserState, getOpenOrders, getDrawdownPct } from './hyperliquidInfoService';
 import { cancelAllOrders, closePosition } from './hyperliquidExchangeService';
+import telegramService from '../notifications/TelegramService';
 
 export async function executeKillswitch(reason: string, trigger: 'api' | 'env' | 'drawdown' | 'manual', userId?: string): Promise<{
   success: boolean;
@@ -102,6 +107,83 @@ export async function resetKillswitch(userId?: string) {
   console.info('[HL-KILLSWITCH] Reset by userId:', userId ?? 'unknown');
 }
 
+// ─── Level 1 — Pause ──────────────────────────────────────────────
+
+export async function pauseTrading(reason: string, userId?: string): Promise<{
+  success: boolean;
+  level: 'PAUSE';
+}> {
+  activatePause(reason);
+
+  try {
+    await prisma.hyperliquidKillEvent.create({
+      data: { userId, reason, trigger: 'pause' as any, snapshot: { level: 'PAUSE' } },
+    });
+  } catch {}
+
+  try {
+    await telegramService.notify({ type: 'KILLSWITCH', exchange: 'hyperliquid', data: { event: 'PAUSE', reason } });
+  } catch {}
+
+  console.info(`[HL-PAUSE] Trading paused — reason: ${reason}`);
+  return { success: true, level: 'PAUSE' };
+}
+
+// ─── Level 2 — Hard Stop ──────────────────────────────────────────
+
+export async function hardStop(reason: string, userId?: string): Promise<{
+  success: boolean;
+  level: 'HARD_STOP';
+  ordersCancelled: number;
+  errors: string[];
+  isDryRun: boolean;
+}> {
+  activateKillswitch(reason, 'manual');
+  deactivatePause();
+
+  let ordersCancelled = 0;
+  const errors: string[] = [];
+
+  try {
+    const openOrders = await getOpenOrders(HL_CONFIG.WALLET_ADDRESS);
+    if (openOrders.length > 0) {
+      console.warn(`[HL-HARD-STOP] Cancelling ${openOrders.length} open orders`);
+      ordersCancelled = await cancelAllOrders(openOrders, userId);
+    }
+  } catch (err) {
+    errors.push(err instanceof Error ? err.message : 'Order cancellation error');
+  }
+
+  try {
+    await prisma.hyperliquidKillEvent.create({
+      data: { userId, reason, trigger: 'manual', snapshot: { level: 'HARD_STOP', ordersCancelled } },
+    });
+  } catch {}
+
+  try {
+    await telegramService.notify({
+      type: 'KILLSWITCH', exchange: 'hyperliquid',
+      data: { event: 'HARD_STOP', reason, ordersCancelled },
+    });
+  } catch {}
+
+  console.warn(`[HL-HARD-STOP] Complete — cancelled=${ordersCancelled} errors=${errors.length}`);
+  return { success: errors.length === 0, level: 'HARD_STOP', ordersCancelled, errors, isDryRun: HL_CONFIG.DRY_RUN };
+}
+
+// ─── Resume (from any level) ──────────────────────────────────────
+
+export async function resumeTrading(userId?: string): Promise<void> {
+  deactivatePause();
+  deactivateKillswitch();
+
+  try {
+    await telegramService.notify({ type: 'KILLSWITCH', exchange: 'hyperliquid', data: { event: 'RESUMED' } });
+  } catch {}
+
+  console.info('[HL] Trading resumed by userId:', userId ?? 'unknown');
+}
+
 // ─── Drawdown monitor ─────────────────────────────────────────────
 
 let _monitorTimer: NodeJS.Timeout | null = null;
@@ -135,6 +217,8 @@ export function stopDrawdownMonitor() {
 export function getKillswitchStatus() {
   return {
     ...getKillswitchState(),
+    pause: getPauseState(),
+    controlLevel: isKillswitchActive() ? 'HARD_STOP' : isPauseActive() ? 'PAUSE' : 'ACTIVE',
     maxDrawdownPct: HL_CONFIG.MAX_DRAWDOWN_PCT,
     dryRun: HL_CONFIG.DRY_RUN,
     monitorRunning: _monitorTimer !== null,

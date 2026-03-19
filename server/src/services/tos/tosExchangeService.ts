@@ -15,7 +15,7 @@
  */
 
 import axios from 'axios';
-import { TOS_CONFIG, isKillswitchActive, hasAccountNumber } from './tosConfig';
+import { TOS_CONFIG, isKillswitchActive, isPauseActive, hasAccountNumber } from './tosConfig';
 import { getValidAccessToken } from './tosAuthService';
 import { getQuotes } from './tosInfoService';
 import { prisma } from '../../lib/prisma';
@@ -50,7 +50,10 @@ async function tosDelete(url: string): Promise<void> {
 
 function assertSafe(action: string): void {
   if (isKillswitchActive()) {
-    throw new Error(`KILLSWITCH ACTIVE — ${action} blocked`);
+    throw new Error(`HARD STOP ACTIVE — ${action} blocked`);
+  }
+  if (isPauseActive()) {
+    throw new Error(`TRADING PAUSED — ${action} blocked. Resume trading to continue.`);
   }
 }
 

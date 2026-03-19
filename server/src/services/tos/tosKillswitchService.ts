@@ -22,9 +22,11 @@ import {
   activateKillswitch, deactivateKillswitch,
   isKillswitchActive, getKillswitchState,
   TOS_CONFIG, hasCredentials,
+  activatePause, deactivatePause, isPauseActive, getPauseState,
 } from './tosConfig';
 import { getPrimaryAccount, getOpenOrders, computeDrawdownPct } from './tosInfoService';
 import { cancelAllOpenOrders, closePosition } from './tosExchangeService';
+import telegramService from '../notifications/TelegramService';
 
 // ─── Killswitch ───────────────────────────────────────────────────
 
@@ -104,9 +106,88 @@ export async function resetKillswitch(userId?: string) {
   console.info('[TOS-KILLSWITCH] Reset by userId:', userId ?? 'unknown');
 }
 
+// ─── Level 1 — Pause ──────────────────────────────────────────────
+
+export async function pauseTrading(reason: string, userId?: string): Promise<{
+  success: boolean;
+  level: 'PAUSE';
+}> {
+  activatePause(reason);
+
+  try {
+    await prisma.tosKillEvent.create({
+      data: { userId, reason, trigger: 'pause' as any, snapshot: { level: 'PAUSE' } },
+    });
+  } catch {}
+
+  try {
+    await telegramService.notify({ type: 'KILLSWITCH', exchange: 'tos', data: { event: 'PAUSE', reason } });
+  } catch {}
+
+  console.info(`[TOS-PAUSE] Trading paused — reason: ${reason}`);
+  return { success: true, level: 'PAUSE' };
+}
+
+// ─── Level 2 — Hard Stop ──────────────────────────────────────────
+
+export async function hardStop(reason: string, userId?: string): Promise<{
+  success: boolean;
+  level: 'HARD_STOP';
+  ordersCancelled: number;
+  errors: string[];
+  isDryRun: boolean;
+}> {
+  activateKillswitch(reason, 'manual');
+  deactivatePause();
+
+  let ordersCancelled = 0;
+  const errors: string[] = [];
+
+  try {
+    const openOrders = await getOpenOrders();
+    if (openOrders.length > 0) {
+      console.warn(`[TOS-HARD-STOP] Cancelling ${openOrders.length} open orders`);
+      ordersCancelled = await cancelAllOpenOrders(openOrders.map((o) => ({ orderId: o.orderId })));
+    }
+  } catch (err) {
+    errors.push(err instanceof Error ? err.message : 'Order cancellation error');
+  }
+
+  try {
+    await prisma.tosKillEvent.create({
+      data: { userId, reason, trigger: 'manual', snapshot: { level: 'HARD_STOP', ordersCancelled } },
+    });
+  } catch {}
+
+  try {
+    await telegramService.notify({
+      type: 'KILLSWITCH', exchange: 'tos',
+      data: { event: 'HARD_STOP', reason, ordersCancelled },
+    });
+  } catch {}
+
+  console.warn(`[TOS-HARD-STOP] Complete — cancelled=${ordersCancelled} errors=${errors.length}`);
+  return { success: errors.length === 0, level: 'HARD_STOP', ordersCancelled, errors, isDryRun: TOS_CONFIG.DRY_RUN };
+}
+
+// ─── Resume (from any level) ──────────────────────────────────────
+
+export async function resumeTrading(userId?: string): Promise<void> {
+  deactivatePause();
+  deactivateKillswitch();
+
+  try {
+    await telegramService.notify({ type: 'KILLSWITCH', exchange: 'tos', data: { event: 'RESUMED' } });
+  } catch {}
+
+  console.info('[TOS] Trading resumed by userId:', userId ?? 'unknown');
+}
+
 export function getKillswitchStatus() {
   return {
     ...getKillswitchState(),
+    pause: getPauseState(),
+    controlLevel: isKillswitchActive() ? 'HARD_STOP' : isPauseActive() ? 'PAUSE' : 'ACTIVE',
     maxDrawdownPct:   TOS_CONFIG.MAX_DRAWDOWN_PCT,
     dryRun:           TOS_CONFIG.DRY_RUN,
     monitorRunning:   _monitorTimer !== null,

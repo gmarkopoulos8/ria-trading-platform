@@ -5,6 +5,7 @@ import {
   Bot, Power, PowerOff, ShieldCheck, ShieldAlert, ShieldX, Zap, RefreshCw,
   PlayCircle, Settings2, TrendingUp, DollarSign, Activity, AlertTriangle,
   CheckCircle2, XCircle, Clock, ChevronDown, ChevronUp, Info, ExternalLink,
+  PauseCircle, StopCircle, AlertOctagon,
 } from 'lucide-react';
 import { cn } from '../lib/utils';
 import { api } from '../api/client';
@@ -596,6 +597,29 @@ export default function AutoTrader() {
   });
   const logs: AutoTradeLogEntry[] = (logsRaw as { success: boolean; data: { logs: AutoTradeLogEntry[] } })?.data?.logs ?? [];
 
+  const { data: hlStatusRaw } = useQuery({
+    queryKey: ['hl-status'],
+    queryFn: () => api.hyperliquid.status(),
+    refetchInterval: 30_000,
+    staleTime: 15_000,
+  });
+  const { data: tosStatusRaw } = useQuery({
+    queryKey: ['tos-status'],
+    queryFn: () => api.tos.status(),
+    refetchInterval: 30_000,
+    staleTime: 15_000,
+  });
+  const hlCtrlLevel: 'ACTIVE' | 'PAUSE' | 'HARD_STOP' = (hlStatusRaw as any)?.data?.killswitch?.controlLevel ?? 'ACTIVE';
+  const tosCtrlLevel: 'ACTIVE' | 'PAUSE' | 'HARD_STOP' = (tosStatusRaw as any)?.data?.killswitch?.controlLevel ?? 'ACTIVE';
+
+  const hlPauseMut    = useMutation({ mutationFn: () => (api.hyperliquid as any).pause('Manual pause'), onSuccess: () => { toast.info('HL trading paused'); qc.invalidateQueries({ queryKey: ['hl-status'] }); }, onError: (e: any) => toast.error(e?.response?.data?.error ?? 'Failed') });
+  const hlHardStopMut = useMutation({ mutationFn: () => (api.hyperliquid as any).hardStop('Manual hard stop'), onSuccess: (d: any) => { toast.warning(`HL hard stop — ${d?.data?.ordersCancelled ?? 0} cancelled`); qc.invalidateQueries({ queryKey: ['hl-status'] }); }, onError: (e: any) => toast.error(e?.response?.data?.error ?? 'Failed') });
+  const hlResumeMut   = useMutation({ mutationFn: () => (api.hyperliquid as any).resume(), onSuccess: () => { toast.success('HL trading resumed'); qc.invalidateQueries({ queryKey: ['hl-status'] }); }, onError: (e: any) => toast.error(e?.response?.data?.error ?? 'Failed') });
+
+  const tosPauseMut    = useMutation({ mutationFn: () => (api.tos as any).pause('Manual pause'), onSuccess: () => { toast.info('TOS trading paused'); qc.invalidateQueries({ queryKey: ['tos-status'] }); }, onError: (e: any) => toast.error(e?.response?.data?.error ?? 'Failed') });
+  const tosHardStopMut = useMutation({ mutationFn: () => (api.tos as any).hardStop('Manual hard stop'), onSuccess: (d: any) => { toast.warning(`TOS hard stop — ${d?.data?.ordersCancelled ?? 0} cancelled`); qc.invalidateQueries({ queryKey: ['tos-status'] }); }, onError: (e: any) => toast.error(e?.response?.data?.error ?? 'Failed') });
+  const tosResumeMut   = useMutation({ mutationFn: () => (api.tos as any).resume(), onSuccess: () => { toast.success('TOS trading resumed'); qc.invalidateQueries({ queryKey: ['tos-status'] }); }, onError: (e: any) => toast.error(e?.response?.data?.error ?? 'Failed') });
+
   const enableMut = useMutation({
     mutationFn: () => api.autotrader.enable(),
     onSuccess: () => { qc.invalidateQueries({ queryKey: ['autotrader-status'] }); toast.success('Auto-trading enabled'); },
@@ -734,6 +758,79 @@ export default function AutoTrader() {
           color={status && status.todayPnl >= 0 ? 'green' : 'red'}
         />
       </div>
+
+      <Card className="p-4">
+        <div className="flex items-center gap-2 mb-4">
+          <AlertOctagon className="h-4 w-4 text-slate-500" />
+          <h3 className="text-sm font-bold text-slate-300">Platform Controls</h3>
+          <span className="text-xs text-slate-600">Per-exchange trading controls</span>
+        </div>
+        <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+          {[
+            {
+              label: 'Hyperliquid',
+              ctrl: hlCtrlLevel,
+              pauseMut: hlPauseMut,
+              hardStopMut: hlHardStopMut,
+              resumeMut: hlResumeMut,
+            },
+            {
+              label: 'ThinkorSwim',
+              ctrl: tosCtrlLevel,
+              pauseMut: tosPauseMut,
+              hardStopMut: tosHardStopMut,
+              resumeMut: tosResumeMut,
+            },
+          ].map(({ label, ctrl, pauseMut, hardStopMut, resumeMut }) => {
+            const isStopped = ctrl === 'HARD_STOP';
+            const isPaused  = ctrl === 'PAUSE';
+            return (
+              <div key={label} className="p-3 rounded-xl bg-surface-2 border border-surface-border space-y-3">
+                <div className="flex items-center justify-between">
+                  <p className="text-sm font-semibold text-white">{label}</p>
+                  <span className={cn(
+                    'text-xs font-bold px-2 py-0.5 rounded font-mono',
+                    isStopped ? 'bg-red-500/20 text-red-400 animate-pulse' :
+                    isPaused  ? 'bg-amber-500/20 text-amber-400' :
+                                'bg-accent-green/20 text-accent-green'
+                  )}>
+                    {isStopped ? '⛔ HARD STOP' : isPaused ? '⏸ PAUSED' : '● ACTIVE'}
+                  </span>
+                </div>
+                {(isPaused || isStopped) ? (
+                  <button
+                    onClick={() => resumeMut.mutate()}
+                    disabled={resumeMut.isPending}
+                    className="w-full flex items-center justify-center gap-1.5 py-2 rounded-lg bg-accent-green/10 border border-accent-green/30 text-accent-green text-xs font-semibold hover:bg-accent-green/20 transition-colors"
+                  >
+                    <Power className="h-3 w-3" />
+                    {resumeMut.isPending ? 'Resuming…' : 'Resume Trading'}
+                  </button>
+                ) : (
+                  <div className="flex gap-2">
+                    <button
+                      onClick={() => pauseMut.mutate()}
+                      disabled={pauseMut.isPending}
+                      className="flex-1 flex items-center justify-center gap-1 py-2 rounded-lg bg-amber-500/10 border border-amber-500/30 text-amber-400 text-xs font-semibold hover:bg-amber-500/20 transition-colors"
+                    >
+                      <PauseCircle className="h-3 w-3" />
+                      {pauseMut.isPending ? '...' : 'Pause'}
+                    </button>
+                    <button
+                      onClick={() => hardStopMut.mutate()}
+                      disabled={hardStopMut.isPending}
+                      className="flex-1 flex items-center justify-center gap-1 py-2 rounded-lg bg-orange-500/10 border border-orange-500/30 text-orange-400 text-xs font-semibold hover:bg-orange-500/20 transition-colors"
+                    >
+                      <StopCircle className="h-3 w-3" />
+                      {hardStopMut.isPending ? '...' : 'Hard Stop'}
+                    </button>
+                  </div>
+                )}
+              </div>
+            );
+          })}
+        </div>
+      </Card>
 
       {cb && <CircuitBreakerPanel cb={cb} />}
 

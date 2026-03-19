@@ -6,6 +6,7 @@ import {
   BarChart3, Power, PowerOff, ChevronDown, ChevronUp, Minus,
   ShieldAlert, Zap, Activity, X, Settings2, Eye, EyeOff, ExternalLink,
   CheckCircle2, AlertTriangle, FlaskConical,
+  PauseCircle, StopCircle, AlertOctagon, ChevronRight,
 } from 'lucide-react';
 import { cn } from '../../lib/utils';
 import { api } from '../../api/client';
@@ -948,8 +949,10 @@ function TOSConnectCard({ onConnected }: { onConnected: () => void }) {
 
 export default function TosDashboard() {
   const qc = useQueryClient();
-  const [showKillConfirm, setShowKillConfirm] = useState(false);
-  const [killReason, setKillReason]           = useState('');
+  const [showHardStopConfirm, setShowHardStopConfirm] = useState(false);
+  const [showEmergencyConfirm, setShowEmergencyConfirm] = useState(false);
+  const [controlReason, setControlReason]     = useState('');
+  const [emergencyConfirmText, setEmergencyConfirmText] = useState('');
 
   const { data: credStatus, refetch: refetchCredStatus } = useQuery({
     queryKey: ['credential-status'],
@@ -994,16 +997,38 @@ export default function TosDashboard() {
     staleTime: 30_000,
   });
 
-  const killMutation = useMutation({
-    mutationFn: (reason: string) => api.tos.killswitch(reason),
-    onSuccess: () => { toast.warning('KILLSWITCH ACTIVATED'); setShowKillConfirm(false); qc.invalidateQueries({ queryKey: ['tos-status'] }); },
-    onError: (err: any) => toast.error(err?.response?.data?.error ?? 'Killswitch failed'),
+  const pauseMutation = useMutation({
+    mutationFn: (reason: string) => (api.tos as any).pause(reason),
+    onSuccess: () => { toast.info('Trading paused'); qc.invalidateQueries({ queryKey: ['tos-status'] }); },
+    onError: (err: any) => toast.error(err?.response?.data?.error ?? 'Pause failed'),
   });
 
-  const resetKillMutation = useMutation({
-    mutationFn: () => api.tos.resetKillswitch(),
-    onSuccess: () => { toast.success('Killswitch deactivated'); qc.invalidateQueries({ queryKey: ['tos-status'] }); },
-    onError: (err: any) => toast.error(err?.response?.data?.error ?? 'Failed'),
+  const hardStopMutation = useMutation({
+    mutationFn: (reason: string) => (api.tos as any).hardStop(reason),
+    onSuccess: (data: any) => {
+      toast.warning(`Hard stop activated — ${data?.data?.ordersCancelled ?? 0} orders cancelled`);
+      setShowHardStopConfirm(false);
+      qc.invalidateQueries({ queryKey: ['tos-status'] });
+    },
+    onError: (err: any) => toast.error(err?.response?.data?.error ?? 'Hard stop failed'),
+  });
+
+  const emergencyExitMutation = useMutation({
+    mutationFn: ({ reason, confirmText }: { reason: string; confirmText: string }) =>
+      (api.tos as any).emergencyExit(reason, confirmText),
+    onSuccess: (data: any) => {
+      toast.error(`EMERGENCY EXIT — ${data?.data?.positionsClosed ?? 0} positions closed`);
+      setShowEmergencyConfirm(false);
+      setEmergencyConfirmText('');
+      qc.invalidateQueries({ queryKey: ['tos-status'] });
+    },
+    onError: (err: any) => toast.error(err?.response?.data?.error ?? 'Emergency exit failed'),
+  });
+
+  const resumeMutation = useMutation({
+    mutationFn: () => (api.tos as any).resume(),
+    onSuccess: () => { toast.success('Trading resumed'); qc.invalidateQueries({ queryKey: ['tos-status'] }); },
+    onError: (err: any) => toast.error(err?.response?.data?.error ?? 'Resume failed'),
   });
 
   const cancelOrderMutation = useMutation({
@@ -1030,6 +1055,10 @@ export default function TosDashboard() {
   ) ?? [];
   const orderHistory: OrderLog[] = (historyData as any)?.data?.history ?? [];
   const ksActive = status?.killswitch?.active ?? false;
+  const controlLevel: 'ACTIVE' | 'PAUSE' | 'HARD_STOP' = (status?.killswitch as any)?.controlLevel ?? 'ACTIVE';
+  const isPaused = controlLevel === 'PAUSE';
+  const isStopped = controlLevel === 'HARD_STOP';
+  const isAnyControlActive = isPaused || isStopped;
   const totalPnl = positions.reduce((s, p) => s + (p.currentDayProfitLoss ?? 0), 0);
 
   return (
@@ -1115,17 +1144,14 @@ export default function TosDashboard() {
             <button onClick={() => refetchStatus()} className="p-2 text-slate-500 hover:text-white transition-colors rounded-lg hover:bg-surface-2">
               <RefreshCw className="h-4 w-4" />
             </button>
-            {ksActive ? (
-              <button onClick={() => resetKillMutation.mutate()}
-                className="flex items-center gap-2 px-4 py-2 bg-accent-green text-black text-xs font-black rounded-xl hover:bg-accent-green/80 transition-colors">
-                <Power className="h-3.5 w-3.5" /> Resume Trading
-              </button>
-            ) : (
-              <button onClick={() => setShowKillConfirm(true)}
-                className="flex items-center gap-2 px-4 py-2 bg-red-500/20 border border-red-500/40 text-red-400 text-xs font-black rounded-xl hover:bg-red-500/30 transition-colors">
-                <PowerOff className="h-3.5 w-3.5" /> KILLSWITCH
-              </button>
-            )}
+            <span className={cn(
+              'text-xs font-bold px-2 py-1 rounded font-mono',
+              isStopped ? 'bg-red-500/20 text-red-400 animate-pulse' :
+              isPaused  ? 'bg-amber-500/20 text-amber-400' :
+                          'bg-accent-green/20 text-accent-green'
+            )}>
+              {isStopped ? '⛔ HARD STOP' : isPaused ? '⏸ PAUSED' : '● ACTIVE'}
+            </span>
           </div>
         </div>
       </div>
@@ -1134,14 +1160,88 @@ export default function TosDashboard() {
         {!tosConnected && !status?.hasCredentials && !sLoading && (
           <TOSConnectCard onConnected={() => { refetchCredStatus(); refetchStatus(); }} />
         )}
-        {ksActive && tosConnected && (
-          <div className="mx-6 mt-4 p-4 bg-red-500/10 border border-red-500/40 rounded-xl">
-            <div className="flex items-center gap-2 mb-1">
-              <PowerOff className="h-4 w-4 text-red-400" />
-              <p className="text-sm font-black text-red-400">KILLSWITCH ACTIVE — ALL TRADING HALTED</p>
-            </div>
-            <p className="text-xs text-red-400/70">Reason: {status?.killswitch?.reason ?? 'Unknown'}</p>
-            <p className="text-xs text-red-400/50 mt-0.5">Trigger: {status?.killswitch?.trigger?.toUpperCase()} · {status?.killswitch?.activatedAt ? new Date(status.killswitch.activatedAt).toLocaleString() : '—'}</p>
+        {tosConnected && (
+          <div className="mx-6 mt-4">
+            <Card className="p-4">
+              <div className="flex items-center justify-between mb-3">
+                <p className="text-xs font-mono uppercase tracking-wider text-slate-500">Trading Controls</p>
+                <span className={cn(
+                  'text-xs font-bold px-2 py-1 rounded font-mono',
+                  isStopped ? 'bg-red-500/20 text-red-400 animate-pulse' :
+                  isPaused  ? 'bg-amber-500/20 text-amber-400' :
+                              'bg-accent-green/20 text-accent-green'
+                )}>
+                  {isStopped ? '⛔ HARD STOP' : isPaused ? '⏸ PAUSED' : '● ACTIVE'}
+                </span>
+              </div>
+
+              {isAnyControlActive && (
+                <div className={cn(
+                  'flex items-center justify-between p-3 rounded-lg mb-3 border',
+                  isStopped ? 'bg-red-500/10 border-red-500/30' : 'bg-amber-500/10 border-amber-500/30'
+                )}>
+                  <div>
+                    <p className={cn('text-sm font-bold', isStopped ? 'text-red-400' : 'text-amber-400')}>
+                      {isStopped ? '⛔ Hard Stop Active — Trading Halted' : '⏸ Trading Paused'}
+                    </p>
+                    <p className="text-xs text-slate-500 mt-0.5">
+                      {status?.killswitch?.reason ?? (status?.killswitch as any)?.pause?.reason ?? 'Manual control active'}
+                    </p>
+                    <p className="text-xs text-slate-600 mt-0.5">
+                      Since {status?.killswitch?.activatedAt
+                        ? new Date(status.killswitch.activatedAt).toLocaleTimeString()
+                        : (status?.killswitch as any)?.pause?.activatedAt
+                        ? new Date((status?.killswitch as any)?.pause?.activatedAt).toLocaleTimeString()
+                        : '—'}
+                    </p>
+                  </div>
+                  <button
+                    onClick={() => resumeMutation.mutate()}
+                    disabled={resumeMutation.isPending}
+                    className="flex items-center gap-1.5 px-3 py-2 rounded-lg bg-accent-green/20 border border-accent-green/40 text-accent-green text-xs font-semibold hover:bg-accent-green/30 transition-colors"
+                  >
+                    <Power className="h-3.5 w-3.5" />
+                    {resumeMutation.isPending ? 'Resuming...' : 'Resume Trading'}
+                  </button>
+                </div>
+              )}
+
+              {!isAnyControlActive && (
+                <div className="flex items-center gap-2 mb-3">
+                  <button
+                    onClick={() => pauseMutation.mutate('Manual pause')}
+                    disabled={pauseMutation.isPending}
+                    className="flex-1 flex items-center justify-center gap-1.5 py-2 rounded-lg bg-amber-500/10 border border-amber-500/30 text-amber-400 text-xs font-semibold hover:bg-amber-500/20 transition-colors"
+                  >
+                    <PauseCircle className="h-3.5 w-3.5" />
+                    {pauseMutation.isPending ? '...' : 'Pause'}
+                  </button>
+                  <button
+                    onClick={() => setShowHardStopConfirm(true)}
+                    className="flex-1 flex items-center justify-center gap-1.5 py-2 rounded-lg bg-orange-500/10 border border-orange-500/30 text-orange-400 text-xs font-semibold hover:bg-orange-500/20 transition-colors"
+                  >
+                    <StopCircle className="h-3.5 w-3.5" />
+                    Hard Stop
+                  </button>
+                </div>
+              )}
+
+              <div className="pt-3 border-t border-surface-border">
+                <button
+                  onClick={() => setShowEmergencyConfirm(true)}
+                  className="w-full flex items-center justify-between px-3 py-2.5 rounded-lg bg-red-500/5 border border-red-500/20 hover:bg-red-500/10 hover:border-red-500/40 transition-colors group"
+                >
+                  <div className="flex items-center gap-2">
+                    <AlertOctagon className="h-4 w-4 text-red-500/60 group-hover:text-red-400" />
+                    <div className="text-left">
+                      <p className="text-xs font-semibold text-red-500/70 group-hover:text-red-400">Emergency Exit All Positions</p>
+                      <p className="text-[10px] text-slate-600">Closes all open positions at market. Use only in emergencies.</p>
+                    </div>
+                  </div>
+                  <ChevronRight className="h-3.5 w-3.5 text-red-500/40 group-hover:text-red-400" />
+                </button>
+              </div>
+            </Card>
           </div>
         )}
 
@@ -1318,27 +1418,86 @@ export default function TosDashboard() {
         </div>
       </div>
 
-      {showKillConfirm && (
-        <div className="fixed inset-0 bg-black/60 backdrop-blur-sm z-50 flex items-center justify-center p-4">
-          <div className="bg-surface-1 border border-red-500/40 rounded-2xl p-6 max-w-sm w-full space-y-4">
-            <div className="flex items-center gap-3">
-              <div className="w-10 h-10 rounded-xl bg-red-500/10 flex items-center justify-center">
-                <PowerOff className="h-5 w-5 text-red-400" />
+      {showHardStopConfirm && (
+        <div className="fixed inset-0 bg-black/60 backdrop-blur-sm flex items-center justify-center z-50 p-4">
+          <div className="bg-surface-1 border border-surface-border rounded-2xl p-6 max-w-sm w-full shadow-2xl">
+            <div className="flex items-center gap-3 mb-4">
+              <div className="w-10 h-10 rounded-xl bg-orange-500/20 border border-orange-500/30 flex items-center justify-center flex-shrink-0">
+                <StopCircle className="h-5 w-5 text-orange-400" />
               </div>
               <div>
-                <h3 className="text-sm font-black text-red-400">Activate Killswitch?</h3>
-                <p className="text-xs text-slate-500">Cancels all orders · closes all positions</p>
+                <h3 className="text-sm font-black text-white">Activate Hard Stop?</h3>
+                <p className="text-xs text-slate-500">New orders blocked · Pending orders cancelled · Positions kept open</p>
               </div>
             </div>
-            <textarea value={killReason} onChange={(e) => setKillReason(e.target.value)} placeholder="Optional reason…"
-              className="w-full bg-surface-2 border border-surface-border text-white text-sm rounded-lg px-3 py-2 resize-none h-16 focus:outline-none placeholder-slate-600" />
+            <textarea
+              value={controlReason}
+              onChange={(e) => setControlReason(e.target.value)}
+              placeholder="Optional reason (e.g. 'Taking manual control')…"
+              className="w-full bg-surface-3 border border-surface-border rounded-lg p-2.5 text-sm text-white placeholder-slate-600 resize-none h-20 mb-4 focus:outline-none focus:border-orange-500/50"
+            />
             <div className="flex gap-2">
-              <button onClick={() => setShowKillConfirm(false)} className="flex-1 py-2 border border-surface-border text-slate-400 text-sm rounded-xl hover:text-white transition-colors">
+              <button onClick={() => setShowHardStopConfirm(false)} className="flex-1 py-2.5 rounded-xl border border-surface-border text-slate-400 text-sm hover:text-white transition-colors">
                 Cancel
               </button>
-              <button onClick={() => killMutation.mutate(killReason || 'Manual killswitch')} disabled={killMutation.isPending}
-                className="flex-1 py-2 bg-red-500 text-white text-sm font-black rounded-xl hover:bg-red-500/80 transition-colors disabled:opacity-50">
-                {killMutation.isPending ? <RefreshCw className="h-4 w-4 animate-spin mx-auto" /> : 'KILL'}
+              <button
+                onClick={() => hardStopMutation.mutate(controlReason || 'Manual hard stop')}
+                disabled={hardStopMutation.isPending}
+                className="flex-1 py-2.5 rounded-xl bg-orange-500/20 border border-orange-500/40 text-orange-400 text-sm font-bold hover:bg-orange-500/30 transition-colors"
+              >
+                {hardStopMutation.isPending ? <RefreshCw className="h-4 w-4 animate-spin mx-auto" /> : 'Hard Stop'}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {showEmergencyConfirm && (
+        <div className="fixed inset-0 bg-black/80 backdrop-blur-sm flex items-center justify-center z-50 p-4">
+          <div className="bg-surface-1 border border-red-500/40 rounded-2xl p-6 max-w-sm w-full shadow-2xl">
+            <div className="flex items-center gap-3 mb-1">
+              <div className="w-10 h-10 rounded-xl bg-red-500/20 border border-red-500/40 flex items-center justify-center flex-shrink-0">
+                <AlertOctagon className="h-5 w-5 text-red-400" />
+              </div>
+              <h3 className="text-sm font-black text-red-400">Emergency Exit</h3>
+            </div>
+            <p className="text-xs text-slate-400 mb-4">
+              This will <strong className="text-white">immediately close ALL open positions at market price</strong> and cancel all pending orders. This cannot be undone.
+            </p>
+            <div className="p-3 rounded-lg bg-red-500/10 border border-red-500/20 mb-4">
+              <p className="text-xs text-red-400 font-mono">
+                ⚠ Market orders during volatile conditions may fill at significantly worse prices than current market price.
+              </p>
+            </div>
+            <div className="mb-4">
+              <label className="text-xs text-slate-500 mb-1.5 block">Type <span className="font-mono font-bold text-white">CONFIRM</span> to proceed</label>
+              <input
+                type="text"
+                value={emergencyConfirmText}
+                onChange={(e) => setEmergencyConfirmText(e.target.value.toUpperCase())}
+                placeholder="CONFIRM"
+                className="w-full bg-surface-3 border border-surface-border rounded-lg px-3 py-2.5 text-sm font-mono text-white placeholder-slate-600 focus:outline-none focus:border-red-500/50 uppercase"
+              />
+            </div>
+            <div className="flex gap-2">
+              <button
+                onClick={() => { setShowEmergencyConfirm(false); setEmergencyConfirmText(''); }}
+                className="flex-1 py-2.5 rounded-xl border border-surface-border text-slate-400 text-sm hover:text-white transition-colors"
+              >
+                Cancel
+              </button>
+              <button
+                onClick={() => emergencyExitMutation.mutate({
+                  reason: 'Emergency exit — manual trigger',
+                  confirmText: emergencyConfirmText,
+                })}
+                disabled={emergencyConfirmText !== 'CONFIRM' || emergencyExitMutation.isPending}
+                className="flex-1 py-2.5 rounded-xl bg-red-500/20 border border-red-500/40 text-red-400 text-sm font-black hover:bg-red-500/30 transition-colors disabled:opacity-30 disabled:cursor-not-allowed"
+              >
+                {emergencyExitMutation.isPending
+                  ? <RefreshCw className="h-4 w-4 animate-spin mx-auto" />
+                  : '🚨 EXIT ALL POSITIONS'
+                }
               </button>
             </div>
           </div>

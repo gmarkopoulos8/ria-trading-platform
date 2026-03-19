@@ -192,6 +192,10 @@ export const api = {
     resetKillswitch: ()                          => del('/tos/killswitch'),
     orderHistory:    (limit?: number)            => get('/tos/order-history', limit ? { limit } : {}),
     strategies:      ()                          => get('/tos/scheduler/strategies'),
+    pause:           (reason?: string)           => post('/tos/controls/pause', { reason }),
+    hardStop:        (reason?: string)           => post('/tos/controls/hard-stop', { reason }),
+    emergencyExit:   (reason?: string, confirmText?: string) => post('/tos/controls/emergency-exit', { reason, confirmText }),
+    resume:          ()                          => post('/tos/controls/resume', {}),
   },
 
   hyperliquid: {
@@ -206,6 +210,10 @@ export const api = {
     killswitch:       (reason?: string)          => post('/hyperliquid/killswitch', { reason }),
     resetKillswitch:  ()                         => del('/hyperliquid/killswitch'),
     orderHistory:     (limit?: number)           => get('/hyperliquid/order-history', limit ? { limit } : {}),
+    pause:            (reason?: string)          => post('/hyperliquid/controls/pause', { reason }),
+    hardStop:         (reason?: string)          => post('/hyperliquid/controls/hard-stop', { reason }),
+    emergencyExit:    (reason?: string, confirmText?: string) => post('/hyperliquid/controls/emergency-exit', { reason, confirmText }),
+    resume:           ()                         => post('/hyperliquid/controls/resume', {}),
   },
 
   autotrader: {
