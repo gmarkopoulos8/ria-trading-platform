@@ -11,6 +11,7 @@ import {
   ReferenceLine,
 } from 'recharts';
 import { api } from '../api/client';
+import { cn } from '../lib/utils';
 import { Card, CardHeader } from '../components/ui/Card';
 import { Badge } from '../components/ui/Badge';
 import { EmptyState } from '../components/ui/EmptyState';
@@ -527,6 +528,122 @@ function TechnicalPanel({ symbol, timeframe, assetClass }: { symbol: string; tim
   );
 }
 
+function OptionsPanel({ symbol }: { symbol: string }) {
+  const { data: recData, isLoading: recLoading } = useQuery({
+    queryKey: ['options-rec', symbol],
+    queryFn: async () => {
+      const r = await (api as any).options.recommendation(symbol) as { success: boolean; data?: any };
+      return r.data ?? null;
+    },
+    staleTime: 15 * 60_000,
+  });
+  const { data: ivData, isLoading: ivLoading } = useQuery({
+    queryKey: ['options-iv', symbol],
+    queryFn: async () => {
+      const r = await (api as any).options.ivRank(symbol) as { success: boolean; data?: any };
+      return r.data ?? null;
+    },
+    staleTime: 15 * 60_000,
+  });
+
+  const rec = recData;
+  const iv = ivData;
+
+  if (recLoading || ivLoading) return <div className="p-4"><div className="h-4 w-32 bg-surface-3 animate-pulse rounded" /></div>;
+
+  const strategyColors: Record<string, string> = {
+    LONG_CALL: 'text-accent-green border-accent-green/30 bg-accent-green/10',
+    LONG_PUT: 'text-red-400 border-red-400/30 bg-red-400/10',
+    BULL_CALL_SPREAD: 'text-accent-blue border-accent-blue/30 bg-accent-blue/10',
+    BEAR_PUT_SPREAD: 'text-orange-400 border-orange-400/30 bg-orange-400/10',
+    CASH_SECURED_PUT: 'text-accent-purple border-accent-purple/30 bg-accent-purple/10',
+    COVERED_CALL: 'text-slate-300 border-slate-400/30 bg-slate-400/10',
+    NONE: 'text-slate-500 border-surface-border bg-surface-3',
+  };
+
+  return (
+    <div className="p-4 space-y-4">
+      {iv && (
+        <div className="grid grid-cols-3 gap-3">
+          <div className="rounded-lg bg-surface-2 p-3">
+            <p className="text-[10px] text-slate-500 uppercase tracking-wider">IV Rank</p>
+            <p className={cn('text-lg font-bold font-mono mt-0.5',
+              (iv.ivRank ?? 0) > 60 ? 'text-amber-400' : (iv.ivRank ?? 0) < 30 ? 'text-accent-green' : 'text-white')}>
+              {iv.ivRank !== undefined && iv.ivRank !== null ? `${iv.ivRank.toFixed(0)}%` : '—'}
+            </p>
+            <p className="text-[10px] text-slate-600 mt-0.5">
+              {(iv.ivRank ?? 0) > 60 ? 'High — favor selling' : (iv.ivRank ?? 0) < 30 ? 'Low — favor buying' : 'Moderate'}
+            </p>
+          </div>
+          <div className="rounded-lg bg-surface-2 p-3">
+            <p className="text-[10px] text-slate-500 uppercase tracking-wider">Implied Vol</p>
+            <p className="text-lg font-bold font-mono text-white mt-0.5">
+              {iv.impliedVolatility !== undefined ? `${(iv.impliedVolatility * 100).toFixed(1)}%` : '—'}
+            </p>
+          </div>
+          <div className="rounded-lg bg-surface-2 p-3">
+            <p className="text-[10px] text-slate-500 uppercase tracking-wider">Percentile</p>
+            <p className="text-lg font-bold font-mono text-white mt-0.5">
+              {iv.ivPercentile !== undefined ? `${iv.ivPercentile.toFixed(0)}th` : '—'}
+            </p>
+          </div>
+        </div>
+      )}
+
+      {rec && rec.strategy !== 'NONE' && (
+        <div className="space-y-3">
+          <div className="flex items-center gap-3">
+            <span className={cn('text-xs font-bold px-2.5 py-1 rounded-lg border font-mono', strategyColors[rec.strategy] ?? strategyColors.NONE)}>
+              {rec.strategy?.replace(/_/g, ' ')}
+            </span>
+            <span className="text-xs text-slate-500">Recommended strategy</span>
+          </div>
+          {rec.legs && rec.legs.length > 0 && (
+            <div className="space-y-1.5">
+              {rec.legs.map((leg: any, i: number) => (
+                <div key={i} className="flex items-center gap-3 text-xs">
+                  <span className={cn('w-10 font-bold font-mono', leg.action === 'BUY' ? 'text-accent-green' : 'text-red-400')}>{leg.action}</span>
+                  <span className="text-slate-400">{leg.contractType}</span>
+                  <span className="font-mono text-slate-300">{leg.expiration}</span>
+                  <span className="font-mono text-white">strike ${leg.strike?.toFixed(2)}</span>
+                  {leg.estimatedPremium !== undefined && (
+                    <span className="text-slate-500">~${leg.estimatedPremium?.toFixed(2)}/contract</span>
+                  )}
+                </div>
+              ))}
+            </div>
+          )}
+          {rec.reasoning && rec.reasoning.length > 0 && (
+            <ul className="space-y-1">
+              {rec.reasoning.map((r: string, i: number) => (
+                <li key={i} className="flex items-start gap-1.5 text-xs text-slate-400">
+                  <span className="text-accent-blue mt-0.5">·</span> {r}
+                </li>
+              ))}
+            </ul>
+          )}
+          {rec.maxRiskUsd !== undefined && (
+            <p className="text-xs text-slate-500">
+              Max risk: <span className="font-mono text-white">${rec.maxRiskUsd?.toFixed(0)}</span>
+              {rec.maxRewardUsd !== undefined && (
+                <> · Max reward: <span className="font-mono text-accent-green">${rec.maxRewardUsd?.toFixed(0)}</span></>
+              )}
+            </p>
+          )}
+        </div>
+      )}
+
+      {rec && rec.strategy === 'NONE' && (
+        <p className="text-sm text-slate-500 text-center py-4">No actionable options setup at this time</p>
+      )}
+
+      {!rec && !recLoading && (
+        <p className="text-sm text-slate-500 text-center py-4">Options data unavailable — requires market hours connectivity</p>
+      )}
+    </div>
+  );
+}
+
 export default function SymbolIntelligence() {
   const { symbol } = useParams();
   const navigate = useNavigate();
@@ -536,6 +653,7 @@ export default function SymbolIntelligence() {
   const [showTechnical, setShowTechnical] = useState(true);
   const [showCatalysts, setShowCatalysts] = useState(true);
   const [showThesis, setShowThesis] = useState(true);
+  const [showOptions, setShowOptions] = useState(false);
 
   const { data: quoteData, isLoading: quoteLoading, isError: quoteError, refetch: refetchQuote } = useQuery({
     queryKey: ['quote', symbol],
@@ -780,6 +898,25 @@ export default function SymbolIntelligence() {
 
               {showThesis && (
                 <ThesisPanel symbol={symbol} assetClass={quote.assetClass} />
+              )}
+
+              {/* ── Options Analysis Section ── */}
+              {(quote.assetClass === 'STOCK' || quote.assetClass === 'ETF') && (
+                <div className="rounded-xl border border-surface-border overflow-hidden">
+                  <div className="flex items-center justify-between px-4 py-3 bg-surface-2/50">
+                    <div className="flex items-center gap-2">
+                      <span className="text-sm font-semibold text-white">Options Analysis</span>
+                      <span className="text-[10px] font-mono bg-surface-3 text-slate-400 px-1.5 py-0.5 rounded">TOS</span>
+                    </div>
+                    <button onClick={() => setShowOptions((v) => !v)}
+                      className="text-xs text-slate-500 hover:text-white transition-colors font-mono">
+                      {showOptions ? 'Hide' : 'Show'}
+                    </button>
+                  </div>
+                  {showOptions && (
+                    <OptionsPanel symbol={symbol} />
+                  )}
+                </div>
               )}
 
               {quote.isMock && (

@@ -5,6 +5,7 @@ import {
 import { generateNewsItems } from './generator';
 import { computeSentimentTrend } from './classifier';
 import { isCryptoSymbol } from '../market/utils';
+import { getInsiderSignal } from './FinnhubNewsProvider';
 import prisma from '../../lib/prisma';
 
 const CACHE_TTL_MS = 15 * 60 * 1000;
@@ -78,6 +79,47 @@ class NewsService {
         analyzedAt: new Date(),
         timespan: '5 days',
       };
+
+      // Fetch insider signal for stocks and inject as synthetic catalyst
+      if (assetClass !== 'crypto') {
+        getInsiderSignal(ticker).then((insiderData) => {
+          if (insiderData && insiderData.signal !== 'NEUTRAL') {
+            const syntheticItem: NormalizedNewsItem = {
+              id: `insider-${ticker}-${Date.now()}`,
+              ticker,
+              headline: `Insider ${insiderData.signal === 'BULLISH' ? 'Buying' : 'Selling'}: ${insiderData.explanation}`,
+              summary: insiderData.explanation,
+              url: `https://finnhub.io/market-insider/${ticker}`,
+              source: { name: 'Finnhub Insider Data', domain: 'finnhub.io', qualityScore: 85 },
+              sentiment: insiderData.signal === 'BULLISH' ? 'POSITIVE' : 'NEGATIVE',
+              eventType: 'FILING',
+              category: insiderData.signal === 'BULLISH' ? 'POSITIVE_CATALYST' : 'NEGATIVE_CATALYST',
+              urgency: insiderData.signal === 'BULLISH' ? 'HIGH' : 'MEDIUM',
+              publishedAt: new Date(),
+              isMock: false,
+              scores: {
+                sentiment: insiderData.signal === 'BULLISH' ? 0.7 : -0.7,
+                sentimentTrend: 0,
+                importance: 0.8,
+                recency: 1.0,
+                sourceQuality: 0.85,
+                catalyst: 0.8,
+              },
+              explanation: insiderData.explanation,
+              keyPoints: [insiderData.explanation],
+            };
+            // Inject into cached items
+            const existing = cache.get(cacheKey);
+            if (existing) {
+              const updatedItems = [syntheticItem, ...existing.data.newsItems.slice(0, 14)];
+              cache.set(cacheKey, {
+                data: { ...existing.data, newsItems: updatedItems },
+                ts: existing.ts,
+              });
+            }
+          }
+        }).catch(() => {});
+      }
 
       cache.set(cacheKey, { data: analysis, ts: Date.now() });
       this.persistItems(ticker, items).catch(() => {});

@@ -7,6 +7,8 @@ import { placeOrder as hlPlaceOrder, type OrderRequest as HlOrderRequest } from 
 import { TOS_CONFIG, isKillswitchActive as isTOSStopped, isPauseActive as isTOSPaused } from '../tos/tosConfig';
 import { HL_CONFIG, isKillswitchActive as isHLStopped, isPauseActive as isHLPaused } from '../hyperliquid/hyperliquidConfig';
 import { getConfig, checkSessionActive } from './ExchangeAutoConfigService';
+import { detectRegime } from '../market/RegimeDetector';
+import { getRecommendation } from '../options/OptionsAnalyzer';
 
 export type AutoTradeExchange = 'TOS' | 'HYPERLIQUID' | 'PAPER';
 
@@ -24,6 +26,8 @@ export interface AutoTradeSignal {
   reason?: string;
   scanRunId?: string;
   exchange?: AutoTradeExchange;
+  intradayConfirmation?: string;
+  atrPercent?: number;
 }
 
 export interface AutoTradeConfig {
@@ -111,6 +115,25 @@ export async function executeAutoTrade(
     return { success: false, status: 'BLOCKED', symbol: signal.symbol, exchange, reason: `TOS trading ${isTOSStopped() ? 'hard-stopped' : 'paused'}` };
   }
 
+  // ─── Phase 4: Regime check ─────────────────────────────────────────────
+  let regimePositionSizeMultiplier = 1.0;
+  try {
+    const regime = await detectRegime();
+    if (!regime.autoTraderAdjustments.allowNewEntries) {
+      return { success: false, status: 'BLOCKED', symbol: signal.symbol, exchange, reason: `REGIME_BLOCK: ${regime.regime} — new entries blocked` };
+    }
+    if (regime.autoTraderAdjustments.longOnly && signal.bias === 'BEARISH') {
+      return { success: false, status: 'REJECTED', symbol: signal.symbol, exchange, reason: `REGIME_LONG_ONLY: ${regime.regime} requires long-only mode` };
+    }
+    const effectiveMinConvictionFromRegime = regime.autoTraderAdjustments.minConvictionOverride;
+    if (signal.convictionScore < effectiveMinConvictionFromRegime) {
+      return { success: false, status: 'REJECTED', symbol: signal.symbol, exchange, reason: `REGIME_CONVICTION: ${regime.regime} requires conviction >= ${effectiveMinConvictionFromRegime}` };
+    }
+    regimePositionSizeMultiplier = regime.autoTraderAdjustments.positionSizeMultiplier;
+  } catch {
+    // regime check non-fatal
+  }
+
   // ─── Per-Exchange Config Enforcement ─────────────────────────────────────
   const exchangeKey = exchange === 'TOS' ? 'tos' : exchange === 'HYPERLIQUID' ? 'hyperliquid' : null;
 
@@ -187,6 +210,14 @@ export async function executeAutoTrade(
   }
   if (signal.confidenceScore < config.minConfidenceScore) {
     return { success: false, status: 'REJECTED', symbol: signal.symbol, exchange, reason: `Confidence ${signal.confidenceScore} below threshold ${config.minConfidenceScore}` };
+  }
+
+  // ─── Phase 5: Intraday confirmation check ───────────────────────────────
+  if (signal.intradayConfirmation === 'EXTENDED') {
+    return { success: false, status: 'REJECTED', symbol: signal.symbol, exchange, reason: 'INTRADAY_EXTENDED — price overbought on hourly, waiting for pullback' };
+  }
+  if (signal.intradayConfirmation === 'WAIT') {
+    return { success: false, status: 'REJECTED', symbol: signal.symbol, exchange, reason: 'INTRADAY_NOT_CONFIRMED — hourly trend contradicts daily setup' };
   }
 
   const portfolioState = await getPortfolioState();
@@ -269,6 +300,10 @@ export async function executeAutoTrade(
     maxPositionPct: config.maxPositionPct,
     convictionScore: signal.convictionScore,
     riskScore: (signal.riskScore ?? 50) / 100,
+    atrPercent: signal.atrPercent,
+    stopLossPrice: signal.stopLoss ?? computeStopLoss(entryPrice, 'LONG', config.stopLossPct),
+    entryPrice,
+    regimeSizeMultiplier: regimePositionSizeMultiplier,
   }, entryPrice);
 
   // Clamp to per-exchange position size limits
@@ -319,6 +354,35 @@ export async function executeAutoTrade(
   // Increment per-scan counter
   if (perScanTradeCount) {
     perScanTradeCount.set(exchange, (perScanTradeCount.get(exchange) ?? 0) + 1);
+  }
+
+  // ─── Phase 9: Options evaluation path (TOS only) ────────────────────────
+  if (exchange === 'TOS' && exchangeKey) {
+    try {
+      const settings = await prisma.userSettings.findUnique({ where: { id: userSettingsId } });
+      if (settings?.userId) {
+        const exCfg = await getConfig(settings.userId, 'tos');
+        if (exCfg.optionsEnabled) {
+          const optionsRec = await getRecommendation(
+            { ticker: signal.symbol, thesis: { bias: signal.bias, convictionScore: signal.convictionScore, suggestedHoldWindow: '2-4 WEEKS', invalidationZone: { level: signal.stopLoss ?? 0, description: '' } } } as any,
+            portfolioState.totalEquity,
+            portfolioState.totalEquity * (exCfg.maxOptionsRiskPct / 100),
+          ).catch(() => null);
+
+          if (optionsRec && optionsRec.strategy !== 'NONE' && exCfg.allowedOptionStrategies.includes(optionsRec.strategy)) {
+            await prisma.autoTradeLog.update({
+              where: { id: log.id },
+              data: {
+                metadata: JSON.parse(JSON.stringify({ signal, sized, optionsRecommendation: optionsRec })),
+                reason: `OPTIONS_AVAILABLE: ${optionsRec.strategy} — ${optionsRec.reasoning[0] ?? ''}`,
+              },
+            });
+          }
+        }
+      }
+    } catch {
+      // options check is non-fatal
+    }
   }
 
   try {

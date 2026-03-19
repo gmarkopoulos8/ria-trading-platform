@@ -179,4 +179,15 @@ router.get('/heatmap', async (req: Request, res: Response) => {
   });
 });
 
+router.get('/regime', async (req: Request, res: Response) => {
+  try {
+    const { detectRegime } = await import('../services/market/RegimeDetector');
+    const regime = await detectRegime();
+    return res.json(regime);
+  } catch (err) {
+    console.error('[/market/regime]', err);
+    return res.status(500).json({ error: 'Failed to detect regime' });
+  }
+});
+
 export default router;

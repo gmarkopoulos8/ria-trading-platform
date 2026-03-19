@@ -11,7 +11,7 @@ function clamp(n: number, min = 0, max = 100): number {
 function computeBias(ms: MarketStructureOutput, catalyst: CatalystOutput): Bias {
   const msSignal = ms.overallScore;
   const catSignal = catalyst.overallScore;
-  const compositeScore = msSignal * 0.6 + catSignal * 0.4;
+  const compositeScore = msSignal * 0.50 + catSignal * 0.50;
 
   if (compositeScore >= 60) return 'BULLISH';
   if (compositeScore <= 40) return 'BEARISH';
@@ -201,10 +201,18 @@ export function runThesisAgent(
 ): ThesisOutput {
   const bias = computeBias(ms, catalyst);
 
+  const volumeScore = (() => {
+    if (ms.momentum.score >= 70) return 80;
+    if (ms.momentum.score >= 55) return 65;
+    if (ms.momentum.score <= 30) return 25;
+    return 50;
+  })();
+
   const convictionScore = clamp(
-    ms.overallScore * 0.50 +
-    catalyst.overallScore * 0.30 +
-    (100 - risk.overallRiskScore) * 0.20
+    ms.overallScore         * 0.30 +
+    catalyst.overallScore   * 0.35 +
+    (100 - risk.overallRiskScore) * 0.20 +
+    volumeScore             * 0.15
   );
 
   const confidenceScore = clamp(

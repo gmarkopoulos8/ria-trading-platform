@@ -10,7 +10,7 @@ Full-stack AI paper trading research simulator. Premium dark-mode terminal UI fo
 - `server/src/services/alpaca/alpacaInfoService.ts` — account, positions, orders, portfolio history, market clock, drawdown computation
 - `server/src/services/alpaca/alpacaExchangeService.ts` — placeOrder (with dry-run mode + AlpacaOrderLog), cancelOrder, cancelAllOrders, closePosition, closeAllPositions
 - `server/src/services/alpaca/alpacaKillswitchService.ts` — pauseTrading, hardStop, emergencyExit, resumeTrading, drawdown monitor (60s polling)
-- `server/src/services/alpaca/AlpacaTestSuite.ts` — 10-test automated suite (market buy/sell, limit, bracket, fractional, balance check, latency)
+- `server/src/services/alpaca/AlpacaTestSuite.ts` — 11-test automated suite (market buy/sell, limit, bracket, fractional, balance check, latency, + options recommendation test)
 - `server/src/services/alpaca/StrategyReplayService.ts` — replay completed scan runs on Alpaca paper account
 - `server/src/services/alpaca/LatencyMonitor.ts` — 5s polling for fill latency, slippage, p95 stats tracking via `AlpacaOrderLog`
 - `server/src/routes/alpaca.ts` — 17 REST endpoints (status, account, positions, orders, portfolio history, order log, clock, controls, test suite, replay, latency)
@@ -41,6 +41,20 @@ Full-stack AI paper trading research simulator. Premium dark-mode terminal UI fo
 - `TOSConnectCard` in `TosDashboard.tsx` — 3-step OAuth wizard (credentials → authorize → connect)
 - `Dashboard.tsx` — exchange connection status cards + encryption warning banner
 - **ENCRYPTION_KEY** secret (64 hex chars) required for encrypted storage. Without it, credential storage is disabled (graceful fallback to env vars).
+
+### Signal Quality + Options Trading (12-Phase Implementation)
+- **Phase 1** — Real benchmark RS comparison: `relativeStrength.ts` uses SPY/BTC real bars; `TechnicalService.analyze()` accepts optional benchmarkBars
+- **Phase 2** — Rebalanced conviction weights in `ThesisAgent.ts` (MS 30%, catalysts 35%, risk 20%, volume 15%)
+- **Phase 3** — ATR-based position sizing in `PositionSizer.ts` (`atrPercent`, `stopLossPrice`, `regimeSizeMultiplier` params); fallback to % equity sizing
+- **Phase 4** — `RegimeDetector.ts` (BULL_TREND/CHOPPY/ELEVATED_VOLATILITY/BEAR_CRISIS); `/api/market/regime` route; Dashboard regime card showing VIX, SMAs, entry gate, size multiplier
+- **Phase 5** — 4-hour intraday confirmation types in `thesis/types.ts`; `AutoTradeSignal.intradayConfirmation` field; EXTENDED/WAIT signals block new entries in `AutoTradeExecutor.ts`
+- **Phase 6** — Crypto funding rate signal: `getFundingRate()` in `hyperliquidInfoService.ts`; integrated in `ThesisEngine.ts`
+- **Phase 7** — Insider transaction signal: `getInsiderSignal()` in `FinnhubNewsProvider.ts`; injected via `NewsService.ts`
+- **Phase 8** — Options infrastructure: `server/src/services/options/types.ts`, `OptionsDataService.ts`, `OptionsAnalyzer.ts` (strategy selection + IV rank + Greeks); `/api/options` routes (chain, recommendation, iv-rank); `api.options.*` in client
+- **Phase 9** — Schema options fields in `ExchangeAutoConfig` (optionsEnabled, preferOptions, maxOptionsRiskPct, allowedOptionStrategies); options evaluation path in `AutoTradeExecutor.ts` (regime block, conviction override, size multiplier, options rec attachment)
+- **Phase 10** — Options UI: `AutoTrader.tsx` options settings section (TOS only); `SymbolIntelligence.tsx` Options Analysis panel with IV rank / strategy recommendation; `DailyScan.tsx` intradayConfirmation badge column
+- **Phase 11** — Alpaca paper options testing: 11th test case in `AlpacaTestSuite.ts`; `OptionsRecommendationsPanel` in `AlpacaDashboard.tsx` (symbol picker, IV stats, leg details, reasoning)
+- **Phase 12** — Regime-aware options selection built into `OptionsAnalyzer.selectStrategy()` (BULL_TREND → LONG_CALL/BULL_SPREAD, BEAR_CRISIS → no new options, ELEVATED_VOLATILITY → premium selling)
 
 ## Architecture
 

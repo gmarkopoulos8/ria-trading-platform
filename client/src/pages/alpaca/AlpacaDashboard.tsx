@@ -289,6 +289,149 @@ function TestSuiteCard() {
   );
 }
 
+// ─── Phase 11: Options Recommendations Panel ────────────────────────────────
+
+const OPTIONS_DEMO_SYMBOLS = ['AAPL', 'MSFT', 'SPY', 'QQQ', 'NVDA'];
+
+function OptionsRecommendationsPanel() {
+  const [sym, setSym] = useState('AAPL');
+
+  const { data: recData, isLoading: recLoading, refetch: refetchRec } = useQuery({
+    queryKey: ['alpaca-options-rec', sym],
+    queryFn: async () => {
+      const r = await (api as any).options.recommendation(sym) as { success: boolean; data?: any };
+      return r.data ?? null;
+    },
+    staleTime: 15 * 60_000,
+    enabled: !!sym,
+  });
+  const { data: ivData, isLoading: ivLoading } = useQuery({
+    queryKey: ['alpaca-options-iv', sym],
+    queryFn: async () => {
+      const r = await (api as any).options.ivRank(sym) as { success: boolean; data?: any };
+      return r.data ?? null;
+    },
+    staleTime: 15 * 60_000,
+    enabled: !!sym,
+  });
+
+  const rec = recData;
+  const iv = ivData;
+  const loading = recLoading || ivLoading;
+
+  const strategyColor = (s: string) => {
+    if (s === 'LONG_CALL') return 'text-emerald-400 bg-emerald-400/10 border-emerald-400/30';
+    if (s === 'LONG_PUT') return 'text-red-400 bg-red-400/10 border-red-400/30';
+    if (s === 'BULL_CALL_SPREAD') return 'text-blue-400 bg-blue-400/10 border-blue-400/30';
+    if (s === 'BEAR_PUT_SPREAD') return 'text-orange-400 bg-orange-400/10 border-orange-400/30';
+    if (s === 'CASH_SECURED_PUT') return 'text-violet-400 bg-violet-400/10 border-violet-400/30';
+    if (s === 'COVERED_CALL') return 'text-zinc-300 bg-zinc-400/10 border-zinc-400/30';
+    return 'text-zinc-500 bg-zinc-700/30 border-zinc-600/30';
+  };
+
+  return (
+    <Card className="p-4">
+      <CardHeader
+        title="Options Recommendations"
+        subtitle="Phase 11 — paper options testing"
+        icon={<Zap className="w-4 h-4 text-blue-400" />}
+        action={
+          <button onClick={() => refetchRec()}
+            className="flex items-center gap-1 px-2 py-1 bg-zinc-700 hover:bg-zinc-600 text-zinc-300 text-xs rounded-lg">
+            <RefreshCw className="w-3 h-3" /> Refresh
+          </button>
+        }
+      />
+      <div className="flex gap-2 mt-3 mb-4 flex-wrap">
+        {OPTIONS_DEMO_SYMBOLS.map((s) => (
+          <button key={s}
+            onClick={() => setSym(s)}
+            className={cn('px-2.5 py-1 rounded-lg text-xs font-mono border transition-colors',
+              sym === s ? 'bg-blue-600/20 border-blue-500/40 text-blue-300' : 'bg-zinc-800 border-zinc-700 text-zinc-400 hover:text-zinc-200')}>
+            {s}
+          </button>
+        ))}
+      </div>
+
+      {loading && <div className="h-4 w-32 bg-zinc-700 animate-pulse rounded" />}
+
+      {!loading && iv && (
+        <div className="grid grid-cols-3 gap-3 mb-4">
+          <div className="rounded-lg bg-zinc-800 p-3">
+            <p className="text-[10px] text-zinc-500 uppercase tracking-wider">IV Rank</p>
+            <p className={cn('text-lg font-bold font-mono mt-0.5',
+              (iv.ivRank ?? 0) > 60 ? 'text-amber-400' : (iv.ivRank ?? 0) < 30 ? 'text-emerald-400' : 'text-white')}>
+              {iv.ivRank != null ? `${iv.ivRank.toFixed(0)}%` : '—'}
+            </p>
+            <p className="text-[10px] text-zinc-600 mt-0.5">
+              {(iv.ivRank ?? 0) > 60 ? 'High — favor selling' : (iv.ivRank ?? 0) < 30 ? 'Low — favor buying' : 'Moderate'}
+            </p>
+          </div>
+          <div className="rounded-lg bg-zinc-800 p-3">
+            <p className="text-[10px] text-zinc-500 uppercase tracking-wider">Implied Vol</p>
+            <p className="text-lg font-bold font-mono text-white mt-0.5">
+              {iv.impliedVolatility != null ? `${(iv.impliedVolatility * 100).toFixed(1)}%` : '—'}
+            </p>
+          </div>
+          <div className="rounded-lg bg-zinc-800 p-3">
+            <p className="text-[10px] text-zinc-500 uppercase tracking-wider">Percentile</p>
+            <p className="text-lg font-bold font-mono text-white mt-0.5">
+              {iv.ivPercentile != null ? `${iv.ivPercentile.toFixed(0)}th` : '—'}
+            </p>
+          </div>
+        </div>
+      )}
+
+      {!loading && rec && rec.strategy && rec.strategy !== 'NONE' && (
+        <div className="space-y-3">
+          <div className="flex items-center gap-3">
+            <span className={cn('text-xs font-bold px-2.5 py-1 rounded-lg border font-mono', strategyColor(rec.strategy))}>
+              {rec.strategy.replace(/_/g, ' ')}
+            </span>
+            <span className="text-xs text-zinc-500">for {sym}</span>
+          </div>
+          {rec.legs && rec.legs.length > 0 && (
+            <div className="space-y-1.5">
+              {rec.legs.map((leg: any, i: number) => (
+                <div key={i} className="flex items-center gap-3 text-xs bg-zinc-800/60 rounded px-3 py-2">
+                  <span className={cn('w-10 font-bold font-mono', leg.action === 'BUY' ? 'text-emerald-400' : 'text-red-400')}>{leg.action}</span>
+                  <span className="text-zinc-400">{leg.contractType}</span>
+                  <span className="font-mono text-zinc-300">{leg.expiration}</span>
+                  <span className="font-mono text-white">strike ${leg.strike?.toFixed(2)}</span>
+                  {leg.estimatedPremium != null && (
+                    <span className="text-zinc-500 ml-auto">~${leg.estimatedPremium.toFixed(2)}/contract</span>
+                  )}
+                </div>
+              ))}
+            </div>
+          )}
+          {rec.reasoning && rec.reasoning.length > 0 && (
+            <ul className="space-y-1">
+              {rec.reasoning.map((r: string, i: number) => (
+                <li key={i} className="flex items-start gap-1.5 text-xs text-zinc-400">
+                  <span className="text-blue-400 mt-0.5">·</span> {r}
+                </li>
+              ))}
+            </ul>
+          )}
+          <div className="flex gap-4 text-xs text-zinc-500">
+            {rec.maxRiskUsd != null && <span>Max risk: <span className="font-mono text-white">${rec.maxRiskUsd.toFixed(0)}</span></span>}
+            {rec.maxRewardUsd != null && <span>Max reward: <span className="font-mono text-emerald-400">${rec.maxRewardUsd.toFixed(0)}</span></span>}
+          </div>
+        </div>
+      )}
+
+      {!loading && rec && rec.strategy === 'NONE' && (
+        <p className="text-sm text-zinc-500 py-4">No actionable options setup for {sym} at this time</p>
+      )}
+
+      {!loading && !rec && (
+        <p className="text-sm text-zinc-500 py-4">Options data unavailable — requires market hours connectivity or a live data provider</p>
+      )}
+    </Card>
+  );
+}
+
 // ─── Strategy Replay Card ─────────────────────────────────────────────────────
 
 function StrategyReplayCard({ scanRuns }: { scanRuns: any[] }) {
@@ -845,6 +988,9 @@ export default function AlpacaDashboard() {
 
       {/* Strategy Replay */}
       <StrategyReplayCard scanRuns={scanRuns ?? []} />
+
+      {/* Phase 11: Options Recommendations */}
+      <OptionsRecommendationsPanel />
 
       {/* Paper vs Live Comparison Note */}
       <Card className="p-4 border-zinc-700/50">

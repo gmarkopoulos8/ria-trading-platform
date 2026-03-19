@@ -252,3 +252,60 @@ export async function fetchCryptoNews(ticker: string): Promise<NormalizedNewsIte
     return generateNewsItems(ticker, 'crypto', 15);
   }
 }
+
+// ─── Insider Signal (stocks only, Phase 7) ────────────────────────
+
+const _insiderCache = new Map<string, { data: InsiderSignal | null; ts: number }>();
+const INSIDER_TTL = 4 * 60 * 60 * 1000;
+
+export interface InsiderSignal {
+  recentBuys: number;
+  recentSells: number;
+  netSharesBought: number;
+  signal: 'BULLISH' | 'BEARISH' | 'NEUTRAL';
+  explanation: string;
+}
+
+export async function getInsiderSignal(ticker: string): Promise<InsiderSignal | null> {
+  const cached = _insiderCache.get(ticker);
+  if (cached && Date.now() - cached.ts < INSIDER_TTL) return cached.data;
+
+  const key = process.env.FINNHUB_API_KEY ?? '';
+  if (!key) return null;
+
+  try {
+    const from = new Date(Date.now() - 90 * 86400000).toISOString().slice(0, 10);
+    const to = new Date().toISOString().slice(0, 10);
+    const data = await finnhubGet(`/stock/insider-transactions`, {
+      symbol: ticker, from, to,
+    }) as { data?: Array<{ name: string; share: number; change: number; transactionCode: string; transactionPrice: number }> };
+
+    const transactions = data?.data ?? [];
+    const buys = transactions.filter((t) => t.transactionCode === 'P' && t.change > 0);
+    const sells = transactions.filter((t) => t.transactionCode === 'S' && t.change < 0);
+
+    const netShares = buys.reduce((s, t) => s + t.change, 0) + sells.reduce((s, t) => s + t.change, 0);
+    const buyCount = buys.length;
+    const sellCount = sells.length;
+
+    let signal: 'BULLISH' | 'BEARISH' | 'NEUTRAL' = 'NEUTRAL';
+    let explanation = '';
+
+    if (buyCount >= 2 && netShares > 0) {
+      signal = 'BULLISH';
+      explanation = `${buyCount} insider purchase${buyCount > 1 ? 's' : ''} in last 90 days — net ${netShares.toLocaleString()} shares bought. Strong insider conviction.`;
+    } else if (sellCount >= 3 && netShares < 0) {
+      signal = 'BEARISH';
+      explanation = `${sellCount} insider sales in last 90 days. Distribution by insiders.`;
+    } else {
+      explanation = `${buyCount} buys, ${sellCount} sells in last 90 days. No clear insider signal.`;
+    }
+
+    const result: InsiderSignal = { recentBuys: buyCount, recentSells: sellCount, netSharesBought: netShares, signal, explanation };
+    _insiderCache.set(ticker, { data: result, ts: Date.now() });
+    return result;
+  } catch {
+    _insiderCache.set(ticker, { data: null, ts: Date.now() });
+    return null;
+  }
+}

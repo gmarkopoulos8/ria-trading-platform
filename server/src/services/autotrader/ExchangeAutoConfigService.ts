@@ -46,6 +46,10 @@ export interface ExchangeAutoConfig {
   blockedSectors: string[];
   minAvgDailyVolume: number;
   minMarketCapUsd: number;
+  optionsEnabled: boolean;
+  preferOptions: boolean;
+  maxOptionsRiskPct: number;
+  allowedOptionStrategies: string[];
   createdAt: Date;
   updatedAt: Date;
 }

@@ -28,7 +28,8 @@ class TechnicalService {
   async analyze(
     ticker: string,
     bars: OHLCVBar[],
-    timeframe: Timeframe = '1M'
+    timeframe: Timeframe = '1M',
+    benchmarkBars?: OHLCVBar[]
   ): Promise<TechnicalAnalysisResult> {
     const cacheKey = `${ticker}:${timeframe}`;
     const cached = cache.get(cacheKey);
@@ -63,7 +64,7 @@ class TechnicalService {
     const volume = computeVolumeTrend(bars);
     const supportResistance = computeSupportResistance(bars);
     const trend = computeTrend(bars, currentPrice);
-    const relativeStrength = computeRelativeStrength(bars);
+    const relativeStrength = computeRelativeStrength(bars, benchmarkBars ?? null);
 
     const signals: SignalDirection[] = [
       sma.signal, ema.signal, rsi.signal, macd.signal,

@@ -1,0 +1,1102 @@
+# Replit Agent Prompt — Signal Quality Improvements + Options Trading
+
+This is an addendum to all previous prompts. Apply on top of everything already built. Do not remove, rename, or break any existing functionality. Every change in Phase 1–4 is a modification to existing files. Every change in Phase 5+ is a new addition.
+
+-----
+
+## PHASE 1 — Fix Relative Strength (Real Benchmark Comparison)
+
+The current `computeRelativeStrength()` in `server/src/services/technical/indicators/relativeStrength.ts` compares a ticker against itself — it measures absolute momentum, not relative strength. Replace the entire implementation.
+
+**New implementation:**
+
+```typescript
+import { OHLCVBar, RelativeStrengthResult, SignalDirection } from '../types';
+
+// SPY benchmark bars are passed in alongside the ticker bars
+// This is the only correct way to compute relative strength
+export function computeRelativeStrength(
+  tickerBars: OHLCVBar[],
+  benchmarkBars: OHLCVBar[] | null  // SPY for stocks, BTC for crypto
+): RelativeStrengthResult {
+  if (tickerBars.length < 20) {
+    return { value: 50, percentile: 50, signal: 'NEUTRAL', explanation: 'Insufficient data for relative strength.' };
+  }
+
+  // If no benchmark provided, fall back to absolute momentum (old behavior)
+  if (!benchmarkBars || benchmarkBars.length < 20) {
+    return computeAbsoluteMomentum(tickerBars);
+  }
+
+  // Align the two series by matching the most recent N bars
+  const n = Math.min(tickerBars.length, benchmarkBars.length, 60); // use last 60 bars
+  const tBars = tickerBars.slice(-n);
+  const bBars = benchmarkBars.slice(-n);
+
+  // Compute cumulative returns for both
+  const tStart = tBars[0].close;
+  const bStart = bBars[0].close;
+  const tEnd = tBars[tBars.length - 1].close;
+  const bEnd = bBars[bBars.length - 1].close;
+
+  const tReturn = (tEnd - tStart) / tStart;
+  const bReturn = (bEnd - bStart) / bStart;
+  const relativeReturn = tReturn - bReturn; // positive = outperforming benchmark
+
+  // Also compute 20-bar rolling relative strength
+  const rollingRS: number[] = [];
+  for (let i = 20; i <= n; i++) {
+    const tSlice = tBars.slice(i - 20, i);
+    const bSlice = bBars.slice(i - 20, i);
+    const tr = (tSlice[tSlice.length - 1].close - tSlice[0].close) / tSlice[0].close;
+    const br = (bSlice[bSlice.length - 1].close - bSlice[0].close) / bSlice[0].close;
+    rollingRS.push(tr - br);
+  }
+
+  // Score 0–100: 50 = matches benchmark, >50 = outperforming, <50 = underperforming
+  // Map relativeReturn to 0-100 scale: +20% outperformance = 100, -20% = 0
+  const value = Math.min(99, Math.max(1, Math.round(50 + relativeReturn * 250)));
+  const percentile = value;
+
+  let signal: SignalDirection = 'NEUTRAL';
+  if (value >= 65) signal = 'BULLISH';
+  else if (value <= 35) signal = 'BEARISH';
+
+  // Check if trend is improving or deteriorating
+  const recentRS = rollingRS.slice(-5);
+  const olderRS = rollingRS.slice(-10, -5);
+  const recentAvg = recentRS.length > 0 ? recentRS.reduce((a, b) => a + b, 0) / recentRS.length : 0;
+  const olderAvg = olderRS.length > 0 ? olderRS.reduce((a, b) => a + b, 0) / olderRS.length : 0;
+  const trend = recentAvg > olderAvg ? 'improving' : recentAvg < olderAvg ? 'deteriorating' : 'stable';
+
+  const direction = relativeReturn >= 0 ? 'outperforming' : 'underperforming';
+  const pct = Math.round(Math.abs(relativeReturn) * 1000) / 10;
+
+  const explanation = `Relative strength ${value}/100 — ${direction} benchmark by ${pct}% over ${n} bars. RS trend is ${trend}.`;
+
+  return { value, percentile, signal, explanation };
+}
+
+function computeAbsoluteMomentum(bars: OHLCVBar[]): RelativeStrengthResult {
+  // Fallback when no benchmark — absolute win rate method (unchanged from original)
+  const n = Math.min(bars.length, 60);
+  const recent = bars.slice(-n);
+  const step = Math.max(1, Math.floor(n / 20));
+  const windowReturns: number[] = [];
+  for (let i = step; i < recent.length; i += step) {
+    windowReturns.push((recent[i].close - recent[i - step].close) / recent[i - step].close);
+  }
+  const positiveWindows = windowReturns.filter((r) => r > 0).length;
+  const winRate = windowReturns.length > 0 ? positiveWindows / windowReturns.length : 0.5;
+  const value = Math.min(99, Math.max(1, Math.round(winRate * 100)));
+  let signal: SignalDirection = 'NEUTRAL';
+  if (value >= 65) signal = 'BULLISH';
+  else if (value <= 35) signal = 'BEARISH';
+  return {
+    value, percentile: value, signal,
+    explanation: `Absolute momentum ${value}/100 (no benchmark available). Positive in ${Math.round(winRate * 100)}% of windows.`,
+  };
+}
+```
+
+**Update `TechnicalService.analyze()`** to pass benchmark bars:
+
+In `server/src/services/technical/TechnicalService.ts`, update the `analyze()` method signature:
+
+```typescript
+async analyze(
+  ticker: string,
+  bars: OHLCVBar[],
+  timeframe: Timeframe = '1M',
+  benchmarkBars?: OHLCVBar[]  // NEW optional param — SPY bars for stocks
+): Promise<TechnicalAnalysisResult>
+```
+
+Change the `computeRelativeStrength(bars)` call to `computeRelativeStrength(bars, benchmarkBars ?? null)`.
+
+**Update `ThesisEngine.analyze()`** in `server/src/services/thesis/ThesisEngine.ts`:
+
+After fetching the ticker’s history, also fetch SPY history (for stocks) or BTC history (for crypto) to use as benchmark:
+
+```typescript
+const benchmarkTicker = resolvedClass === 'crypto' ? 'BTC' : 'SPY';
+
+// Only fetch benchmark if it's not the ticker itself
+const [quote, historyResult, catalystAnalysis, benchmarkHistoryResult] = await Promise.allSettled([
+  marketService.quote(ticker, resolvedClass as any),
+  marketService.history(ticker, '3M', resolvedClass as any),
+  newsService.getCatalysts(ticker, { limit: 15 }),
+  ticker !== benchmarkTicker
+    ? marketService.history(benchmarkTicker, '3M', resolvedClass === 'crypto' ? 'crypto' : 'stock')
+    : Promise.resolve([]),
+]);
+
+const benchmarkBars = benchmarkHistoryResult.status === 'fulfilled' ? benchmarkHistoryResult.value : [];
+
+// Pass benchmarkBars to technicalService.analyze:
+const [taResult, patResult] = await Promise.all([
+  technicalService.analyze(ticker, bars, '3M', benchmarkBars),
+  technicalService.analyzePatterns(ticker, bars, '3M'),
+]);
+```
+
+Cache the benchmark bars separately with a 60-minute TTL to avoid redundant API calls — SPY/BTC bars don’t change that often.
+
+-----
+
+## PHASE 2 — Rebalance Conviction Score Weights
+
+In `server/src/services/thesis/ThesisAgent.ts`, update the `runThesisAgent()` function’s `convictionScore` calculation. Find this exact block and replace it:
+
+**FIND:**
+
+```typescript
+const convictionScore = clamp(
+  ms.overallScore * 0.50 +
+  catalyst.overallScore * 0.30 +
+  (100 - risk.overallRiskScore) * 0.20
+);
+```
+
+**REPLACE WITH:**
+
+```typescript
+// Volume confirmation score: reward high volume + price direction alignment
+const volumeScore = (() => {
+  const vol = ms.momentum; // already has volume signal baked in
+  const volRatio = ms.volatility.atrPercent ?? 2; // proxy for activity level
+  // Volume spike on correct direction = strong confirmation
+  if (ms.momentum.score >= 70) return 80;
+  if (ms.momentum.score >= 55) return 65;
+  if (ms.momentum.score <= 30) return 25;
+  return 50;
+})();
+
+const convictionScore = clamp(
+  ms.overallScore         * 0.30 +  // technical (down from 0.50)
+  catalyst.overallScore   * 0.35 +  // catalyst/news (up from 0.30)
+  (100 - risk.overallRiskScore) * 0.20 + // risk-adjusted (unchanged)
+  volumeScore             * 0.15    // volume confirmation (new)
+);
+```
+
+Also update the `computeBias()` function to weight catalyst signals more:
+
+**FIND:**
+
+```typescript
+const compositeScore = msSignal * 0.6 + catSignal * 0.4;
+```
+
+**REPLACE WITH:**
+
+```typescript
+const compositeScore = msSignal * 0.50 + catSignal * 0.50;
+```
+
+Equal weighting on bias determination. A strong catalyst with weak technicals should be as biased as strong technicals with weak catalysts.
+
+-----
+
+## PHASE 3 — Volatility-Adjusted Position Sizing
+
+The `PositionSizer` from the previous autonomous trading prompt uses fixed risk percentages. Update it to use ATR-based sizing.
+
+In `server/src/services/portfolio/PositionSizer.ts`, update `calculatePositionSize()`:
+
+```typescript
+// Replace the existing quantity calculation with this:
+
+// Get ATR from the thesis result if available
+const atrValue = input.atrPercent; // will be added to SizingInput below
+const atrBasedStop = atrValue !== null && atrValue !== undefined
+  ? input.entryPrice * (atrValue / 100) * 1.5  // 1.5x ATR stop width
+  : Math.abs(input.entryPrice - input.stopLossPrice);  // fallback to thesis invalidation
+
+// Use the WIDER of the ATR stop or the thesis invalidation stop
+// Never use a stop tighter than ATR × 1.0 (would be stopped out by noise)
+const effectiveStopDistance = Math.max(
+  atrBasedStop,
+  Math.abs(input.entryPrice - input.stopLossPrice),
+  input.entryPrice * 0.005  // minimum 0.5% stop distance
+);
+
+const riskAmount = portfolioEquity * (riskPct / 100);
+let quantity = riskAmount / effectiveStopDistance;
+
+// Hard limits
+const maxNotional = Math.min(
+  portfolioEquity * 0.10,        // never more than 10% of portfolio notional
+  config.maxPositionSizeUsd,     // exchange config hard cap
+);
+const notionalValue = quantity * input.entryPrice;
+if (notionalValue > maxNotional) {
+  quantity = maxNotional / input.entryPrice;
+}
+```
+
+Update `SizingInput` interface to include `atrPercent?: number`:
+
+```typescript
+interface SizingInput {
+  // ... existing fields ...
+  atrPercent?: number;  // from ThesisEngine's marketStructure.volatility.atrPercent
+}
+```
+
+Update `AutoTradeExecutor.ts` to pass `atrPercent` from the thesis result when calling `PositionSizer`:
+
+```typescript
+quantity = PositionSizer.calculatePositionSize({
+  // ... existing fields ...
+  atrPercent: candidate.rawThesis.marketStructure.volatility.atrPercent ?? undefined,
+});
+```
+
+-----
+
+## PHASE 4 — Regime Detector
+
+**File**: `server/src/services/market/RegimeDetector.ts`
+
+```typescript
+export type MarketRegime = 'BULL_TREND' | 'CHOPPY' | 'ELEVATED_VOLATILITY' | 'BEAR_CRISIS';
+
+export interface RegimeState {
+  regime: MarketRegime;
+  vix: number | null;
+  spyAbove50sma: boolean;
+  spyAbove200sma: boolean;
+  spyRecentDrawdown: number;
+  description: string;
+  autoTraderAdjustments: {
+    minConvictionOverride: number;
+    positionSizeMultiplier: number;
+    allowNewEntries: boolean;
+    longOnly: boolean;
+  };
+  detectedAt: Date;
+}
+```
+
+**`detectRegime(): Promise<RegimeState>`**:
+
+1. Fetch VIX quote via Yahoo Finance: `await marketService.quote('^VIX', 'stock')` — Yahoo Finance supports VIX as a symbol. Cache for 15 minutes.
+1. Fetch SPY 3-month daily bars to compute SMA50 and recent drawdown.
+1. Classify regime:
+
+```typescript
+function classifyRegime(vix: number | null, spyAbove50: boolean, spyAbove200: boolean, drawdownPct: number): MarketRegime {
+  if (vix !== null && vix > 30) return 'BEAR_CRISIS';
+  if (vix !== null && vix > 22) return 'ELEVATED_VOLATILITY';
+  if (!spyAbove200 || drawdownPct > 10) return 'BEAR_CRISIS';
+  if (!spyAbove50 || drawdownPct > 5) return 'ELEVATED_VOLATILITY';
+  if (spyAbove50 && spyAbove200 && (vix === null || vix < 18)) return 'BULL_TREND';
+  return 'CHOPPY';
+}
+```
+
+1. Return regime with auto trader adjustments:
+
+```typescript
+const adjustments = {
+  BULL_TREND:           { minConvictionOverride: 78,  positionSizeMultiplier: 1.0,  allowNewEntries: true,  longOnly: false },
+  CHOPPY:               { minConvictionOverride: 85,  positionSizeMultiplier: 0.60, allowNewEntries: true,  longOnly: true  },
+  ELEVATED_VOLATILITY:  { minConvictionOverride: 88,  positionSizeMultiplier: 0.40, allowNewEntries: true,  longOnly: true  },
+  BEAR_CRISIS:          { minConvictionOverride: 99,  positionSizeMultiplier: 0.0,  allowNewEntries: false, longOnly: true  },
+};
+```
+
+`BEAR_CRISIS` with `minConvictionOverride: 99` and `allowNewEntries: false` means no new entries. Existing positions continue to be monitored.
+
+**Wire into `AutoTradeExecutor.ts`**:
+
+At the top of `evaluateAndExecute()`, before any candidate evaluation:
+
+```typescript
+const regime = await regimeDetector.detectRegime();
+
+// Log regime to AutoTradeLog as an action='REGIME_CHECK' entry
+// Apply regime adjustments:
+const effectiveMinConviction = Math.max(
+  config.minConvictionScore,
+  regime.autoTraderAdjustments.minConvictionOverride
+);
+const positionSizeMultiplier = regime.autoTraderAdjustments.positionSizeMultiplier;
+
+if (!regime.autoTraderAdjustments.allowNewEntries) {
+  console.log(`[AutoTrader] Regime: ${regime.regime} — new entries blocked`);
+  // Still monitor and manage existing positions, just no new entries
+  return { evaluated: 0, skipped: 0, placed: 0, errors: 0, regime: regime.regime, positions: [] };
+}
+
+// Apply size multiplier to all positions placed in this run
+// Pass positionSizeMultiplier to PositionSizer as a final multiplier after ATR sizing
+```
+
+Also apply `regime.autoTraderAdjustments.longOnly` — if true, skip any candidate with `bias === 'BEARISH'` regardless of the exchange config’s `allowShorts` setting.
+
+**Add regime display to Dashboard**:
+
+In `client/src/pages/Dashboard.tsx`, add a small regime indicator card in the exchange status section:
+
+```tsx
+<div className={cn(
+  'flex items-center gap-2 px-3 py-2 rounded-lg text-xs border',
+  regime === 'BULL_TREND'          ? 'bg-accent-green/10 border-accent-green/30 text-accent-green' :
+  regime === 'CHOPPY'              ? 'bg-amber-500/10 border-amber-500/30 text-amber-400' :
+  regime === 'ELEVATED_VOLATILITY' ? 'bg-orange-500/10 border-orange-500/30 text-orange-400' :
+                                     'bg-red-500/10 border-red-500/30 text-red-400'
+)}>
+  <Activity className="h-3.5 w-3.5" />
+  <span className="font-semibold font-mono">
+    {regime === 'BULL_TREND' ? '● Bull Trend' :
+     regime === 'CHOPPY' ? '◐ Choppy Market' :
+     regime === 'ELEVATED_VOLATILITY' ? '⚠ Elevated Volatility' :
+     '🔴 Bear/Crisis Mode'}
+  </span>
+  <span className="text-slate-500 ml-auto">VIX: {vix?.toFixed(1) ?? '—'}</span>
+</div>
+```
+
+Add `GET /api/market/regime` route that returns `RegimeState`. Add to `client/src/api/client.ts`.
+
+-----
+
+## PHASE 5 — 4-Hour Confirmation Check
+
+In `server/src/services/thesis/ThesisEngine.ts`, add a 4-hour timeframe check as a final validation step before returning the thesis result.
+
+After computing the main thesis result, fetch 1-week hourly bars and run a subset analysis:
+
+```typescript
+// 4-hour confirmation (only for stock assets — crypto already monitored 24/7)
+let intradayConfirmation: 'CONFIRMED' | 'EXTENDED' | 'WAIT' | 'UNAVAILABLE' = 'UNAVAILABLE';
+
+if (resolvedClass !== 'crypto') {
+  try {
+    const hourlyBars = await marketService.history(ticker, '1W', resolvedClass as any);
+    // '1W' returns 60-minute bars from Yahoo Finance — use last 30 bars as proxy for 4H
+    if (hourlyBars.length >= 10) {
+      const intradayRSI = calcRSI(hourlyBars.map(b => b.close), 14);
+      const intradayTrend = computeTrend(hourlyBars, hourlyBars[hourlyBars.length - 1].close);
+
+      if (intradayRSI !== null) {
+        if (thesis.bias === 'BULLISH') {
+          if (intradayRSI > 72) {
+            intradayConfirmation = 'EXTENDED'; // overbought on hourly — wait for pullback
+          } else if (intradayRSI >= 45 && intradayTrend.direction !== 'BEARISH') {
+            intradayConfirmation = 'CONFIRMED';
+          } else {
+            intradayConfirmation = 'WAIT';
+          }
+        } else if (thesis.bias === 'BEARISH') {
+          if (intradayRSI < 28) {
+            intradayConfirmation = 'EXTENDED';
+          } else if (intradayRSI <= 55 && intradayTrend.direction !== 'BULLISH') {
+            intradayConfirmation = 'CONFIRMED';
+          } else {
+            intradayConfirmation = 'WAIT';
+          }
+        } else {
+          intradayConfirmation = 'WAIT';
+        }
+      }
+    }
+  } catch {
+    intradayConfirmation = 'UNAVAILABLE';
+  }
+}
+```
+
+Add `intradayConfirmation` to `FullThesisResult` type in `server/src/services/thesis/types.ts`:
+
+```typescript
+export type IntradayConfirmation = 'CONFIRMED' | 'EXTENDED' | 'WAIT' | 'UNAVAILABLE';
+
+// Add to FullThesisResult:
+intradayConfirmation: IntradayConfirmation;
+```
+
+In `AutoTradeExecutor.ts`, add this check after the conviction threshold check:
+
+```typescript
+const confirmation = candidate.rawThesis.intradayConfirmation;
+if (confirmation === 'EXTENDED') {
+  logSkip(ticker, 'INTRADAY_EXTENDED — price overbought on hourly, waiting for pullback');
+  continue;
+}
+if (confirmation === 'WAIT') {
+  logSkip(ticker, 'INTRADAY_NOT_CONFIRMED — hourly trend contradicts daily setup');
+  continue;
+}
+// CONFIRMED and UNAVAILABLE both proceed
+```
+
+Show the `intradayConfirmation` value on `DailyScan.tsx` results (already in the previous prompt’s intraday column).
+
+-----
+
+## PHASE 6 — Crypto-Specific Signals (Funding Rate)
+
+In `server/src/services/hyperliquid/hyperliquidInfoService.ts`, the funding rate data is already available via the Hyperliquid API. Add a function to fetch it:
+
+**`getFundingRate(asset: string): Promise<{ rate: number; annualized: number } | null>`**:
+
+```typescript
+// Hyperliquid: POST /info with { type: 'metaAndAssetCtxs' } returns funding rates
+export async function getFundingRate(asset: string): Promise<{ rate: number; annualized: number } | null> {
+  try {
+    const data = await postInfo<[UniverseMeta, AssetContext[]]>({ type: 'metaAndAssetCtxs' });
+    const [meta, contexts] = data;
+    const idx = meta.universe.findIndex(a => a.name.toUpperCase() === asset.toUpperCase());
+    if (idx === -1) return null;
+    const ctx = contexts[idx];
+    const rate = parseFloat(ctx?.funding ?? '0');
+    return { rate, annualized: rate * 3 * 365 * 100 }; // 3 funding periods/day × 365 days × 100 for pct
+  } catch {
+    return null;
+  }
+}
+```
+
+Add `AssetContext` interface:
+
+```typescript
+interface AssetContext {
+  funding: string;
+  openInterest: string;
+  prevDayPx: string;
+  dayNtlVlm: string;
+  premium: string;
+  oraclePx: string;
+  markPx: string;
+  midPx: string | null;
+  impactPxs: string[] | null;
+}
+```
+
+**Use in ThesisEngine** for crypto assets:
+
+After computing the risk output for crypto tickers, fetch the funding rate and apply a modifier:
+
+```typescript
+if (resolvedClass === 'crypto') {
+  const fundingData = await getFundingRate(ticker).catch(() => null);
+  if (fundingData !== null) {
+    // Extreme positive funding (longs paying too much) = crowded long, bearish signal
+    // Extreme negative funding (shorts paying too much) = crowded short, bullish signal
+    const fundingModifier = (() => {
+      if (fundingData.rate > 0.001)  return -8;  // >0.1% per 8h = crowded long, reduce bullish conviction
+      if (fundingData.rate > 0.0005) return -4;  // >0.05% = elevated
+      if (fundingData.rate < -0.001) return +8;  // extreme negative = crowded short, squeeze potential
+      if (fundingData.rate < -0.0005) return +4;
+      return 0;
+    })();
+
+    // Apply modifier to conviction score
+    result.thesis.convictionScore = Math.min(100, Math.max(0,
+      result.thesis.convictionScore + fundingModifier
+    ));
+
+    // Add to supporting reasons or warnings
+    if (Math.abs(fundingModifier) > 0) {
+      const direction = fundingModifier > 0 ? 'negative' : 'positive';
+      const impact = fundingModifier > 0 ? 'potential squeeze setup' : 'crowded trade — caution';
+      result.thesis.supportingReasons.push(
+        `Funding rate ${(fundingData.rate * 100).toFixed(4)}%/8h (${direction}) — ${impact}`
+      );
+    }
+  }
+}
+```
+
+-----
+
+## PHASE 7 — Insider Transactions Signal Booster
+
+Finnhub’s `GET /stock/insider-transactions?symbol={ticker}` endpoint is already on your free plan. Use it to boost conviction when C-suite insiders are buying.
+
+**Add to `FinnhubNewsProvider.ts`** (from previous prompt):
+
+```typescript
+export async function getInsiderSignal(ticker: string): Promise<{
+  recentBuys: number;
+  recentSells: number;
+  netSharesBought: number;
+  signal: 'BULLISH' | 'BEARISH' | 'NEUTRAL';
+  explanation: string;
+} | null> {
+  try {
+    await finnhubRateLimiter.waitForToken();
+    const from = new Date(Date.now() - 90 * 86400000).toISOString().slice(0, 10); // last 90 days
+    const to = new Date().toISOString().slice(0, 10);
+    const { data } = await axios.get(
+      `${FINNHUB_BASE}/stock/insider-transactions?symbol=${ticker}&from=${from}&to=${to}&token=${API_KEY}`
+    );
+
+    const transactions: Array<{ name: string; share: number; change: number; transactionCode: string; transactionPrice: number }> =
+      data?.data ?? [];
+
+    // Only care about open market buys (P) and sells (S) — not grants or exercises
+    const buys = transactions.filter(t => t.transactionCode === 'P' && t.change > 0);
+    const sells = transactions.filter(t => t.transactionCode === 'S' && t.change < 0);
+
+    const netShares = buys.reduce((s, t) => s + t.change, 0) + sells.reduce((s, t) => s + t.change, 0);
+    const buyCount = buys.length;
+    const sellCount = sells.length;
+
+    let signal: 'BULLISH' | 'BEARISH' | 'NEUTRAL' = 'NEUTRAL';
+    let explanation = '';
+
+    if (buyCount >= 2 && netShares > 0) {
+      signal = 'BULLISH';
+      explanation = `${buyCount} insider purchase${buyCount > 1 ? 's' : ''} in last 90 days — net ${netShares.toLocaleString()} shares bought. Strong insider conviction.`;
+    } else if (sellCount >= 3 && netShares < 0) {
+      signal = 'BEARISH';
+      explanation = `${sellCount} insider sales in last 90 days. Distribution by insiders.`;
+    } else {
+      explanation = `${buyCount} buys, ${sellCount} sells in last 90 days. No clear insider signal.`;
+    }
+
+    return { recentBuys: buyCount, recentSells: sellCount, netSharesBought: netShares, signal, explanation };
+  } catch {
+    return null;
+  }
+}
+```
+
+**Use in `NewsService.getCatalysts()`** — after fetching news, also fetch insider data for stocks and append as a synthetic catalyst item if signal is BULLISH or BEARISH. This flows into the CatalystAgent automatically.
+
+Only fetch for stocks (not crypto). Cache per ticker for 4 hours.
+
+-----
+
+## PHASE 8 — Options Infrastructure
+
+### 8A. Options Data Service
+
+**File**: `server/src/services/options/OptionsDataService.ts`
+
+```typescript
+import axios from 'axios';
+
+const FINNHUB_BASE = 'https://finnhub.io/api/v1';
+const API_KEY = process.env.FINNHUB_API_KEY ?? '';
+
+export interface OptionContract {
+  contractSymbol: string;  // e.g. "AAPL240119C00185000"
+  type: 'call' | 'put';
+  strike: number;
+  expiration: string;       // YYYY-MM-DD
+  dte: number;              // days to expiration
+  bid: number;
+  ask: number;
+  mid: number;
+  last: number;
+  volume: number;
+  openInterest: number;
+  impliedVolatility: number;
+  delta: number | null;
+  gamma: number | null;
+  theta: number | null;
+  vega: number | null;
+  inTheMoney: boolean;
+}
+
+export interface OptionsChain {
+  ticker: string;
+  expirations: string[];
+  calls: OptionContract[];
+  puts: OptionContract[];
+  fetchedAt: Date;
+}
+
+export interface IVRank {
+  current: number;    // current 30-day IV
+  rank: number;       // 0–100: where current IV sits in 52-week range
+  percentile: number; // same as rank for our purposes
+  isHigh: boolean;    // true if rank > 50
+  isLow: boolean;     // true if rank < 30
+}
+```
+
+**`getOptionsChain(ticker: string): Promise<OptionsChain | null>`**:
+
+- `GET https://finnhub.io/api/v1/stock/option-chain?symbol={ticker}&token={key}`
+- Finnhub returns: `{ data: [{ expirationDate, options: { CALL: [...], PUT: [...] } }] }`
+- Map Finnhub’s response structure to `OptionsChain`
+- Finnhub option fields: `contractSymbol`, `contractSize`, `currency`, `expirationDate`, `strike`, `type`, `lastPrice`, `bid`, `ask`, `volume`, `openInterest`, `impliedVolatility`, `delta`, `gamma`, `theta`, `vega`, `inTheMoney`
+- Filter out contracts with: volume < 10, openInterest < 50, bid === 0 (illiquid)
+- Cache per ticker for 15 minutes
+- Always call `await finnhubRateLimiter.waitForToken()` before the request
+
+**`computeIVRank(ticker: string): Promise<IVRank | null>`**:
+
+- Finnhub doesn’t have a direct IVRank endpoint, but we can approximate it:
+- Fetch the option chain and compute average IV across near-term ATM contracts
+- Compare to the 52-week high/low of the stock price as a proxy (when stock is near 52W low, IV tends to be high)
+- More accurately: fetch `GET /stock/metric?symbol={ticker}&metric=all` — this has `52WeekHigh`, `52WeekLow`, and `beta`
+- Use beta as a proxy for IV: `ivRank = Math.min(100, Math.max(0, (beta - 0.5) / 2.0 * 100))` for a rough estimate
+- Cache for 1 hour
+
+**`getDTE(expiration: string): number`**:
+
+- Helper to compute days from today to expiration date
+
+**`filterByDTE(contracts: OptionContract[], minDTE: number, maxDTE: number): OptionContract[]`**:
+**`filterByDelta(contracts: OptionContract[], minDelta: number, maxDelta: number): OptionContract[]`**:
+**`filterByLiquidity(contracts: OptionContract[], minVolume: number, minOI: number): OptionContract[]`**:
+**`getBidAskSpreadPct(contract: OptionContract): number`**:
+
+- `(ask - bid) / mid * 100` — reject if > 15%
+
+### 8B. Options Analyzer
+
+**File**: `server/src/services/options/OptionsAnalyzer.ts`
+
+```typescript
+import { OptionsDataService, OptionContract, IVRank } from './OptionsDataService';
+import type { FullThesisResult } from '../thesis/types';
+
+export type OptionsStrategy =
+  | 'LONG_CALL'
+  | 'LONG_PUT'
+  | 'BULL_CALL_SPREAD'
+  | 'BEAR_PUT_SPREAD'
+  | 'CASH_SECURED_PUT'
+  | 'NONE';
+
+export interface OptionsLeg {
+  action: 'BUY' | 'SELL';
+  contract: OptionContract;
+  contracts: number;        // number of contracts (1 contract = 100 shares)
+}
+
+export interface OptionsRecommendation {
+  strategy: OptionsStrategy;
+  ticker: string;
+  legs: OptionsLeg[];
+  maxRisk: number;           // max dollars at risk
+  maxProfit: number;         // max dollars profit (Infinity for uncapped)
+  breakeven: number;         // stock price at breakeven
+  probabilityOfProfit: number; // 0–100, derived from delta
+  ivRank: number;
+  netDebit: number;          // positive = you pay, negative = you receive
+  rewardRiskRatio: number;
+  reasoning: string[];
+  warnings: string[];
+  fetchedAt: Date;
+}
+```
+
+**`getRecommendation(thesis: FullThesisResult, accountEquity: number, maxRiskDollars: number): Promise<OptionsRecommendation | null>`**:
+
+```typescript
+async getRecommendation(thesis, accountEquity, maxRiskDollars) {
+  const ticker = thesis.ticker;
+  const bias = thesis.thesis.bias;
+  const conviction = thesis.thesis.convictionScore;
+  const holdWindow = thesis.thesis.suggestedHoldWindow;
+  const currentPrice = thesis.marketStructure.currentPrice;
+
+  // Only recommend options for stocks (not crypto — different mechanics)
+  if (ticker.length > 5 || currentPrice < 5) return null;
+
+  const [chain, ivRank] = await Promise.all([
+    optionsDataService.getOptionsChain(ticker),
+    optionsDataService.computeIVRank(ticker),
+  ]);
+
+  if (!chain || chain.calls.length === 0) return null;
+
+  const ivR = ivRank?.rank ?? 50;
+  const targetDTEMin = 25;
+  const targetDTEMax = 50;
+  const strategy = selectStrategy(bias, conviction, ivR, holdWindow);
+
+  if (strategy === 'NONE') return null;
+
+  // Build legs based on strategy
+  switch (strategy) {
+    case 'LONG_CALL':
+      return buildLongCall(ticker, chain, currentPrice, ivR, maxRiskDollars, thesis);
+
+    case 'LONG_PUT':
+      return buildLongPut(ticker, chain, currentPrice, ivR, maxRiskDollars, thesis);
+
+    case 'BULL_CALL_SPREAD':
+      return buildBullCallSpread(ticker, chain, currentPrice, ivR, maxRiskDollars, thesis);
+
+    case 'BEAR_PUT_SPREAD':
+      return buildBearPutSpread(ticker, chain, currentPrice, ivR, maxRiskDollars, thesis);
+
+    case 'CASH_SECURED_PUT':
+      return buildCashSecuredPut(ticker, chain, currentPrice, ivR, maxRiskDollars, thesis);
+
+    default:
+      return null;
+  }
+}
+```
+
+**`selectStrategy()`**:
+
+```typescript
+function selectStrategy(bias, conviction, ivRank, holdWindow): OptionsStrategy {
+  const holdDays = parseHoldWindowDays(holdWindow); // '2-4 WEEKS' → 21, '1-3 MONTHS' → 60, etc.
+
+  if (bias === 'NEUTRAL') return 'NONE';
+  if (conviction < 70) return 'NONE'; // options only on high conviction
+
+  if (bias === 'BULLISH') {
+    if (ivRank > 55 && conviction >= 75) return 'CASH_SECURED_PUT'; // sell premium in high IV
+    if (conviction >= 82 && holdDays <= 30) return 'LONG_CALL';     // directional bet
+    if (conviction >= 70) return 'BULL_CALL_SPREAD';                 // defined risk
+  }
+
+  if (bias === 'BEARISH') {
+    if (conviction >= 82 && holdDays <= 30) return 'LONG_PUT';
+    if (conviction >= 70) return 'BEAR_PUT_SPREAD';
+  }
+
+  return 'NONE';
+}
+```
+
+**Leg selection functions:**
+
+**`buildLongCall()`**:
+
+1. Filter calls to `targetDTEMin–targetDTEMax` range
+1. Find contract where `delta` is closest to 0.60 (slightly ITM)
+1. Check liquidity: volume ≥ 100, OI ≥ 500, spread ≤ 15% of mid
+1. If no liquid contract: return null
+1. Number of contracts: `Math.floor(maxRiskDollars / (contract.mid * 100))`; minimum 1
+1. Max risk = contracts × mid × 100 (premium paid)
+1. Breakeven = strike + mid
+1. Probability of profit = approximately `(delta - 0.10) * 100` (rough estimate from delta)
+
+**`buildBullCallSpread()`**:
+
+1. Buy the 0.55–0.65 delta call (25–50 DTE)
+1. Sell the call at strike approximately 5% above current price (same expiration)
+1. Net debit = long mid - short mid
+1. Max risk = net debit × contracts × 100
+1. Max profit = (short strike - long strike - net debit) × contracts × 100
+1. Ensure reward:risk ≥ 1.5:1; if not, skip
+1. Breakeven = long strike + net debit
+
+**`buildCashSecuredPut()`**:
+
+1. Filter puts to 25–35 DTE
+1. Find put at or just below nearest support level from thesis (use `thesis.thesis.invalidationZone.level` as strike reference)
+1. Target delta of -0.30 to -0.40 (out of the money)
+1. Check: stock price must be at least 5% above strike (don’t sell puts too close to current price)
+1. Net credit = mid × contracts × 100 (you receive this immediately)
+1. Max risk = (strike - mid) × contracts × 100 (if stock goes to zero — very unlikely)
+1. Breakeven = strike - mid
+1. Cash required = strike × 100 × contracts (must have this in account)
+
+**`buildLongPut()`** and **`buildBearPutSpread()`** — mirror images of LONG_CALL and BULL_CALL_SPREAD respectively.
+
+**`parseHoldWindowDays()`**:
+
+```typescript
+function parseHoldWindowDays(w: string): number {
+  if (w.includes('INTRADAY')) return 1;
+  if (w.includes('1-3 DAYS')) return 2;
+  if (w.includes('1-2 WEEKS')) return 10;
+  if (w.includes('2-4 WEEKS')) return 21;
+  if (w.includes('1-3 MONTHS')) return 60;
+  if (w.includes('3-6 MONTHS')) return 120;
+  return 21; // default
+}
+```
+
+### 8C. Options Types
+
+**File**: `server/src/services/options/types.ts`
+
+Export all the interfaces from 8A and 8B. Also add:
+
+```typescript
+export interface OptionsPosition {
+  contractSymbol: string;
+  ticker: string;
+  strategy: OptionsStrategy;
+  legs: OptionsLeg[];
+  openedAt: Date;
+  entryDebit: number;      // what was paid at entry
+  currentValue: number;    // current mid × contracts × 100
+  unrealizedPnl: number;
+  unrealizedPnlPct: number;
+  dteAtEntry: number;
+  currentDTE: number;
+  deltaAtEntry: number;
+  currentDelta: number | null;
+  warnings: string[];      // theta accelerating, delta degraded, IV collapsed
+}
+```
+
+-----
+
+## PHASE 9 — Options in TOS Auto Trader
+
+### 9A. ExchangeAutoConfig update
+
+Add to `ExchangeAutoConfig` in the DB schema (from previous addendum):
+
+```prisma
+// Add to ExchangeAutoConfig model:
+optionsEnabled       Boolean  @default(false)
+preferOptions        Boolean  @default(false)  // when true, prefer options over stock entries
+maxOptionsRiskPct    Float    @default(1.0)     // max % of portfolio per options trade
+allowedOptionStrategies String[] @default(["LONG_CALL", "BULL_CALL_SPREAD"])
+```
+
+Run `npx prisma migrate dev --name add_options_config`.
+
+### 9B. AutoTradeExecutor Options Path
+
+In `server/src/services/autotrader/AutoTradeExecutor.ts`, add an options evaluation branch:
+
+After all standard checks pass for a TOS candidate and before placing the stock order:
+
+```typescript
+// Check if options are enabled for TOS
+if (exchangeConfig.optionsEnabled && exchange === 'tos') {
+  const optionsRec = await optionsAnalyzer.getRecommendation(
+    candidate.rawThesis,
+    portfolioState.tos.equity,
+    portfolioState.tos.equity * (exchangeConfig.maxOptionsRiskPct / 100)
+  );
+
+  if (optionsRec && optionsRec.strategy !== 'NONE') {
+    // Check if this strategy is in the allowed list
+    if (exchangeConfig.allowedOptionStrategies.includes(optionsRec.strategy)) {
+      if (exchangeConfig.preferOptions) {
+        // Place options trade instead of stock
+        await placeOptionsOrder(optionsRec, userId);
+        logAction(ticker, 'OPTIONS_PLACED', optionsRec);
+        continue; // skip the stock entry
+      } else {
+        // Place both stock AND options (if capital allows)
+        // Log the options recommendation even if not trading it
+        logAction(ticker, 'OPTIONS_AVAILABLE', optionsRec);
+      }
+    }
+  }
+}
+```
+
+**`placeOptionsOrder(rec: OptionsRecommendation, userId: string): Promise<void>`**:
+
+- For each leg in `rec.legs`:
+  - Build TOS order request with `assetType: 'OPTION'`, `symbol: leg.contract.contractSymbol`
+  - `instruction`: `BUY_TO_OPEN` for buy legs, `SELL_TO_OPEN` for sell legs
+  - `orderType: 'LIMIT'`, `price: leg.contract.mid`
+  - Log to `TosOrderLog` with `assetType: 'OPTION'`
+- For spreads: use `orderType: 'NET_DEBIT'` with both legs in a single order (TOS supports multi-leg options orders)
+
+### 9C. Options Position Monitoring
+
+In `server/src/services/monitoring/AlertEngine.ts`, add options-specific alert types to the `MonitorAlertType` union:
+
+```typescript
+export type MonitorAlertType =
+  // ... existing types ...
+  | 'OPTIONS_DELTA_DEGRADED'    // delta dropped below 0.30 — option losing directional sensitivity
+  | 'OPTIONS_THETA_ACCELERATING' // < 21 DTE — time decay accelerating
+  | 'OPTIONS_IV_COLLAPSED'       // IV dropped significantly since entry
+  | 'OPTIONS_EXPIRING_SOON';     // < 7 DTE — time to act or let expire
+```
+
+In `IntradayMonitorLoop.ts`, add options position checks for open positions with `assetType === 'OPTION'`. For each open options position:
+
+- Check current delta vs entry delta
+- Check DTE
+- Check current IV vs entry IV
+- Fire appropriate alerts
+
+-----
+
+## PHASE 10 — Options UI
+
+### 10A. Symbol Intelligence Page Enhancement
+
+In `client/src/pages/SymbolIntelligence.tsx`, add an **“Options Analysis”** tab alongside existing analysis tabs. This tab shows:
+
+- **Strategy Recommendation card**: fetches from new `GET /api/options/recommendation?symbol={ticker}` route
+  - Shows recommended strategy, legs, max risk, max profit, breakeven, IV rank
+  - “Add to Auto Trader” button that opens the exchange config modal pre-filled
+- **Options Chain table**: fetches from `GET /api/options/chain?symbol={ticker}`
+  - Filterable by expiration date dropdown
+  - Toggle: Calls | Puts | Both
+  - Columns: Strike, DTE, Bid, Ask, Mid, Volume, OI, IV, Delta, Theta
+  - Highlight the “sweet spot” contracts (25–50 DTE, 0.50–0.65 delta) with a subtle blue background
+- **IV Rank indicator**: a gauge 0–100 with zones:
+  - 0–30: “Low IV — good time to BUY options” (green)
+  - 30–60: “Normal IV” (yellow)
+  - 60–100: “High IV — good time to SELL premium” (red)
+
+### 10B. Auto Trader Page Options Section
+
+In `client/src/pages/AutoTrader.tsx`, add an **“Options Settings”** section inside the TOS exchange configuration panel (not the HL panel):
+
+```tsx
+{/* Options Trading — TOS only */}
+<div className="space-y-3 pt-3 border-t border-surface-border">
+  <p className="text-xs text-slate-500 font-mono uppercase tracking-wider">Options Trading</p>
+  
+  {/* Enable options */}
+  <div className="flex items-center justify-between">
+    <div>
+      <p className="text-sm text-white">Enable Options Trading</p>
+      <p className="text-xs text-slate-500">Analyzes options strategies alongside stock entries</p>
+    </div>
+    <toggle for optionsEnabled />
+  </div>
+
+  {optionsEnabled && (
+    <>
+      {/* Prefer options over stocks */}
+      <div className="flex items-center justify-between">
+        <div>
+          <p className="text-sm text-white">Prefer Options Over Stocks</p>
+          <p className="text-xs text-slate-500">When a good options setup exists, use it instead of stock entry</p>
+        </div>
+        <toggle for preferOptions />
+      </div>
+
+      {/* Max options risk */}
+      <div>
+        <label className="text-xs text-slate-500 mb-1 block">Max Risk Per Options Trade (%)</label>
+        <input type="number" step="0.1" min="0.1" max="3" for maxOptionsRiskPct />
+        <p className="text-xs text-slate-600 mt-1">Max premium to risk per options position as % of portfolio</p>
+      </div>
+
+      {/* Allowed strategies */}
+      <div>
+        <label className="text-xs text-slate-500 mb-2 block">Allowed Strategies</label>
+        <div className="space-y-1.5">
+          {[
+            { key: 'LONG_CALL', label: 'Long Call', desc: 'Buy calls on bullish setups' },
+            { key: 'LONG_PUT', label: 'Long Put', desc: 'Buy puts on bearish setups' },
+            { key: 'BULL_CALL_SPREAD', label: 'Bull Call Spread', desc: 'Defined risk bullish spread' },
+            { key: 'BEAR_PUT_SPREAD', label: 'Bear Put Spread', desc: 'Defined risk bearish spread' },
+            { key: 'CASH_SECURED_PUT', label: 'Cash-Secured Put', desc: 'Sell puts for income on bullish names (high IV only)' },
+          ].map(strategy => (
+            <checkbox key={strategy.key} label={strategy.label} desc={strategy.desc} />
+          ))}
+        </div>
+        <p className="text-xs text-amber-400 mt-2">⚠ Options trading requires appropriate Schwab account permissions</p>
+      </div>
+    </>
+  )}
+</div>
+```
+
+### 10C. New API Routes
+
+**File**: add to `server/src/routes/` or inline in `server/src/routes/stocks.ts`:
+
+```
+GET /api/options/chain?symbol={ticker}              → full options chain
+GET /api/options/recommendation?symbol={ticker}     → OptionsRecommendation for current thesis
+GET /api/options/iv-rank?symbol={ticker}           → IVRank
+```
+
+Register in `server/src/index.ts` under `/api/options`.
+
+Add to `client/src/api/client.ts`:
+
+```typescript
+options: {
+  chain: (symbol: string) => apiGet(`/options/chain?symbol=${symbol}`),
+  recommendation: (symbol: string) => apiGet(`/options/recommendation?symbol=${symbol}`),
+  ivRank: (symbol: string) => apiGet(`/options/iv-rank?symbol=${symbol}`),
+},
+```
+
+-----
+
+## PHASE 11 — Alpaca Paper Options Testing
+
+Since Alpaca paper supports options by default, add options support to the Alpaca tab:
+
+In `server/src/services/alpaca/alpacaExchangeService.ts`, the existing `placeOrder()` already handles options orders since Alpaca uses the same `/v2/orders` endpoint for options contracts. Just ensure the symbol can be an options contract symbol (like `AAPL240119C00185000`).
+
+In `AlpacaTestSuite.ts`, add an 11th test case:
+
+```
+11. "Options Order (Paper)" — Buy 1 AAPL call contract at the best ask. Verify order placed, cancel it.
+```
+
+In `AlpacaDashboard.tsx`, add an options recommendations panel to the Testing Tools section that fetches `GET /api/options/recommendation` for each open paper position and shows what options play would be available.
+
+-----
+
+## PHASE 12 — Regime-Aware Options Selection
+
+When the regime detector returns `ELEVATED_VOLATILITY` or `BEAR_CRISIS`, adjust the options strategy selection:
+
+In `OptionsAnalyzer.selectStrategy()`, add regime awareness:
+
+```typescript
+// Import regime detector
+const regime = await regimeDetector.detectRegime();
+
+// In ELEVATED_VOLATILITY: prefer defined-risk spreads, no naked long options
+if (regime.regime === 'ELEVATED_VOLATILITY') {
+  if (bias === 'BULLISH' && ivRank > 40) return 'CASH_SECURED_PUT'; // sell elevated premium
+  if (bias === 'BULLISH') return 'BULL_CALL_SPREAD'; // defined risk only
+  if (bias === 'BEARISH') return 'BEAR_PUT_SPREAD';
+}
+
+// In BEAR_CRISIS: only sell premium (collect income) or no options
+if (regime.regime === 'BEAR_CRISIS') {
+  return 'NONE'; // don't trade options in a crisis
+}
+```
+
+-----
+
+## SUMMARY
+
+### New Files
+
+```
+server/src/services/market/RegimeDetector.ts
+server/src/services/options/OptionsDataService.ts
+server/src/services/options/OptionsAnalyzer.ts
+server/src/services/options/types.ts
+```
+
+### Modified Files
+
+```
+server/src/services/technical/indicators/relativeStrength.ts  → real benchmark comparison
+server/src/services/technical/TechnicalService.ts             → pass benchmarkBars to RS
+server/src/services/thesis/ThesisEngine.ts                    → fetch benchmark, 4H check, funding rate, insider signal
+server/src/services/thesis/ThesisAgent.ts                     → rebalanced conviction weights
+server/src/services/thesis/types.ts                           → add IntradayConfirmation field
+server/src/services/portfolio/PositionSizer.ts                → ATR-based sizing
+server/src/services/autotrader/AutoTradeExecutor.ts           → regime check, options path, ATR sizing
+server/src/services/hyperliquid/hyperliquidInfoService.ts     → add getFundingRate()
+server/src/services/news/FinnhubNewsProvider.ts               → add getInsiderSignal()
+server/src/services/news/NewsService.ts                       → call getInsiderSignal() for stocks
+server/src/services/monitoring/AlertEngine.ts                 → add options alert types
+server/src/services/autotrader/IntradayMonitorLoop.ts         → options position monitoring
+server/prisma/schema.prisma                                   → options fields in ExchangeAutoConfig
+server/src/index.ts                                           → register /api/options routes
+client/src/pages/Dashboard.tsx                               → regime indicator card
+client/src/pages/SymbolIntelligence.tsx                      → options analysis tab
+client/src/pages/AutoTrader.tsx                              → options settings section
+client/src/pages/alpaca/AlpacaDashboard.tsx                  → options test case, recommendations panel
+client/src/api/client.ts                                     → options API methods, regime method
+```
+
+### Secrets Required
+
+No new secrets. Uses existing `FINNHUB_API_KEY` for all options data endpoints.

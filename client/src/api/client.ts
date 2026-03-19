@@ -92,6 +92,13 @@ export const api = {
     overview: () => get('/market/overview'),
     opportunities: (params?: Record<string, unknown>) => get('/market/opportunities', params),
     movers: (params?: Record<string, unknown>) => get('/market/movers', params),
+    regime: () => get('/market/regime'),
+  },
+
+  options: {
+    chain: (symbol: string) => get(`/options/chain?symbol=${symbol}`),
+    recommendation: (symbol: string) => get(`/options/recommendation?symbol=${symbol}`),
+    ivRank: (symbol: string) => get(`/options/iv-rank?symbol=${symbol}`),
   },
 
   symbols: {

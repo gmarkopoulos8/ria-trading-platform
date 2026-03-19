@@ -162,6 +162,43 @@ export async function getDrawdownPct(userState: UserState | null): Promise<numbe
   return Math.max(0, drawdown);
 }
 
+// ─── Funding Rate ─────────────────────────────────────────────────
+
+interface AssetContext {
+  funding: string;
+  openInterest: string;
+  prevDayPx: string;
+  dayNtlVlm: string;
+  premium: string;
+  oraclePx: string;
+  markPx: string;
+  midPx: string | null;
+  impactPxs: string[] | null;
+}
+
+const _fundingCache = new Map<string, { rate: number; annualized: number; ts: number }>();
+const FUNDING_TTL = 5 * 60 * 1000;
+
+export async function getFundingRate(asset: string): Promise<{ rate: number; annualized: number } | null> {
+  const cached = _fundingCache.get(asset.toUpperCase());
+  if (cached && Date.now() - cached.ts < FUNDING_TTL) {
+    return { rate: cached.rate, annualized: cached.annualized };
+  }
+  try {
+    const data = await postInfo<[UniverseMeta, AssetContext[]]>({ type: 'metaAndAssetCtxs' });
+    const [meta, contexts] = data;
+    const idx = meta.universe.findIndex((a) => a.name.toUpperCase() === asset.toUpperCase());
+    if (idx === -1) return null;
+    const ctx = contexts[idx];
+    const rate = parseFloat(ctx?.funding ?? '0');
+    const annualized = rate * 3 * 365 * 100;
+    _fundingCache.set(asset.toUpperCase(), { rate, annualized, ts: Date.now() });
+    return { rate, annualized };
+  } catch {
+    return null;
+  }
+}
+
 // ─── Asset index lookup ───────────────────────────────────────────
 
 let _metaCache: UniverseMeta | null = null;

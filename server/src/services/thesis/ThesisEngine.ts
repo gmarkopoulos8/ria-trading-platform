@@ -7,13 +7,20 @@ import { runCatalystAgent } from './CatalystAgent';
 import { runRiskAgent } from './RiskAgent';
 import { runThesisAgent } from './ThesisAgent';
 import { isCryptoSymbol } from '../market/utils';
+import { getFundingRate } from '../hyperliquid/hyperliquidInfoService';
+import { calcRSI } from '../technical/indicators/rsi';
+import { computeTrend } from '../technical/indicators/trend';
 import prisma from '../../lib/prisma';
 import type {
   FullThesisResult, ThesisSummary, MarketStructureOutput, CatalystOutput, RiskOutput,
+  IntradayConfirmation,
 } from './types';
+import type { OHLCVBar } from '../technical/types';
 
 const CACHE_TTL_MS = 10 * 60 * 1000;
+const BENCHMARK_CACHE_TTL_MS = 60 * 60 * 1000;
 const cache = new Map<string, { result: FullThesisResult; ts: number }>();
+const benchmarkCache = new Map<string, { bars: OHLCVBar[]; ts: number }>();
 
 const SCAN_TICKERS = [
   { ticker: 'NVDA', name: 'NVIDIA Corp', assetClass: 'stock' },
@@ -28,6 +35,26 @@ const SCAN_TICKERS = [
   { ticker: 'SOL', name: 'Solana', assetClass: 'crypto' },
 ];
 
+async function fetchBenchmarkBars(resolvedClass: string, ticker: string): Promise<OHLCVBar[]> {
+  const benchmarkTicker = resolvedClass === 'crypto' ? 'BTC' : 'SPY';
+  if (ticker === benchmarkTicker) return [];
+
+  const cached = benchmarkCache.get(benchmarkTicker);
+  if (cached && Date.now() - cached.ts < BENCHMARK_CACHE_TTL_MS) return cached.bars;
+
+  try {
+    const bars = await marketService.history(
+      benchmarkTicker,
+      '3M',
+      resolvedClass === 'crypto' ? 'crypto' : 'stock',
+    );
+    benchmarkCache.set(benchmarkTicker, { bars, ts: Date.now() });
+    return bars;
+  } catch {
+    return [];
+  }
+}
+
 class ThesisEngine {
   async analyze(ticker: string, assetClass?: string, opts?: { scanMode?: boolean }): Promise<FullThesisResult> {
     const key = `${ticker}:${assetClass ?? ''}`;
@@ -41,20 +68,34 @@ class ThesisEngine {
       ? () => finnhubProvider.history(ticker, '3M')
       : () => marketService.history(ticker, '3M', resolvedClass as 'stock' | 'crypto' | 'etf');
 
-    const [quote, historyResult, catalystAnalysis] = await Promise.allSettled([
+    const benchmarkTicker = resolvedClass === 'crypto' ? 'BTC' : 'SPY';
+    const fetchBenchmark = ticker !== benchmarkTicker
+      ? marketService.history(benchmarkTicker, '3M', resolvedClass === 'crypto' ? 'crypto' : 'stock').catch(() => [] as OHLCVBar[])
+      : Promise.resolve([] as OHLCVBar[]);
+
+    const [quote, historyResult, catalystAnalysis, benchmarkHistoryResult] = await Promise.allSettled([
       marketService.quote(ticker, resolvedClass as 'stock' | 'crypto' | 'etf'),
       historyProvider(),
       newsService.getCatalysts(ticker, { limit: 15 }),
+      fetchBenchmark,
     ]);
 
     const quoteData = quote.status === 'fulfilled' ? quote.value : null;
     const bars = historyResult.status === 'fulfilled' ? historyResult.value : [];
     const catalysts = catalystAnalysis.status === 'fulfilled' ? catalystAnalysis.value : null;
+    const benchmarkBars = benchmarkHistoryResult.status === 'fulfilled'
+      ? (benchmarkHistoryResult.value as OHLCVBar[])
+      : [];
+
+    // Cache benchmark
+    if (benchmarkBars.length > 0) {
+      benchmarkCache.set(benchmarkTicker, { bars: benchmarkBars, ts: Date.now() });
+    }
 
     const currentPrice = quoteData?.price ?? (bars.length > 0 ? bars[bars.length - 1].close : 100);
 
     const [taResult, patResult] = await Promise.all([
-      technicalService.analyze(ticker, bars, '3M'),
+      technicalService.analyze(ticker, bars, '3M', benchmarkBars),
       technicalService.analyzePatterns(ticker, bars, '3M'),
     ]);
 
@@ -75,12 +116,74 @@ class ThesisEngine {
     const risk: RiskOutput = runRiskAgent(ms, cat, quoteForRisk);
     const thesis = runThesisAgent(ms, cat, risk);
 
+    // ─── Phase 6: Crypto funding rate modifier ──────────────────────
+    if (resolvedClass === 'crypto') {
+      const fundingData = await getFundingRate(ticker).catch(() => null);
+      if (fundingData !== null) {
+        const fundingModifier = (() => {
+          if (fundingData.rate > 0.001)  return -8;
+          if (fundingData.rate > 0.0005) return -4;
+          if (fundingData.rate < -0.001) return +8;
+          if (fundingData.rate < -0.0005) return +4;
+          return 0;
+        })();
+
+        thesis.convictionScore = Math.min(100, Math.max(0, thesis.convictionScore + fundingModifier));
+
+        if (Math.abs(fundingModifier) > 0) {
+          const direction = fundingModifier > 0 ? 'negative' : 'positive';
+          const impact = fundingModifier > 0 ? 'potential squeeze setup' : 'crowded trade — caution';
+          thesis.supportingReasons.push(
+            `Funding rate ${(fundingData.rate * 100).toFixed(4)}%/8h (${direction}) — ${impact}`
+          );
+        }
+      }
+    }
+
+    // ─── Phase 5: 4-hour intraday confirmation ──────────────────────
+    let intradayConfirmation: IntradayConfirmation = 'UNAVAILABLE';
+
+    if (resolvedClass !== 'crypto') {
+      try {
+        const hourlyBars = await marketService.history(ticker, '1W', resolvedClass as 'stock' | 'etf');
+        if (hourlyBars.length >= 10) {
+          const intradayRSI = calcRSI(hourlyBars.map((b) => b.close), 14);
+          const intradayTrend = computeTrend(hourlyBars, hourlyBars[hourlyBars.length - 1].close);
+
+          if (intradayRSI !== null) {
+            if (thesis.bias === 'BULLISH') {
+              if (intradayRSI > 72) {
+                intradayConfirmation = 'EXTENDED';
+              } else if (intradayRSI >= 45 && intradayTrend.direction !== 'BEARISH') {
+                intradayConfirmation = 'CONFIRMED';
+              } else {
+                intradayConfirmation = 'WAIT';
+              }
+            } else if (thesis.bias === 'BEARISH') {
+              if (intradayRSI < 28) {
+                intradayConfirmation = 'EXTENDED';
+              } else if (intradayRSI <= 55 && intradayTrend.direction !== 'BULLISH') {
+                intradayConfirmation = 'CONFIRMED';
+              } else {
+                intradayConfirmation = 'WAIT';
+              }
+            } else {
+              intradayConfirmation = 'WAIT';
+            }
+          }
+        }
+      } catch {
+        intradayConfirmation = 'UNAVAILABLE';
+      }
+    }
+
     const result: FullThesisResult = {
       ticker,
       marketStructure: ms,
       catalysts: cat,
       risk,
       thesis,
+      intradayConfirmation,
       analyzedAt: new Date(),
     };
 

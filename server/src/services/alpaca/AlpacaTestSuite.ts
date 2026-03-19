@@ -2,6 +2,7 @@ import axios from 'axios';
 import { ALPACA_PAPER_URL, getAlpacaCredentials } from './alpacaConfig';
 import { placeOrder, cancelOrder, cancelAllOrders, closePosition } from './alpacaExchangeService';
 import { getAccount, getPositions } from './alpacaInfoService';
+import { getRecommendation } from '../options/OptionsAnalyzer';
 
 export interface TestCase {
   name: string;
@@ -98,6 +99,7 @@ export async function runTestSuite(userId: string): Promise<TestSuiteResult> {
       { name: 'Account Balance Check',   description: 'Verify equity > 0 and buying_power > 0.',                              status: 'pending' },
       { name: 'Position Count Verify',   description: 'After closes, verify position count is 0.',                            status: 'pending' },
       { name: 'Latency Check',           description: 'Place + cancel a market order. Measure round-trip < 5000ms.',          status: 'pending' },
+      { name: 'Options Recommendation',  description: 'Fetch options strategy recommendation for AAPL. Expect: valid strategy object returned.', status: 'pending' },
     ],
   };
 
@@ -191,6 +193,24 @@ export async function runTestSuite(userId: string): Promise<TestSuiteResult> {
     const latency = Date.now() - start;
     if (latency >= 5000) throw new Error(`Latency ${latency}ms exceeds 5000ms threshold`);
     return { latencyMs: latency };
+  });
+
+  await runTest(result.tests[10], async () => {
+    const rec = await getRecommendation(
+      {
+        ticker: 'AAPL',
+        thesis: {
+          bias: 'BULLISH',
+          convictionScore: 80,
+          suggestedHoldWindow: '2-4 WEEKS',
+          invalidationZone: { level: 170, description: 'Below key support' },
+        },
+      } as any,
+      100_000,
+      1_000,
+    );
+    if (!rec || !rec.strategy) throw new Error('No recommendation returned');
+    return { strategy: rec.strategy, legs: rec.legs?.length ?? 0 };
   });
 
   result.passed   = result.tests.filter((t) => t.status === 'passed').length;

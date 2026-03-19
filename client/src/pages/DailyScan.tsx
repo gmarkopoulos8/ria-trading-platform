@@ -53,6 +53,7 @@ interface ScanResult {
   invalidationZoneJson: { level: number; description: string };
   takeProfit1Json: { level: number; description: string };
   takeProfit2Json: { level: number; description: string };
+  intradayConfirmation?: string;
 }
 
 interface ScanRun {
@@ -351,6 +352,22 @@ function ResultRow({ result, expanded, onToggle }: { result: ScanResult; expande
           <div className="hidden xl:block w-32 flex-shrink-0">
             <span className="text-xs text-slate-400 truncate block">{result.setupType}</span>
           </div>
+          {result.intradayConfirmation && (
+            <div className="hidden xl:flex flex-shrink-0">
+              <span className={cn(
+                'text-[10px] font-bold px-1.5 py-0.5 rounded font-mono',
+                result.intradayConfirmation === 'CONFIRMED' ? 'bg-accent-green/20 text-accent-green' :
+                result.intradayConfirmation === 'EXTENDED' ? 'bg-amber-500/20 text-amber-400' :
+                result.intradayConfirmation === 'WAIT' ? 'bg-red-500/20 text-red-400' :
+                'bg-surface-3 text-slate-500',
+              )}>
+                {result.intradayConfirmation === 'CONFIRMED' ? '4H ✓' :
+                 result.intradayConfirmation === 'EXTENDED' ? '4H EXT' :
+                 result.intradayConfirmation === 'WAIT' ? '4H WAIT' :
+                 result.intradayConfirmation}
+              </span>
+            </div>
+          )}
           <div className="ml-auto flex-shrink-0">
             {expanded ? <ChevronUp className="h-4 w-4 text-slate-500" /> : <ChevronDown className="h-4 w-4 text-slate-500" />}
           </div>

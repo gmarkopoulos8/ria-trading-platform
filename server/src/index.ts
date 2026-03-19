@@ -19,6 +19,7 @@ import tosRouter from './routes/tos';
 import autotraderRouter from './routes/autotrader';
 import credentialRouter from './routes/credentials';
 import alpacaRouter from './routes/alpaca';
+import optionsRouter from './routes/options';
 import { errorHandler, notFoundHandler } from './middleware/errorHandler';
 import { monitorAllOpenPositions } from './services/monitoring/PositionMonitor';
 import { startDailyScanScheduler } from './services/scans/dailyScanScheduler';
@@ -117,6 +118,7 @@ app.use('/api/tos', tosRouter);
 app.use('/api/autotrader', autotraderRouter);
 app.use('/api/credentials', credentialRouter);
 app.use('/api/alpaca', alpacaRouter);
+app.use('/api/options', optionsRouter);
 
 app.use('/api/*', notFoundHandler);
 app.use(errorHandler);

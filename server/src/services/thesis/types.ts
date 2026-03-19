@@ -115,12 +115,15 @@ export interface ThesisOutput {
   expiresAt: Date;
 }
 
+export type IntradayConfirmation = 'CONFIRMED' | 'EXTENDED' | 'WAIT' | 'UNAVAILABLE';
+
 export interface FullThesisResult {
   ticker: string;
   marketStructure: MarketStructureOutput;
   catalysts: CatalystOutput;
   risk: RiskOutput;
   thesis: ThesisOutput;
+  intradayConfirmation: IntradayConfirmation;
   analyzedAt: Date;
 }
 

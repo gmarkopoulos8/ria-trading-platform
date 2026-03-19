@@ -43,6 +43,10 @@ interface AutoTradeConfig {
   stopLossPct: number;
   takeProfitPct: number;
   dryRun: boolean;
+  optionsEnabled?: boolean;
+  preferOptions?: boolean;
+  maxOptionsRiskPct?: number;
+  allowedOptionStrategies?: string[];
 }
 
 interface ExchangeBalance { exchange: string; equity: number; cash: number; unrealizedPnl: number; available: boolean }
@@ -417,6 +421,77 @@ function ConfigEditor({ config, onSave, saving }: {
           })}
         </div>
       </div>
+
+      {/* Options Settings — TOS only */}
+      {local.exchange === 'TOS' && (
+        <div className="rounded-xl border border-surface-border bg-surface-2/50 p-4 space-y-3">
+          <p className="text-xs font-semibold text-slate-300 uppercase tracking-wider">Options Trading (TOS)</p>
+          <div className="flex items-center justify-between">
+            <div>
+              <p className="text-sm text-white">Enable options evaluation</p>
+              <p className="text-xs text-slate-500">Attach options recommendations to auto-trade signals</p>
+            </div>
+            <button
+              onClick={() => field('optionsEnabled', !local.optionsEnabled)}
+              className={cn('w-10 h-5 rounded-full transition-colors relative', local.optionsEnabled ? 'bg-accent-blue' : 'bg-surface-3')}
+            >
+              <span className={cn('absolute top-0.5 h-4 w-4 rounded-full bg-white transition-transform', local.optionsEnabled ? 'translate-x-5' : 'translate-x-0.5')} />
+            </button>
+          </div>
+          {local.optionsEnabled && (
+            <>
+              <div className="flex items-center justify-between">
+                <div>
+                  <p className="text-sm text-white">Prefer options over equities</p>
+                  <p className="text-xs text-slate-500">Route qualifying signals to options orders first</p>
+                </div>
+                <button
+                  onClick={() => field('preferOptions', !local.preferOptions)}
+                  className={cn('w-10 h-5 rounded-full transition-colors relative', local.preferOptions ? 'bg-accent-blue' : 'bg-surface-3')}
+                >
+                  <span className={cn('absolute top-0.5 h-4 w-4 rounded-full bg-white transition-transform', local.preferOptions ? 'translate-x-5' : 'translate-x-0.5')} />
+                </button>
+              </div>
+              <div>
+                <label className="text-xs text-slate-500 uppercase tracking-wider">Max Options Risk % of Equity</label>
+                <div className="flex items-center gap-2 mt-1">
+                  <input
+                    type="range" min="0.5" max="5" step="0.5"
+                    value={local.maxOptionsRiskPct ?? 1.0}
+                    onChange={(e) => field('maxOptionsRiskPct', parseFloat(e.target.value))}
+                    className="flex-1 accent-accent-blue"
+                  />
+                  <span className="text-sm font-mono text-white w-10 text-right">{(local.maxOptionsRiskPct ?? 1.0).toFixed(1)}%</span>
+                </div>
+              </div>
+              <div>
+                <label className="text-xs text-slate-500 uppercase tracking-wider mb-2 block">Allowed Strategies</label>
+                <div className="flex flex-wrap gap-2">
+                  {['LONG_CALL', 'LONG_PUT', 'BULL_CALL_SPREAD', 'BEAR_PUT_SPREAD', 'CASH_SECURED_PUT', 'COVERED_CALL'].map((s) => {
+                    const allowed: string[] = local.allowedOptionStrategies ?? ['LONG_CALL', 'BULL_CALL_SPREAD'];
+                    const active = allowed.includes(s);
+                    return (
+                      <button
+                        key={s}
+                        onClick={() => {
+                          const next = active ? allowed.filter((x) => x !== s) : [...allowed, s];
+                          field('allowedOptionStrategies', next);
+                        }}
+                        className={cn(
+                          'px-2.5 py-1 rounded-lg text-[11px] font-semibold border transition-colors',
+                          active ? 'border-accent-blue/50 bg-accent-blue/10 text-accent-blue' : 'border-surface-border bg-surface-3 text-slate-500',
+                        )}
+                      >
+                        {s.replace(/_/g, ' ')}
+                      </button>
+                    );
+                  })}
+                </div>
+              </div>
+            </>
+          )}
+        </div>
+      )}
 
       <div className="flex justify-end">
         <button

@@ -103,6 +103,13 @@ export default function Dashboard() {
     refetchInterval: 60_000,
   });
 
+  const { data: regimeData } = useQuery({
+    queryKey: ['market-regime'],
+    queryFn: () => api.market.regime(),
+    staleTime: 5 * 60_000,
+    refetchInterval: 10 * 60_000,
+  });
+
   const encryptionOk = (credData as any)?.data?.encryptionConfigured !== false;
   const hlCred = (credData as any)?.data?.hyperliquid;
   const tosCred = (credData as any)?.data?.tos;
@@ -408,6 +415,60 @@ export default function Dashboard() {
           </div>
         </div>
       )}
+
+      {/* ── Market Regime Card ── */}
+      {regimeData && (() => {
+        const r = (regimeData as any)?.data;
+        if (!r) return null;
+        const regimeColors: Record<string, string> = {
+          BULL_TREND: 'bg-accent-green/5 border-accent-green/30',
+          CHOPPY: 'bg-amber-500/5 border-amber-500/30',
+          ELEVATED_VOLATILITY: 'bg-orange-500/5 border-orange-500/30',
+          BEAR_CRISIS: 'bg-red-500/5 border-red-500/30',
+        };
+        const regimeDotColors: Record<string, string> = {
+          BULL_TREND: 'bg-accent-green',
+          CHOPPY: 'bg-amber-400',
+          ELEVATED_VOLATILITY: 'bg-orange-400',
+          BEAR_CRISIS: 'bg-red-400',
+        };
+        const regimeLabels: Record<string, string> = {
+          BULL_TREND: 'Bull Trend',
+          CHOPPY: 'Choppy / Sideways',
+          ELEVATED_VOLATILITY: 'Elevated Volatility',
+          BEAR_CRISIS: 'Bear / Crisis',
+        };
+        const cls = regimeColors[r.regime] ?? 'bg-surface-2 border-surface-border';
+        const dot = regimeDotColors[r.regime] ?? 'bg-slate-400';
+        return (
+          <div className={cn('p-4 rounded-xl border flex items-start justify-between gap-4', cls)}>
+            <div className="flex items-start gap-3">
+              <div className="mt-0.5 flex-shrink-0 flex items-center gap-1.5">
+                <span className={cn('w-2.5 h-2.5 rounded-full animate-pulse', dot)} />
+              </div>
+              <div>
+                <p className="text-sm font-semibold text-white">
+                  Market Regime: {regimeLabels[r.regime] ?? r.regime}
+                </p>
+                <p className="text-xs text-slate-400 mt-0.5">{r.description}</p>
+                <div className="flex flex-wrap gap-3 mt-2 text-[11px] text-slate-500">
+                  <span>Size×: <span className="font-mono text-slate-300">{r.autoTraderAdjustments?.positionSizeMultiplier?.toFixed(2)}</span></span>
+                  <span>Min conviction: <span className="font-mono text-slate-300">{r.autoTraderAdjustments?.minConvictionOverride}</span></span>
+                  <span>New entries: <span className={cn('font-semibold', r.autoTraderAdjustments?.allowNewEntries ? 'text-accent-green' : 'text-red-400')}>{r.autoTraderAdjustments?.allowNewEntries ? 'Yes' : 'Blocked'}</span></span>
+                  {r.autoTraderAdjustments?.longOnly && <span className="text-amber-400 font-semibold">Long-only mode</span>}
+                </div>
+              </div>
+            </div>
+            {r.indicators && (
+              <div className="text-right text-[11px] text-slate-500 flex-shrink-0">
+                {r.indicators.vix !== null && <p>VIX <span className="font-mono text-slate-300">{r.indicators.vix?.toFixed(1)}</span></p>}
+                <p>SPY/50d: <span className={cn('font-mono', r.indicators.spyAbove50sma ? 'text-accent-green' : 'text-red-400')}>{r.indicators.spyAbove50sma ? '▲' : '▼'}</span></p>
+                <p>SPY/200d: <span className={cn('font-mono', r.indicators.spyAbove200sma ? 'text-accent-green' : 'text-red-400')}>{r.indicators.spyAbove200sma ? '▲' : '▼'}</span></p>
+              </div>
+            )}
+          </div>
+        );
+      })()}
 
       {/* ── Connection prompt if no accounts ── */}
       {!anyConnected && (
