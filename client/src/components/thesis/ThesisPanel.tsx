@@ -90,13 +90,13 @@ function ScoreRing({ value, label, color }: { value: number; label: string; colo
 
 function ScoreBar({ value, label, colorClass }: { value: number; label: string; colorClass: string }) {
   return (
-    <div className="space-y-1">
-      <div className="flex justify-between text-xs font-mono">
-        <span className="text-slate-500">{label}</span>
-        <span className="text-slate-400">{value}/100</span>
+    <div className="space-y-1.5">
+      <div className="flex justify-between items-center">
+        <span className="text-[11px] text-slate-400 font-light">{label}</span>
+        <span className="text-[11px] font-mono font-bold text-slate-300 tabular-nums">{value}<span className="text-slate-600 font-normal">/100</span></span>
       </div>
-      <div className="h-1.5 bg-surface-4 rounded-full overflow-hidden">
-        <div className={`h-full rounded-full transition-all ${colorClass}`} style={{ width: `${value}%` }} />
+      <div className="h-1 bg-white/5 rounded-full overflow-hidden">
+        <div className={`h-full rounded-full transition-all duration-700 ease-out opacity-80 ${colorClass}`} style={{ width: `${value}%` }} />
       </div>
     </div>
   );
@@ -194,15 +194,17 @@ export function ThesisPanel({ symbol, assetClass }: { symbol: string; assetClass
         reasons={thesis.supportingReasons}
       />
 
-      <div className="mt-4 p-2.5 rounded-lg bg-surface-3 border border-surface-border">
-        <div className="flex items-center gap-1 mb-1">
-          <Target className="h-3 w-3 text-accent-blue" />
-          <p className="text-[10px] text-slate-600 font-mono uppercase">Entry Zone</p>
+      <div className="mt-4 rounded-xl bg-white/3 border border-white/6 px-4 py-3.5">
+        <div className="flex items-center gap-1.5 mb-2">
+          <Target className="h-3 w-3 text-blue-400" />
+          <p className="text-[9px] font-mono text-slate-500 uppercase tracking-widest">Entry Zone</p>
         </div>
-        <p className="text-xs font-mono font-semibold text-white">
+        <p className="text-base font-bold font-mono text-white tracking-tight">
           {formatPrice(thesis.entryZone.low)} – {formatPrice(thesis.entryZone.high)}
         </p>
-        <p className="text-[10px] text-slate-600 leading-tight mt-0.5">{thesis.entryZone.description.slice(0, 60)}</p>
+        {thesis.entryZone.description && (
+          <p className="text-[11px] text-slate-500 leading-relaxed mt-1.5">{thesis.entryZone.description.slice(0, 80)}</p>
+        )}
       </div>
 
       <div className="flex items-center gap-2 mt-3 mb-3">
@@ -316,9 +318,10 @@ export function ThesisPanel({ symbol, assetClass }: { symbol: string; assetClass
       )}
 
       {showDetail && (
-        <div className="space-y-4 border-t border-surface-border pt-4">
-          <div className="space-y-2">
-            <div className="grid grid-cols-2 gap-3">
+        <div className="space-y-5 border-t border-white/6 pt-5">
+          <div>
+            <p className="text-[9px] font-mono text-slate-600 uppercase tracking-widest mb-3">Score Breakdown</p>
+            <div className="space-y-3">
               <ScoreBar value={thesis.marketStructureScore} label="Market Structure" colorClass={thesis.marketStructureScore >= 60 ? 'bg-emerald-400' : thesis.marketStructureScore <= 40 ? 'bg-red-400' : 'bg-amber-400'} />
               <ScoreBar value={thesis.catalystScore} label="Catalyst" colorClass={thesis.catalystScore >= 60 ? 'bg-emerald-400' : thesis.catalystScore <= 40 ? 'bg-red-400' : 'bg-amber-400'} />
               <ScoreBar value={thesis.bullishScore} label="Bullish Score" colorClass="bg-emerald-400" />
@@ -328,47 +331,33 @@ export function ThesisPanel({ symbol, assetClass }: { symbol: string; assetClass
             </div>
           </div>
 
-          {thesis.supportingReasons.length > 0 && (
-            <div>
-              <p className="text-[10px] text-slate-600 font-mono uppercase tracking-wider mb-2">Supporting Reasons</p>
-              <ul className="space-y-1.5">
-                {thesis.supportingReasons.map((reason, i) => (
-                  <li key={i} className="flex items-start gap-2">
-                    <CheckCircle className="h-3 w-3 text-emerald-400 mt-0.5 flex-shrink-0" />
-                    <span className="text-xs text-slate-400">{reason}</span>
-                  </li>
-                ))}
-              </ul>
-            </div>
-          )}
-
-          <div className="p-3 rounded-lg bg-amber-500/5 border border-amber-500/10">
-            <div className="flex items-start gap-2">
+          <div className="rounded-xl bg-amber-500/5 border border-amber-500/15 px-4 py-3.5">
+            <div className="flex items-start gap-2.5">
               <AlertTriangle className="h-3.5 w-3.5 text-amber-400 flex-shrink-0 mt-0.5" />
               <div>
-                <p className="text-[10px] text-amber-400 font-mono font-semibold uppercase mb-0.5">Main Risk to Thesis</p>
-                <p className="text-xs text-slate-400">{thesis.mainRiskToThesis}</p>
+                <p className="text-[9px] font-mono text-amber-400 uppercase tracking-widest mb-1.5">Main Risk to Thesis</p>
+                <p className="text-[12px] text-slate-300 leading-relaxed">{thesis.mainRiskToThesis}</p>
               </div>
             </div>
           </div>
 
           {thesis.monitoringPriorities.length > 0 && (
             <div>
-              <p className="text-[10px] text-slate-600 font-mono uppercase tracking-wider mb-2">Monitoring Priorities</p>
-              <ul className="space-y-1">
+              <p className="text-[9px] font-mono text-slate-600 uppercase tracking-widest mb-3">Monitoring Priorities</p>
+              <ul className="space-y-0 divide-y divide-white/4">
                 {thesis.monitoringPriorities.map((priority, i) => (
-                  <li key={i} className="flex items-start gap-2">
-                    <Activity className="h-3 w-3 text-accent-blue mt-0.5 flex-shrink-0" />
-                    <span className="text-xs text-slate-400">{priority}</span>
+                  <li key={i} className="flex items-start gap-2.5 py-2.5 first:pt-0 last:pb-0">
+                    <Activity className="h-3 w-3 text-blue-400 mt-0.5 flex-shrink-0" />
+                    <span className="text-[12px] text-slate-300 leading-relaxed">{priority}</span>
                   </li>
                 ))}
               </ul>
             </div>
           )}
 
-          <div className="p-3 rounded-lg bg-surface-3 border border-surface-border">
-            <p className="text-[10px] text-slate-600 font-mono uppercase tracking-wider mb-1.5">Explanation</p>
-            <p className="text-xs text-slate-400 leading-relaxed">{thesis.explanation}</p>
+          <div className="rounded-xl bg-white/3 border border-white/6 px-4 py-3.5">
+            <p className="text-[9px] font-mono text-slate-600 uppercase tracking-widest mb-2">Explanation</p>
+            <p className="text-[12px] text-slate-400 leading-relaxed">{thesis.explanation}</p>
           </div>
         </div>
       )}

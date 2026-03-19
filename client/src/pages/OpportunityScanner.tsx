@@ -166,17 +166,30 @@ function ScanCard({
       </div>
 
       {expanded && (
-        <div className="px-4 pb-4 border-t border-surface-border pt-4 space-y-4">
+        <div className="px-4 pb-5 border-t border-white/5 pt-4 space-y-4">
+          {/* Verdict + meta row */}
           <div className="flex items-center gap-3 flex-wrap">
             <MiniVerdictBadge action={summary.recommendedAction} score={summary.convictionScore} />
-            <div className="flex gap-3 text-xs font-mono">
-              <span className="text-slate-600">Confidence: <span className="text-slate-300">{summary.confidenceScore}/100</span></span>
-              <span className="text-slate-600">Risk: <span className={summary.riskScore <= 35 ? 'text-emerald-400' : summary.riskScore <= 60 ? 'text-amber-400' : 'text-red-400'}>{summary.riskScore}/100</span></span>
+            <div className="flex gap-4">
+              <div className="flex flex-col">
+                <span className="text-[9px] font-mono text-slate-600 uppercase tracking-widest">Confidence</span>
+                <span className="text-[11px] font-mono font-bold text-slate-300">{summary.confidenceScore}<span className="text-slate-600">/100</span></span>
+              </div>
+              <div className="flex flex-col">
+                <span className="text-[9px] font-mono text-slate-600 uppercase tracking-widest">Risk</span>
+                <span className={`text-[11px] font-mono font-bold ${summary.riskScore <= 35 ? 'text-emerald-400' : summary.riskScore <= 60 ? 'text-amber-400' : 'text-red-400'}`}>
+                  {summary.riskScore}<span className="text-slate-600">/100</span>
+                </span>
+              </div>
             </div>
           </div>
 
-          <p className="text-xs text-slate-400 leading-relaxed">{summary.thesisSummary}</p>
+          {/* Thesis summary */}
+          {summary.thesisSummary && (
+            <p className="text-[12px] text-slate-400 leading-relaxed border-l-2 border-white/10 pl-3">{summary.thesisSummary}</p>
+          )}
 
+          {/* Risk / Reward */}
           <RiskRewardPanel
             stopLoss={summary.invalidation}
             takeProfit1={summary.takeProfit1}
@@ -184,16 +197,17 @@ function ScanCard({
             currentPrice={summary.price}
           />
 
-          <div className="flex items-center justify-between">
-            <div className="p-2.5 rounded-lg bg-surface-3 border border-surface-border">
-              <p className="text-[10px] text-slate-600 font-mono uppercase mb-1">Entry Zone</p>
-              <p className="text-xs font-mono text-white font-semibold">
+          {/* Entry zone + CTA */}
+          <div className="flex items-center justify-between gap-3">
+            <div className="rounded-xl bg-white/3 border border-white/6 px-3.5 py-2.5 flex-1 min-w-0">
+              <p className="text-[9px] font-mono text-slate-600 uppercase tracking-widest mb-1">Entry Zone</p>
+              <p className="text-sm font-bold font-mono text-white tracking-tight">
                 {formatPrice(summary.entryLow)} – {formatPrice(summary.entryHigh)}
               </p>
             </div>
             <button
               onClick={onClick}
-              className="flex items-center gap-1.5 px-4 py-2 bg-accent-blue hover:bg-accent-blue/80 rounded-lg text-xs font-semibold transition-colors"
+              className="flex items-center gap-2 px-4 py-2.5 bg-blue-600 hover:bg-blue-500 rounded-xl text-xs font-semibold transition-all duration-150 flex-shrink-0"
             >
               <Brain className="h-3.5 w-3.5" /> Full Analysis
             </button>

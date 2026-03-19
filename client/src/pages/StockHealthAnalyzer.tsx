@@ -145,14 +145,16 @@ function ScoreGauge({ score }: { score: number }) {
 
 function ScoreBar({ label, value, color }: { label: string; value: number; color: string }) {
   return (
-    <div className="space-y-1">
-      <div className="flex justify-between text-xs">
-        <span className="text-slate-400">{label}</span>
-        <span className={cn('font-mono font-bold', color)}>{Math.round(value)}</span>
+    <div className="space-y-1.5">
+      <div className="flex justify-between items-center">
+        <span className="text-[11px] text-slate-400 font-light">{label}</span>
+        <span className={cn('text-[11px] font-mono font-bold tabular-nums', color)}>{Math.round(value)}<span className="text-slate-600 font-normal">/100</span></span>
       </div>
-      <div className="h-1.5 bg-surface-border rounded-full overflow-hidden">
-        <div className={cn('h-full rounded-full transition-all duration-500', color.replace('text-', 'bg-'))}
-          style={{ width: `${Math.min(100, value)}%` }} />
+      <div className="h-1 bg-white/5 rounded-full overflow-hidden">
+        <div
+          className={cn('h-full rounded-full transition-all duration-700 ease-out', color.replace('text-', 'bg-'))}
+          style={{ width: `${Math.min(100, value)}%`, opacity: 0.8 }}
+        />
       </div>
     </div>
   );
@@ -255,27 +257,28 @@ function HealthResultCard({ result, onRefresh, refreshing }: {
   return (
     <div className="grid grid-cols-1 xl:grid-cols-5 gap-0 h-full">
       <div className="xl:col-span-2 flex flex-col border-r border-surface-border overflow-y-auto">
-        <div className="p-5 border-b border-surface-border">
-          <div className="flex items-start justify-between mb-4">
-            <div>
-              <div className="flex items-center gap-2 mb-1">
-                <h2 className="text-2xl font-black text-white font-mono">{result.ticker}</h2>
-                <span className="text-xs text-slate-500 bg-surface-border px-2 py-0.5 rounded">{result.exchange}</span>
-                {result.isMock && <span className="text-[10px] text-amber-500 bg-amber-500/10 border border-amber-500/20 px-2 py-0.5 rounded">SIMULATED</span>}
+        <div className="p-5 border-b border-surface-border space-y-4">
+          {/* Symbol header */}
+          <div className="flex items-start justify-between">
+            <div className="min-w-0">
+              <div className="flex items-center gap-2.5 flex-wrap mb-1">
+                <h2 className="text-3xl font-black text-white font-mono tracking-tight leading-none">{result.ticker}</h2>
+                <span className="text-[10px] text-slate-500 bg-white/5 border border-white/8 px-2 py-0.5 rounded-md font-mono tracking-widest uppercase">{result.exchange}</span>
               </div>
-              <p className="text-sm text-slate-400">{result.companyName}</p>
+              <p className="text-sm text-slate-400 font-light truncate mt-1">{result.companyName}</p>
             </div>
             <button onClick={onRefresh} disabled={refreshing}
-              className="p-2 text-slate-500 hover:text-white transition-colors rounded-lg hover:bg-surface-2 flex-shrink-0">
+              className="p-2 text-slate-500 hover:text-white transition-all duration-150 rounded-lg hover:bg-white/5 flex-shrink-0 ml-2">
               <RefreshCw className={cn('h-4 w-4', refreshing && 'animate-spin')} />
             </button>
           </div>
 
-          <div className="flex items-center justify-between mb-4">
+          {/* Price + bias row */}
+          <div className="flex items-end justify-between">
             <div>
-              <p className="text-2xl font-bold text-white font-mono">{fmt(result.currentPrice)}</p>
-              <p className={cn('text-sm font-semibold', result.changePercent >= 0 ? 'text-accent-green' : 'text-red-400')}>
-                {result.changePercent >= 0 ? '+' : ''}{result.changePercent?.toFixed(2)}%
+              <p className="text-3xl font-bold text-white font-mono leading-none tracking-tight">{fmt(result.currentPrice)}</p>
+              <p className={cn('text-sm font-semibold mt-1', result.changePercent >= 0 ? 'text-emerald-400' : 'text-red-400')}>
+                {result.changePercent >= 0 ? '+' : ''}{result.changePercent?.toFixed(2)}% today
               </p>
             </div>
             <BiasChip bias={result.bias} />
@@ -308,86 +311,82 @@ function HealthResultCard({ result, onRefresh, refreshing }: {
         </div>
 
         <div className="p-5 border-b border-surface-border space-y-3">
-          <div className="grid grid-cols-2 gap-3">
-            <div className="bg-surface-2 rounded-lg p-3">
-              <p className="text-[10px] text-slate-500 uppercase tracking-wider mb-1">Confidence</p>
-              <p className={cn('text-xl font-bold font-mono', healthScoreColor(result.confidenceScore))}>{result.confidenceScore}</p>
-              <p className="text-[10px] text-slate-600 mt-0.5">/ 100</p>
+          <div className="grid grid-cols-2 gap-2.5">
+            <div className="rounded-xl bg-white/3 border border-white/6 p-3.5">
+              <p className="text-[9px] font-mono text-slate-500 uppercase tracking-widest mb-2">Confidence</p>
+              <p className={cn('text-2xl font-black font-mono leading-none', healthScoreColor(result.confidenceScore))}>{result.confidenceScore}</p>
+              <p className="text-[9px] text-slate-600 font-mono mt-1">/ 100</p>
             </div>
-            <div className="bg-surface-2 rounded-lg p-3">
-              <p className="text-[10px] text-slate-500 uppercase tracking-wider mb-1">Risk Score</p>
-              <p className={cn('text-xl font-bold font-mono', result.riskScore >= 60 ? 'text-red-400' : result.riskScore >= 40 ? 'text-yellow-400' : 'text-accent-green')}>{result.riskScore}</p>
-              <p className="text-[10px] text-slate-600 mt-0.5">/ 100</p>
+            <div className="rounded-xl bg-white/3 border border-white/6 p-3.5">
+              <p className="text-[9px] font-mono text-slate-500 uppercase tracking-widest mb-2">Risk Score</p>
+              <p className={cn('text-2xl font-black font-mono leading-none', result.riskScore >= 60 ? 'text-red-400' : result.riskScore >= 40 ? 'text-yellow-400' : 'text-emerald-400')}>{result.riskScore}</p>
+              <p className="text-[9px] text-slate-600 font-mono mt-1">/ 100 · {result.riskScore >= 60 ? 'High' : result.riskScore >= 40 ? 'Medium' : 'Low'}</p>
             </div>
           </div>
 
-          <div className="space-y-1.5 text-xs">
-            <div className="flex justify-between">
-              <span className="text-slate-500 flex items-center gap-1"><Activity className="h-3 w-3" /> Trend</span>
-              <span className="text-white">{result.trendState}</span>
-            </div>
-            <div className="flex justify-between">
-              <span className="text-slate-500">Volatility</span>
-              <span className="text-white">{result.volatilityState}</span>
-            </div>
-            <div className="flex justify-between">
-              <span className="text-slate-500">Support Zone</span>
-              <span className="font-mono text-accent-green">{fmt(result.supportZone?.min)} – {fmt(result.supportZone?.max)}</span>
-            </div>
-            <div className="flex justify-between">
-              <span className="text-slate-500">Resistance Zone</span>
-              <span className="font-mono text-red-400">{fmt(result.resistanceZone?.min)} – {fmt(result.resistanceZone?.max)}</span>
-            </div>
-            <div className="flex justify-between">
-              <span className="text-slate-500 flex items-center gap-1"><Target className="h-3 w-3" /> Invalidation</span>
-              <span className="font-mono text-orange-400">{fmt(result.invalidationLevel)}</span>
-            </div>
+          <div className="space-y-0 divide-y divide-white/4 rounded-xl border border-white/6 overflow-hidden">
+            {[
+              { icon: <Activity className="h-3 w-3" />, label: 'Trend', value: result.trendState, valueColor: 'text-slate-200' },
+              { icon: null, label: 'Volatility', value: result.volatilityState, valueColor: 'text-slate-200' },
+              { icon: null, label: 'Support Zone', value: `${fmt(result.supportZone?.min)} – ${fmt(result.supportZone?.max)}`, valueColor: 'text-emerald-400' },
+              { icon: null, label: 'Resistance Zone', value: `${fmt(result.resistanceZone?.min)} – ${fmt(result.resistanceZone?.max)}`, valueColor: 'text-red-400' },
+              { icon: <Target className="h-3 w-3" />, label: 'Invalidation', value: fmt(result.invalidationLevel), valueColor: 'text-orange-400' },
+            ].map((row) => (
+              <div key={row.label} className="flex items-center justify-between px-3.5 py-2.5 hover:bg-white/3 transition-colors">
+                <span className="flex items-center gap-1.5 text-[11px] text-slate-500">
+                  {row.icon}<span>{row.label}</span>
+                </span>
+                <span className={cn('text-[11px] font-mono font-semibold', row.valueColor)}>{row.value}</span>
+              </div>
+            ))}
           </div>
 
           {result.patternsDetected?.length > 0 && (
-            <div className="flex flex-wrap gap-1.5 pt-1">
+            <div className="flex flex-wrap gap-1.5">
               {result.patternsDetected.slice(0, 4).map((p, i) => (
-                <span key={i} className="text-[10px] text-accent-purple bg-accent-purple/10 border border-accent-purple/20 px-2 py-0.5 rounded">{p}</span>
+                <span key={i} className="text-[10px] text-violet-400 bg-violet-500/8 border border-violet-500/20 px-2.5 py-1 rounded-lg font-mono">{p}</span>
               ))}
             </div>
           )}
         </div>
 
         <div className="p-5 border-b border-surface-border">
-          <p className="text-[10px] text-slate-500 uppercase tracking-wider mb-3 font-mono">Score Composition</p>
-          <div className="space-y-2.5">
-            <ScoreBar label="Technical Structure (30%)" value={result.scoreWeights?.technical ?? 0} color="text-accent-blue" />
-            <ScoreBar label="Catalyst / News (20%)" value={result.scoreWeights?.catalyst ?? 0} color="text-accent-purple" />
-            <ScoreBar label="Momentum / Trend (15%)" value={result.scoreWeights?.momentum ?? 0} color="text-teal-400" />
-            <ScoreBar label="Risk Profile (15%)" value={result.scoreWeights?.risk ?? 0} color="text-accent-green" />
-            <ScoreBar label="Volatility Fit (10%)" value={result.scoreWeights?.volatility ?? 0} color="text-orange-400" />
-            <ScoreBar label="Liquidity (10%)" value={result.scoreWeights?.liquidity ?? 0} color="text-yellow-400" />
+          <p className="text-[9px] font-mono text-slate-600 uppercase tracking-widest mb-4">Score Composition</p>
+          <div className="space-y-3">
+            <ScoreBar label="Technical Structure · 30%" value={result.scoreWeights?.technical ?? 0} color="text-blue-400" />
+            <ScoreBar label="Catalyst / News · 20%" value={result.scoreWeights?.catalyst ?? 0} color="text-violet-400" />
+            <ScoreBar label="Momentum / Trend · 15%" value={result.scoreWeights?.momentum ?? 0} color="text-teal-400" />
+            <ScoreBar label="Risk Profile · 15%" value={result.scoreWeights?.risk ?? 0} color="text-emerald-400" />
+            <ScoreBar label="Volatility Fit · 10%" value={result.scoreWeights?.volatility ?? 0} color="text-orange-400" />
+            <ScoreBar label="Liquidity · 10%" value={result.scoreWeights?.liquidity ?? 0} color="text-yellow-400" />
           </div>
         </div>
 
         <div className="p-5 border-b border-surface-border grid grid-cols-2 gap-4">
           <div>
-            <div className="flex items-center gap-1.5 mb-2">
-              <ShieldCheck className="h-3.5 w-3.5 text-accent-green" />
-              <p className="text-[10px] text-slate-500 uppercase tracking-wider font-mono">Strengths</p>
+            <div className="flex items-center gap-1.5 mb-3">
+              <ShieldCheck className="h-3.5 w-3.5 text-emerald-400" />
+              <p className="text-[9px] font-mono text-slate-600 uppercase tracking-widest">Strengths</p>
             </div>
-            <ul className="space-y-1.5">
+            <ul className="space-y-0 divide-y divide-white/4">
               {result.topStrengths?.map((s, i) => (
-                <li key={i} className="flex gap-2 text-xs text-slate-300">
-                  <span className="text-accent-green flex-shrink-0">✓</span><span>{s}</span>
+                <li key={i} className="flex gap-2.5 items-start py-2 first:pt-0 last:pb-0">
+                  <span className="flex-shrink-0 mt-0.5 text-emerald-400 text-[10px]">✓</span>
+                  <span className="text-[11px] text-slate-300 leading-relaxed">{s}</span>
                 </li>
               ))}
             </ul>
           </div>
           <div>
-            <div className="flex items-center gap-1.5 mb-2">
+            <div className="flex items-center gap-1.5 mb-3">
               <AlertTriangle className="h-3.5 w-3.5 text-red-400" />
-              <p className="text-[10px] text-slate-500 uppercase tracking-wider font-mono">Weaknesses</p>
+              <p className="text-[9px] font-mono text-slate-600 uppercase tracking-widest">Weaknesses</p>
             </div>
-            <ul className="space-y-1.5">
+            <ul className="space-y-0 divide-y divide-white/4">
               {result.topWeaknesses?.map((w, i) => (
-                <li key={i} className="flex gap-2 text-xs text-slate-300">
-                  <span className="text-red-400 flex-shrink-0">✗</span><span>{w}</span>
+                <li key={i} className="flex gap-2.5 items-start py-2 first:pt-0 last:pb-0">
+                  <span className="flex-shrink-0 mt-0.5 text-red-400 text-[10px]">✗</span>
+                  <span className="text-[11px] text-slate-300 leading-relaxed">{w}</span>
                 </li>
               ))}
             </ul>
