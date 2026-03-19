@@ -284,4 +284,171 @@ router.get('/replay/history', requireAuth, async (req, res) => {
   }
 });
 
+// ─── Autonomous Trading Routes ────────────────────────────────────────────────
+
+router.post('/auto/start', requireAuth, requireAlpacaCredentials, async (req: Request, res: Response) => {
+  try {
+    const userId = (req as any).session?.userId as string;
+    const {
+      capitalTotal = 500,
+      maxPositions = 3,
+      capitalPerTrade,
+      stopLossPct = 3.0,
+      takeProfitPct = 6.0,
+      minConvictionScore = 75,
+      minConfidenceScore = 60,
+      dryRun = false,
+    } = req.body;
+
+    const perTrade = Math.floor(capitalPerTrade ?? capitalTotal / maxPositions);
+
+    if (!dryRun) {
+      const account = await getAccount();
+      const buyingPower = parseFloat(account.buying_power ?? '0');
+      if (buyingPower < perTrade) {
+        return res.status(400).json({
+          success: false,
+          error: `Insufficient buying power. Need $${perTrade}, available $${buyingPower.toFixed(2)}`,
+        });
+      }
+    }
+
+    const { buildSignalsFromLatestScan } = await import('../services/scans/dynamicUniverseService');
+    const rawSignals = await buildSignalsFromLatestScan({
+      minConvictionScore,
+      minConfidenceScore,
+      allowedBiases: ['BULLISH'],
+      maxSymbols: maxPositions * 3,
+    });
+
+    if (!rawSignals || rawSignals.length === 0) {
+      return res.status(400).json({
+        success: false,
+        error: 'No qualifying signals found. Run a Daily Scan first, or lower your conviction threshold.',
+      });
+    }
+
+    const signals = rawSignals.slice(0, maxPositions).map((s: any) => ({
+      ...s,
+      exchange: 'PAPER' as const,
+      fixedDollarAmount: perTrade,
+    }));
+
+    const config = {
+      enabled: true,
+      exchange: 'PAPER' as const,
+      maxPositionPct: 100,
+      dailyLossLimit: capitalTotal * 0.20,
+      maxDrawdownPct: 25,
+      maxOpenPositions: maxPositions,
+      minConvictionScore,
+      minConfidenceScore,
+      allowedBiases: ['BULLISH'],
+      stopLossPct,
+      takeProfitPct,
+      dryRun,
+    };
+
+    const { runTradingCycle } = await import('../services/autotrader/AutoTradeExecutor');
+    let settings = await prisma.userSettings.findUnique({ where: { userId } });
+    if (!settings) settings = await prisma.userSettings.create({ data: { userId } });
+
+    const results = await runTradingCycle(settings.id, config, signals);
+
+    const placed   = results.filter((r: any) => r.status === 'FILLED' || r.status === 'DRY_RUN');
+    const rejected = results.filter((r: any) => !['FILLED', 'DRY_RUN'].includes(r.status));
+
+    return res.json({
+      success: true,
+      data: {
+        signalsEvaluated: results.length,
+        ordersPlaced: placed.length,
+        ordersRejected: rejected.length,
+        dryRun,
+        placed: placed.map((r: any) => ({ symbol: r.symbol, status: r.status, dollarAmount: r.dollarAmount, entryPrice: r.entryPrice })),
+        rejected: rejected.map((r: any) => ({ symbol: r.symbol, reason: r.reason })),
+      },
+    });
+  } catch (err: any) {
+    console.error('[Alpaca Auto Start]', err?.message);
+    res.status(500).json({ success: false, error: err?.message ?? 'Auto trade failed' });
+  }
+});
+
+router.post('/auto/monitor', requireAuth, requireAlpacaCredentials, async (req: Request, res: Response) => {
+  try {
+    const { stopLossPct = 3.0, takeProfitPct = 6.0, dryRun = false } = req.body;
+
+    const positions = await getPositions();
+    if (!positions || positions.length === 0) {
+      return res.json({ success: true, data: { message: 'No open positions', actions: [] } });
+    }
+
+    const actions: any[] = [];
+
+    for (const pos of positions) {
+      const entry   = parseFloat((pos as any).avg_entry_price ?? '0');
+      const current = parseFloat((pos as any).current_price ?? '0');
+      if (entry <= 0 || current <= 0) continue;
+
+      const pnlPct = ((current - entry) / entry) * 100;
+      let shouldClose = false;
+      let closeReason = '';
+
+      if (pnlPct <= -stopLossPct) {
+        shouldClose = true;
+        closeReason = `Stop loss: ${pnlPct.toFixed(2)}% (limit -${stopLossPct}%)`;
+      } else if (pnlPct >= takeProfitPct) {
+        shouldClose = true;
+        closeReason = `Take profit: +${pnlPct.toFixed(2)}% (target +${takeProfitPct}%)`;
+      }
+
+      if (shouldClose && !dryRun) {
+        await closePosition((pos as any).symbol).catch((e: any) =>
+          console.warn(`[Alpaca Monitor] Close ${(pos as any).symbol} failed:`, e?.message)
+        );
+      }
+
+      actions.push({
+        symbol:  (pos as any).symbol,
+        action:  shouldClose ? (dryRun ? 'WOULD_CLOSE' : 'CLOSED') : 'HOLD',
+        reason:  shouldClose ? closeReason : `Holding at ${pnlPct.toFixed(2)}%`,
+        pnlPct,
+      });
+    }
+
+    return res.json({ success: true, data: { actions, dryRun } });
+  } catch (err: any) {
+    res.status(500).json({ success: false, error: err?.message ?? 'Monitor failed' });
+  }
+});
+
+router.get('/auto/status', requireAuth, async (req: Request, res: Response) => {
+  try {
+    const userId = (req as any).session?.userId as string;
+    const today = new Date();
+    today.setHours(0, 0, 0, 0);
+
+    let settings = await prisma.userSettings.findUnique({ where: { userId } });
+    if (!settings) settings = await prisma.userSettings.create({ data: { userId } });
+
+    const logs = await prisma.autoTradeLog.findMany({
+      where: {
+        userSettingsId: settings.id,
+        exchange: 'PAPER',
+        executedAt: { gte: today },
+      },
+      orderBy: { executedAt: 'desc' },
+      take: 20,
+    });
+
+    const placed = logs.filter((l: any) => ['FILLED', 'DRY_RUN'].includes(l.status));
+    const totalDeployed = placed.reduce((sum: number, l: any) => sum + (Number(l.dollarAmount) || 0), 0);
+
+    return res.json({ success: true, data: { todayTrades: placed.length, totalDeployed, logs } });
+  } catch (err: any) {
+    res.status(500).json({ success: false, error: err?.message ?? 'Status failed' });
+  }
+});
+
 export default router;

@@ -263,6 +263,18 @@ export const api = {
     lastTestResult:  () => get('/alpaca/test-suite/last'),
     runReplay:       (body: unknown) => post('/alpaca/replay', body),
     replayHistory:   () => get('/alpaca/replay/history'),
+    autoStart: (params: {
+      capitalTotal?: number;
+      maxPositions?: number;
+      capitalPerTrade?: number;
+      stopLossPct?: number;
+      takeProfitPct?: number;
+      minConvictionScore?: number;
+      dryRun?: boolean;
+    }) => post('/alpaca/auto/start', params),
+    autoMonitor: (params: { stopLossPct?: number; takeProfitPct?: number; dryRun?: boolean }) =>
+      post('/alpaca/auto/monitor', params),
+    autoStatus: () => get('/alpaca/auto/status'),
   },
 
   credentials: {

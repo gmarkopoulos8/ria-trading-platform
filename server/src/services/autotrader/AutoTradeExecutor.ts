@@ -28,6 +28,7 @@ export interface AutoTradeSignal {
   exchange?: AutoTradeExchange;
   intradayConfirmation?: string;
   atrPercent?: number;
+  fixedDollarAmount?: number;
 }
 
 export interface AutoTradeConfig {
@@ -386,18 +387,58 @@ export async function executeAutoTrade(
   }
 
   try {
-    if (config.dryRun || exchange === 'PAPER') {
-      await prisma.autoTradeLog.update({ where: { id: log.id }, data: { status: 'DRY_RUN' } });
-      return {
-        success: true,
-        status: 'DRY_RUN',
-        symbol: signal.symbol,
-        exchange,
-        logId: log.id,
-        quantity: sized.quantity,
-        entryPrice,
-        dollarAmount: sized.dollarAmount,
-      };
+    // Dry run — simulate only, no exchange calls
+    if (config.dryRun) {
+      await prisma.autoTradeLog.update({
+        where: { id: log.id },
+        data: { status: 'DRY_RUN', entryPrice, stopLoss, takeProfit, quantity: sized.quantity, dollarAmount: sized.dollarAmount },
+      });
+      return { success: true, status: 'DRY_RUN', symbol: signal.symbol, exchange, logId: log.id, quantity: sized.quantity, entryPrice, dollarAmount: sized.dollarAmount };
+    }
+
+    // PAPER — route to Alpaca paper API
+    if (exchange === 'PAPER') {
+      try {
+        const { placeOrder: alpacaPlace } = await import('../alpaca/alpacaExchangeService');
+        const { hasAlpacaCredentials, isPauseActive: alpacaPaused, isKillswitchActive: alpacaStopped } = await import('../alpaca/alpacaConfig');
+
+        if (!hasAlpacaCredentials()) {
+          await prisma.autoTradeLog.update({ where: { id: log.id }, data: { status: 'REJECTED', reason: 'Alpaca not connected' } });
+          return { success: false, status: 'REJECTED', symbol: signal.symbol, exchange, reason: 'Alpaca not connected' };
+        }
+        if (alpacaPaused() || alpacaStopped()) {
+          await prisma.autoTradeLog.update({ where: { id: log.id }, data: { status: 'BLOCKED', reason: 'Alpaca paused or stopped' } });
+          return { success: false, status: 'BLOCKED', symbol: signal.symbol, exchange, reason: 'Alpaca trading is paused' };
+        }
+
+        const dollarAmount = (signal as any).fixedDollarAmount ?? sized.dollarAmount;
+
+        const alpacaResult = await alpacaPlace({
+          symbol: signal.symbol.toUpperCase(),
+          notional: dollarAmount,
+          side: 'buy',
+          type: 'market',
+          timeInForce: 'day',
+          userId: userSettingsId,
+          scanRunId: signal.scanRunId,
+          submittedPrice: entryPrice,
+        });
+
+        if (!alpacaResult.success) {
+          await prisma.autoTradeLog.update({ where: { id: log.id }, data: { status: 'ERROR', reason: alpacaResult.error ?? 'Alpaca order failed' } });
+          return { success: false, status: 'ERROR', symbol: signal.symbol, exchange, reason: alpacaResult.error };
+        }
+
+        await prisma.autoTradeLog.update({
+          where: { id: log.id },
+          data: { status: 'FILLED', entryPrice, stopLoss, takeProfit, quantity: sized.quantity, dollarAmount, orderId: alpacaResult.orderId, executedAt: new Date() },
+        });
+
+        return { success: true, status: 'FILLED', symbol: signal.symbol, exchange, logId: log.id, quantity: sized.quantity, entryPrice, dollarAmount };
+      } catch (err: any) {
+        await prisma.autoTradeLog.update({ where: { id: log.id }, data: { status: 'ERROR', reason: err?.message ?? 'PAPER order error' } });
+        return { success: false, status: 'ERROR', symbol: signal.symbol, exchange, reason: err?.message };
+      }
     }
 
     if (exchange === 'TOS') {

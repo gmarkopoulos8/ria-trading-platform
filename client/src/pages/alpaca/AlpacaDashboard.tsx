@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { toast } from 'sonner';
 import {
@@ -839,6 +839,231 @@ function DisconnectButton({ onDisconnected }: { onDisconnected: () => void }) {
   );
 }
 
+// ─── Autonomous Trading Panel ─────────────────────────────────────────────────
+
+function AutoTradingPanel({ isDryRun: externalDryRun }: { isDryRun: boolean }) {
+  const qc = useQueryClient();
+  const [dryRun, setDryRun]               = useState(externalDryRun);
+  const [capitalTotal, setCapitalTotal]   = useState(500);
+  const [maxPositions, setMaxPositions]   = useState(3);
+  const [stopLossPct, setStopLossPct]     = useState(3.0);
+  const [takeProfitPct, setTakeProfitPct] = useState(6.0);
+  const [minConviction, setMinConviction] = useState(75);
+  const [showParams, setShowParams]       = useState(false);
+  const [lastResult, setLastResult]       = useState<any>(null);
+
+  useEffect(() => { setDryRun(externalDryRun); }, [externalDryRun]);
+
+  const perTrade = Math.floor(capitalTotal / maxPositions);
+  const rrRatio  = (takeProfitPct / stopLossPct).toFixed(2);
+
+  const { data: autoStatus } = useQuery({
+    queryKey: ['alpaca-auto-status'],
+    queryFn:  () => api.alpaca.autoStatus().then((r: any) => r.data),
+    refetchInterval: 30_000,
+  });
+
+  const startMutation = useMutation({
+    mutationFn: () => api.alpaca.autoStart({ capitalTotal, maxPositions, stopLossPct, takeProfitPct, minConvictionScore: minConviction, dryRun }),
+    onSuccess: (r: any) => {
+      const d = r?.data ?? r;
+      setLastResult(d);
+      const n = d?.ordersPlaced ?? 0;
+      if (n > 0) {
+        toast.success(`${dryRun ? '[DRY RUN] ' : ''}${n} order${n !== 1 ? 's' : ''} placed`);
+      } else {
+        toast.info('No qualifying trades found. Try running a Daily Scan first.');
+      }
+      qc.invalidateQueries({ queryKey: ['alpaca-positions', 'alpaca-status', 'alpaca-auto-status', 'alpaca-orders'] });
+    },
+    onError: (e: any) => toast.error(e?.response?.data?.error ?? e?.message ?? 'Trade cycle failed'),
+  });
+
+  const monitorMutation = useMutation({
+    mutationFn: () => api.alpaca.autoMonitor({ stopLossPct, takeProfitPct, dryRun }),
+    onSuccess: (r: any) => {
+      const actions: any[] = r?.data?.actions ?? [];
+      const closed = actions.filter((a: any) => a.action === 'CLOSED' || a.action === 'WOULD_CLOSE');
+      if (closed.length > 0) {
+        toast.success(`${dryRun ? '[DRY RUN] Would close' : 'Closed'} ${closed.length} position${closed.length !== 1 ? 's' : ''}`);
+      } else {
+        toast.info('All positions within range — holding');
+      }
+      qc.invalidateQueries({ queryKey: ['alpaca-positions', 'alpaca-status'] });
+    },
+    onError: (e: any) => toast.error(e?.response?.data?.error ?? 'Monitor failed'),
+  });
+
+  const toggleDryRunMutation = useMutation({
+    mutationFn: (val: boolean) => api.credentials.alpacaUpdateSettings({ dryRun: val }),
+    onSuccess: (_: any, val: boolean) => {
+      setDryRun(val);
+      qc.invalidateQueries({ queryKey: ['alpaca-status'] });
+      toast.success(val ? 'Dry Run enabled' : 'Live paper mode — orders go to Alpaca');
+    },
+    onError: (e: any) => toast.error(e?.response?.data?.error ?? 'Failed to update'),
+  });
+
+  const isRunning = startMutation.isPending || monitorMutation.isPending;
+  const todayTrades   = (autoStatus as any)?.todayTrades ?? 0;
+  const totalDeployed = (autoStatus as any)?.totalDeployed ?? 0;
+
+  return (
+    <Card className="p-5 border border-violet-500/20 bg-gradient-to-br from-violet-950/20 to-zinc-900/40">
+      <div className="flex items-start justify-between mb-4">
+        <div className="flex items-center gap-3">
+          <div className="w-9 h-9 rounded-xl bg-violet-500/20 border border-violet-500/30 flex items-center justify-center flex-shrink-0">
+            <Zap className="w-5 h-5 text-violet-400" />
+          </div>
+          <div>
+            <h2 className="text-base font-bold text-white">Autonomous Trading</h2>
+            <p className="text-xs text-zinc-400">Scans markets · picks stocks · executes paper trades</p>
+          </div>
+        </div>
+        {todayTrades > 0 && (
+          <div className="text-right flex-shrink-0">
+            <p className="text-xs text-zinc-500">Today</p>
+            <p className="text-sm font-bold text-violet-400">{todayTrades} trades · ${totalDeployed.toFixed(0)}</p>
+          </div>
+        )}
+      </div>
+
+      <div className="grid grid-cols-3 gap-2 mb-4">
+        <div className="bg-zinc-900/60 rounded-lg p-3 text-center">
+          <p className="text-[10px] text-zinc-500 uppercase tracking-wider mb-1">Capital</p>
+          <p className="text-base font-bold text-white font-mono">${capitalTotal}</p>
+        </div>
+        <div className="bg-zinc-900/60 rounded-lg p-3 text-center">
+          <p className="text-[10px] text-zinc-500 uppercase tracking-wider mb-1">Per Trade</p>
+          <p className="text-base font-bold text-violet-400 font-mono">${perTrade}</p>
+        </div>
+        <div className="bg-zinc-900/60 rounded-lg p-3 text-center">
+          <p className="text-[10px] text-zinc-500 uppercase tracking-wider mb-1">R:R</p>
+          <p className={cn('text-base font-bold font-mono', Number(rrRatio) >= 2 ? 'text-emerald-400' : Number(rrRatio) >= 1.5 ? 'text-yellow-400' : 'text-red-400')}>
+            {rrRatio}:1
+          </p>
+        </div>
+      </div>
+
+      <div className="flex items-start gap-2 p-2.5 rounded-lg bg-zinc-900/40 border border-zinc-800 mb-4 text-[11px] text-zinc-500">
+        <Activity className="w-3.5 h-3.5 text-zinc-600 flex-shrink-0 mt-0.5" />
+        <span>Reads the latest daily scan, picks the top stocks by conviction score, sizes each trade using your parameters, and places market orders on Alpaca paper. Use <strong className="text-zinc-400">Check Exits</strong> to close positions that hit their stop or target.</span>
+      </div>
+
+      <div className="flex gap-2 mb-3">
+        <button
+          onClick={() => startMutation.mutate()}
+          disabled={isRunning}
+          className={cn(
+            'flex-1 py-3 rounded-xl font-bold text-sm transition-all flex items-center justify-center gap-2 shadow-lg',
+            dryRun
+              ? 'bg-violet-600/30 hover:bg-violet-600/40 border border-violet-500/50 text-violet-300'
+              : 'bg-violet-600 hover:bg-violet-700 text-white shadow-violet-900/50',
+            isRunning && 'opacity-50 cursor-not-allowed',
+          )}
+        >
+          {startMutation.isPending
+            ? <><RefreshCw className="w-4 h-4 animate-spin" /> Analyzing &amp; trading…</>
+            : <><Zap className="w-4 h-4" /> {dryRun ? 'Simulate Trades' : 'Start Trading'}</>
+          }
+        </button>
+        <button
+          onClick={() => monitorMutation.mutate()}
+          disabled={isRunning}
+          title="Check if any positions hit their stop or take-profit"
+          className="px-4 py-3 rounded-xl bg-zinc-800 hover:bg-zinc-700 border border-zinc-700 text-zinc-300 text-sm font-medium transition-colors disabled:opacity-40 flex items-center gap-1.5 flex-shrink-0"
+        >
+          {monitorMutation.isPending
+            ? <RefreshCw className="w-4 h-4 animate-spin" />
+            : <Activity className="w-4 h-4" />
+          }
+          <span className="hidden sm:inline">Check Exits</span>
+        </button>
+      </div>
+
+      <div className="flex items-center justify-between px-1 mb-3">
+        <div>
+          <p className="text-xs font-medium text-zinc-300">Dry Run Mode</p>
+          <p className="text-[10px] text-zinc-600">When on: simulates trades without sending to Alpaca</p>
+        </div>
+        <button
+          onClick={() => toggleDryRunMutation.mutate(!dryRun)}
+          disabled={toggleDryRunMutation.isPending}
+          className={cn('relative w-11 h-6 rounded-full transition-colors flex-shrink-0', dryRun ? 'bg-violet-600' : 'bg-emerald-600')}
+        >
+          <span className={cn('absolute top-1 w-4 h-4 bg-white rounded-full shadow transition-all duration-200', dryRun ? 'left-1' : 'left-6')} />
+        </button>
+      </div>
+
+      {!dryRun && (
+        <div className="mb-3 flex items-start gap-2 p-2.5 bg-amber-500/10 border border-amber-500/30 rounded-lg">
+          <AlertTriangle className="w-3.5 h-3.5 text-amber-400 flex-shrink-0 mt-0.5" />
+          <p className="text-[11px] text-amber-400">Live paper mode — orders will execute on Alpaca. This is still paper money, not real funds.</p>
+        </div>
+      )}
+
+      <button
+        onClick={() => setShowParams(p => !p)}
+        className="w-full flex items-center gap-1.5 text-xs text-zinc-500 hover:text-zinc-300 transition-colors py-1 mb-1"
+      >
+        {showParams ? <ChevronUp className="w-3.5 h-3.5" /> : <ChevronDown className="w-3.5 h-3.5" />}
+        {showParams ? 'Hide parameters' : 'Adjust parameters'}
+      </button>
+
+      {showParams && (
+        <div className="space-y-4 pt-3 border-t border-zinc-800">
+          {[
+            { label: 'Total Capital ($)', value: capitalTotal, set: setCapitalTotal, min: 100, max: 10000, step: 100, fmt: (v: number) => `$${v}`, color: 'accent-violet-500' },
+            { label: 'Max Positions', value: maxPositions, set: setMaxPositions, min: 1, max: 10, step: 1, fmt: (v: number) => `${v}`, color: 'accent-violet-500' },
+            { label: 'Stop Loss (%)', value: stopLossPct, set: setStopLossPct, min: 1, max: 15, step: 0.5, fmt: (v: number) => `-${v}%`, color: 'accent-red-500' },
+            { label: 'Take Profit (%)', value: takeProfitPct, set: setTakeProfitPct, min: 2, max: 30, step: 0.5, fmt: (v: number) => `+${v}%`, color: 'accent-emerald-500' },
+            { label: 'Min Conviction Score', value: minConviction, set: setMinConviction, min: 50, max: 95, step: 1, fmt: (v: number) => `${v}/100`, color: 'accent-violet-500' },
+          ].map(({ label, value, set, min, max, step, fmt, color }) => (
+            <div key={label}>
+              <div className="flex justify-between mb-1">
+                <label className="text-xs text-zinc-400">{label}</label>
+                <span className="text-xs font-mono text-white">{fmt(value)}</span>
+              </div>
+              <input
+                type="range" min={min} max={max} step={step} value={value}
+                onChange={e => set(Number(e.target.value))}
+                className={`w-full ${color}`}
+              />
+            </div>
+          ))}
+        </div>
+      )}
+
+      {lastResult && (
+        <div className="mt-3 pt-3 border-t border-zinc-800">
+          <div className="flex items-center gap-3 text-xs mb-2">
+            <span className="text-zinc-500">Last run:</span>
+            <span>Evaluated <strong className="text-white">{lastResult.signalsEvaluated}</strong></span>
+            <span>Placed <strong className="text-violet-400">{lastResult.ordersPlaced}</strong></span>
+            {lastResult.ordersRejected > 0 && <span>Skipped <strong className="text-zinc-500">{lastResult.ordersRejected}</strong></span>}
+            {lastResult.dryRun && <span className="ml-auto text-[10px] text-violet-400 bg-violet-900/40 px-1.5 py-0.5 rounded">DRY RUN</span>}
+          </div>
+          {(lastResult.placed ?? []).map((p: any) => (
+            <div key={p.symbol} className="flex items-center gap-2 text-xs bg-zinc-900/60 rounded px-2 py-1.5 mb-1">
+              <CheckCircle2 className="w-3 h-3 text-emerald-400 flex-shrink-0" />
+              <span className="font-mono font-bold text-white w-14">{p.symbol}</span>
+              <span className="text-zinc-400">${Number(p.dollarAmount ?? 0).toFixed(0)}</span>
+              {p.entryPrice && <span className="text-zinc-500">@ ${Number(p.entryPrice).toFixed(2)}</span>}
+            </div>
+          ))}
+          {(lastResult.rejected ?? []).slice(0, 3).map((r: any) => (
+            <div key={r.symbol} className="flex items-center gap-2 text-xs bg-zinc-900/30 rounded px-2 py-1.5 mb-1 opacity-50">
+              <XCircle className="w-3 h-3 text-zinc-500 flex-shrink-0" />
+              <span className="font-mono text-zinc-400 w-14">{r.symbol}</span>
+              <span className="text-zinc-600 truncate text-[10px]">{r.reason}</span>
+            </div>
+          ))}
+        </div>
+      )}
+    </Card>
+  );
+}
+
 // ─── Main Dashboard ───────────────────────────────────────────────────────────
 
 function AlpacaDashboardInner() {
@@ -999,6 +1224,9 @@ function AlpacaDashboardInner() {
         />
         <StatCard label="Open Positions" value={String(positions.length)} icon={<Activity className="h-4 w-4" />} color="blue" />
       </div>
+
+      {/* Autonomous Trading */}
+      <AutoTradingPanel isDryRun={isDryRun} />
 
       {/* Equity Curve */}
       <Card className="p-4">
