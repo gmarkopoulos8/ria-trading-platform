@@ -1,7 +1,7 @@
 import { useState } from 'react';
-import { useMutation } from '@tanstack/react-query';
+import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { toast } from 'sonner';
-import { User, Lock, Bell, Palette, Info, ChevronRight } from 'lucide-react';
+import { User, Lock, Bell, Palette, Info, ChevronRight, FlaskConical, Eye, EyeOff } from 'lucide-react';
 import { useAuth } from '../contexts/AuthContext';
 import { api } from '../api/client';
 import { Card } from '../components/ui/Card';
@@ -11,8 +11,112 @@ const sections = [
   { id: 'security', label: 'Security', icon: Lock },
   { id: 'notifications', label: 'Notifications', icon: Bell },
   { id: 'appearance', label: 'Appearance', icon: Palette },
+  { id: 'connections', label: 'Connections', icon: FlaskConical },
   { id: 'about', label: 'About', icon: Info },
 ];
+
+function AlpacaConnectionSection() {
+  const qc = useQueryClient();
+  const [apiKeyId, setApiKeyId] = useState('');
+  const [secretKey, setSecretKey] = useState('');
+  const [dryRun, setDryRun] = useState(true);
+  const [maxDrawdownPct, setMaxDrawdownPct] = useState(8);
+  const [showSecret, setShowSecret] = useState(false);
+
+  const { data: alpacaData } = useQuery({
+    queryKey: ['alpaca-cred-status-settings'],
+    queryFn: () => api.credentials.alpacaStatus(),
+    refetchInterval: 30_000,
+  });
+  const alpaca = (alpacaData as any)?.data;
+
+  const connect = useMutation({
+    mutationFn: () => api.credentials.alpacaConnect({ apiKeyId, secretKey, dryRun, maxDrawdownPct }),
+    onSuccess: () => {
+      toast.success('Alpaca paper account connected');
+      qc.invalidateQueries({ queryKey: ['alpaca-cred-status-settings'] });
+      setApiKeyId(''); setSecretKey('');
+    },
+    onError: (e: any) => toast.error(e?.response?.data?.error ?? 'Connect failed'),
+  });
+
+  const disconnect = useMutation({
+    mutationFn: () => api.credentials.alpacaDisconnect(),
+    onSuccess: () => {
+      toast.success('Alpaca disconnected');
+      qc.invalidateQueries({ queryKey: ['alpaca-cred-status-settings'] });
+    },
+    onError: (e: any) => toast.error(e?.response?.data?.error ?? 'Disconnect failed'),
+  });
+
+  return (
+    <div className="space-y-4">
+      <div className="flex items-center gap-2 p-3 rounded-lg border border-zinc-700/50 bg-zinc-800/30">
+        <FlaskConical className="w-5 h-5 text-violet-400" />
+        <div>
+          <p className="text-sm font-semibold text-white">Alpaca Paper Trading</p>
+          <p className="text-xs text-zinc-500">Connect your Alpaca paper account for simulated trading</p>
+        </div>
+        <div className="ml-auto">
+          {alpaca?.isConnected
+            ? <span className="text-xs text-emerald-400 font-medium">Connected</span>
+            : <span className="text-xs text-zinc-500">Not connected</span>}
+        </div>
+      </div>
+
+      {alpaca?.isConnected ? (
+        <div className="space-y-3">
+          <div className="grid grid-cols-2 gap-3 text-xs">
+            <div className="p-2 bg-zinc-800/50 rounded"><span className="text-zinc-400">API Key</span><div className="text-white font-mono">{alpaca.apiKeyId ?? '…'}</div></div>
+            <div className="p-2 bg-zinc-800/50 rounded"><span className="text-zinc-400">Mode</span><div className="text-white">{alpaca.dryRun ? 'Dry Run' : 'Live Paper'}</div></div>
+          </div>
+          <button
+            onClick={() => disconnect.mutate()}
+            disabled={disconnect.isPending}
+            className="px-4 py-2 bg-red-600/20 hover:bg-red-600/30 border border-red-600/40 text-red-300 text-xs rounded-lg transition-colors disabled:opacity-50"
+          >
+            {disconnect.isPending ? 'Disconnecting…' : 'Disconnect Alpaca'}
+          </button>
+        </div>
+      ) : (
+        <div className="space-y-3">
+          <div>
+            <label className="block text-xs text-zinc-400 mb-1">API Key ID</label>
+            <input className="w-full bg-zinc-800 border border-zinc-700 rounded px-3 py-2 text-sm text-white focus:outline-none focus:border-violet-500" placeholder="PK..." value={apiKeyId} onChange={e => setApiKeyId(e.target.value)} />
+          </div>
+          <div>
+            <label className="block text-xs text-zinc-400 mb-1">Secret Key</label>
+            <div className="relative">
+              <input className="w-full bg-zinc-800 border border-zinc-700 rounded px-3 py-2 text-sm text-white focus:outline-none focus:border-violet-500 pr-10" type={showSecret ? 'text' : 'password'} placeholder="Secret..." value={secretKey} onChange={e => setSecretKey(e.target.value)} />
+              <button className="absolute right-3 top-1/2 -translate-y-1/2 text-zinc-500 hover:text-zinc-300" onClick={() => setShowSecret(s => !s)} type="button">
+                {showSecret ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
+              </button>
+            </div>
+          </div>
+          <div className="flex gap-4">
+            <div className="flex-1">
+              <label className="block text-xs text-zinc-400 mb-1">Max Drawdown %</label>
+              <input type="number" min={1} max={50} className="w-full bg-zinc-800 border border-zinc-700 rounded px-3 py-2 text-sm text-white focus:outline-none focus:border-violet-500" value={maxDrawdownPct} onChange={e => setMaxDrawdownPct(Number(e.target.value))} />
+            </div>
+            <div className="flex items-end pb-2">
+              <label className="flex items-center gap-2 cursor-pointer">
+                <input type="checkbox" checked={dryRun} onChange={e => setDryRun(e.target.checked)} className="accent-violet-500" />
+                <span className="text-sm text-zinc-300">Dry Run</span>
+              </label>
+            </div>
+          </div>
+          <button
+            onClick={() => connect.mutate()}
+            disabled={!apiKeyId || !secretKey || connect.isPending}
+            className="px-4 py-2 bg-violet-600 hover:bg-violet-700 text-white text-sm rounded-lg transition-colors disabled:opacity-50"
+          >
+            {connect.isPending ? 'Connecting…' : 'Connect Alpaca Paper'}
+          </button>
+        </div>
+      )}
+    </div>
+  );
+}
 
 export default function Settings() {
   const { user, logout } = useAuth();
@@ -286,6 +390,14 @@ export default function Settings() {
                   </select>
                 </div>
               </div>
+            </Card>
+          )}
+
+          {activeSection === 'connections' && (
+            <Card className="p-5">
+              <h2 className="text-sm font-semibold text-white mb-4">Exchange Connections</h2>
+              <p className="text-xs text-zinc-500 mb-4">Connect exchange accounts to enable live paper trading. All credentials are encrypted at rest.</p>
+              <AlpacaConnectionSection />
             </Card>
           )}
 

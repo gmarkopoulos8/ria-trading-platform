@@ -1078,6 +1078,11 @@ model ExchangeCredential {
   autoTradeAccountNumber String?
   accountsLastFetchedAt  DateTime?
 
+  alpacaApiKeyId        String?
+  encryptedAlpacaSecret String?
+  alpacaDryRun          Boolean @default(true)
+  alpacaMaxDrawdownPct  Float   @default(8.0)
+
   isConnected    Boolean   @default(false)
   lastVerifiedAt DateTime?
   lastError      String?
@@ -1087,4 +1092,52 @@ model ExchangeCredential {
 
   @@unique([userId, exchange])
   @@index([userId])
+}
+
+// ─── Alpaca Paper Trading ──────────────────────────────────────────
+
+model AlpacaOrderLog {
+  id              String   @id @default(cuid())
+  userId          String
+  symbol          String
+  side            String
+  orderType       String
+  qty             String?
+  notional        String?
+  limitPrice      String?
+  stopPrice       String?
+  timeInForce     String   @default("day")
+  orderClass      String?
+  alpacaOrderId   String?
+  clientOrderId   String?
+  status          String   @default("pending")
+  filledQty       String?
+  filledAvgPrice  String?
+  isDryRun        Boolean  @default(true)
+  errorMessage    String?
+  submittedAt     DateTime @default(now())
+  filledAt        DateTime?
+  latencyMs       Int?
+  submittedPrice  Float?
+  filledPrice     Float?
+  slippagePct     Float?
+  scanRunId       String?
+  metadata        Json?
+
+  @@index([userId])
+  @@index([symbol])
+  @@index([submittedAt])
+  @@map("alpaca_order_logs")
+}
+
+model AlpacaKillEvent {
+  id        String   @id @default(cuid())
+  userId    String?
+  reason    String
+  trigger   String
+  level     String
+  snapshot  Json?
+  createdAt DateTime @default(now())
+
+  @@map("alpaca_kill_events")
 }

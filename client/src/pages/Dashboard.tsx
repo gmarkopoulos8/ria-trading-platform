@@ -89,9 +89,27 @@ export default function Dashboard() {
     refetchInterval: 120_000,
   });
 
+  const { data: alpacaStatusData } = useQuery({
+    queryKey: ['alpaca-cred-status'],
+    queryFn: () => api.credentials.alpacaStatus(),
+    staleTime: 30_000,
+    refetchInterval: 60_000,
+  });
+
+  const { data: alpacaInfoData } = useQuery({
+    queryKey: ['alpaca-status-dash'],
+    queryFn: () => api.alpaca.status(),
+    staleTime: 30_000,
+    refetchInterval: 60_000,
+  });
+
   const encryptionOk = (credData as any)?.data?.encryptionConfigured !== false;
   const hlCred = (credData as any)?.data?.hyperliquid;
   const tosCred = (credData as any)?.data?.tos;
+
+  const alpacaStatus = (alpacaStatusData as any)?.data;
+  const alpacaInfo = (alpacaInfoData as any)?.data;
+  const alpacaControlLevel: string = alpacaInfo?.killswitch?.controlLevel ?? 'ACTIVE';
 
   const tosAvailableAccounts: any[] = (tosAccountsData as any)?.data?.accounts ?? [];
   const autoTradeAccountNumber: string = (tosAccountsData as any)?.data?.autoTradeAccountNumber ?? '';
@@ -121,7 +139,8 @@ export default function Dashboard() {
 
   const hlConnected  = !!(hlStatus?.hasCredentials);
   const tosConnected = !!(tosStatus?.hasCredentials);
-  const anyConnected = hlConnected || tosConnected;
+  const alpacaConnected = !!(alpacaStatus?.isConnected);
+  const anyConnected = hlConnected || tosConnected || alpacaConnected;
 
   const isLoading = ovLoading || portLoading;
 
@@ -342,6 +361,51 @@ export default function Dashboard() {
               </div>
             )}
           </div>
+
+          {/* Alpaca Paper Trading card */}
+          <div
+            className={cn(
+              'p-4 rounded-xl border flex items-center justify-between cursor-pointer group hover:border-opacity-60 transition-all',
+              alpacaStatus?.isConnected
+                ? 'bg-violet-500/5 border-violet-500/30'
+                : 'bg-surface-2 border-surface-border hover:border-slate-600',
+            )}
+            onClick={() => navigate('/alpaca')}
+          >
+            <div className="flex items-center gap-3">
+              <div className={cn('w-9 h-9 rounded-lg flex items-center justify-center',
+                alpacaStatus?.isConnected ? 'bg-violet-500/20' : 'bg-surface-3')}>
+                <FlaskConical className={cn('h-4 w-4', alpacaStatus?.isConnected ? 'text-violet-400' : 'text-slate-500')} />
+              </div>
+              <div>
+                <p className="text-sm font-semibold text-white">Alpaca Paper</p>
+                {alpacaStatus?.isConnected ? (
+                  <p className="text-xs text-slate-400">
+                    Paper trading {alpacaStatus.dryRun ? '· dry run' : '· live paper'}
+                  </p>
+                ) : (
+                  <p className="text-xs text-slate-500">Not connected · click to set up</p>
+                )}
+              </div>
+            </div>
+            <div className="flex items-center gap-2">
+              {alpacaStatus?.isConnected && (() => {
+                const lvl: string = alpacaControlLevel ?? 'ACTIVE';
+                return lvl !== 'ACTIVE' ? (
+                  <span className={cn(
+                    'text-[10px] font-bold px-1.5 py-0.5 rounded font-mono',
+                    lvl === 'HARD_STOP' ? 'bg-red-500/20 text-red-400' : 'bg-amber-500/20 text-amber-400'
+                  )}>
+                    {lvl === 'HARD_STOP' ? '⛔ STOP' : '⏸ PAUSED'}
+                  </span>
+                ) : null;
+              })()}
+              {alpacaStatus?.isConnected
+                ? <CheckCircle2 className="h-4 w-4 text-accent-green" />
+                : <WifiOff className="h-4 w-4 text-slate-600" />}
+              <ArrowRight className="h-4 w-4 text-slate-600 group-hover:text-slate-400 transition-colors" />
+            </div>
+          </div>
         </div>
       )}
 
@@ -353,7 +417,7 @@ export default function Dashboard() {
             <div>
               <p className="text-sm font-semibold text-amber-400">No trading accounts connected</p>
               <p className="text-xs text-amber-400/70 mt-1">
-                Set your Hyperliquid or Schwab/Thinkorswim credentials in Replit Secrets to see live portfolio values here.
+                Connect Hyperliquid, Schwab/Thinkorswim, or Alpaca Paper to see live portfolio values here.
               </p>
               <div className="flex gap-3 mt-2">
                 <button onClick={() => navigate('/hyperliquid')} className="text-xs text-accent-blue hover:underline flex items-center gap-1">
@@ -361,6 +425,9 @@ export default function Dashboard() {
                 </button>
                 <button onClick={() => navigate('/tos')} className="text-xs text-accent-blue hover:underline flex items-center gap-1">
                   Thinkorswim setup <ArrowRight className="h-3 w-3" />
+                </button>
+                <button onClick={() => navigate('/alpaca')} className="text-xs text-violet-400 hover:underline flex items-center gap-1">
+                  Alpaca Paper setup <ArrowRight className="h-3 w-3" />
                 </button>
               </div>
             </div>

@@ -18,12 +18,15 @@ import hyperliquidRouter from './routes/hyperliquid';
 import tosRouter from './routes/tos';
 import autotraderRouter from './routes/autotrader';
 import credentialRouter from './routes/credentials';
+import alpacaRouter from './routes/alpaca';
 import { errorHandler, notFoundHandler } from './middleware/errorHandler';
 import { monitorAllOpenPositions } from './services/monitoring/PositionMonitor';
 import { startDailyScanScheduler } from './services/scans/dailyScanScheduler';
 import { startIntradayMonitor } from './services/autotrader/IntradayMonitorLoop';
 import { isEncryptionConfigured } from './lib/encryption';
 import { loadDefaultCredentials } from './services/credentials/CredentialLoader';
+import { startLatencyMonitor } from './services/alpaca/LatencyMonitor';
+import { startDrawdownMonitor } from './services/alpaca/alpacaKillswitchService';
 
 const app = express();
 const PORT = process.env.PORT ?? 3001;
@@ -113,6 +116,7 @@ app.use('/api/hyperliquid', hyperliquidRouter);
 app.use('/api/tos', tosRouter);
 app.use('/api/autotrader', autotraderRouter);
 app.use('/api/credentials', credentialRouter);
+app.use('/api/alpaca', alpacaRouter);
 
 app.use('/api/*', notFoundHandler);
 app.use(errorHandler);
@@ -144,6 +148,8 @@ app.listen(PORT, async () => {
 
   startDailyScanScheduler();
   startIntradayMonitor();
+  startLatencyMonitor(5_000);
+  startDrawdownMonitor(60_000);
 
   setInterval(() => {
     monitorAllOpenPositions().catch((err) => {

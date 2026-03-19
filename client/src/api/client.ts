@@ -234,6 +234,30 @@ export const api = {
     },
   },
 
+  alpaca: {
+    status:          () => get('/alpaca/status'),
+    account:         () => get('/alpaca/account'),
+    positions:       () => get('/alpaca/positions'),
+    orders:          () => get('/alpaca/orders'),
+    ordersHistory:   (limit?: number) => get('/alpaca/orders/history', limit ? { limit } : {}),
+    portfolioHistory:(period = '1M', timeframe = '1D') => get('/alpaca/portfolio/history', { period, timeframe }),
+    orderLog:        () => get('/alpaca/order-log'),
+    clock:           () => get('/alpaca/clock'),
+    placeOrder:      (body: unknown) => post('/alpaca/orders', body),
+    cancelOrder:     (id: string) => del(`/alpaca/orders/${id}`),
+    cancelAllOrders: () => del('/alpaca/orders'),
+    closePosition:   (symbol: string) => del(`/alpaca/positions/${symbol}`),
+    pause:           (reason?: string) => post('/alpaca/controls/pause', { reason }),
+    hardStop:        (reason?: string) => post('/alpaca/controls/hard-stop', { reason }),
+    emergencyExit:   (reason?: string, confirmText?: string) => post('/alpaca/controls/emergency-exit', { reason, confirmText }),
+    resume:          () => post('/alpaca/controls/resume', {}),
+    latencyStats:    () => get('/alpaca/latency/stats'),
+    runTestSuite:    () => post('/alpaca/test-suite/run', {}),
+    lastTestResult:  () => get('/alpaca/test-suite/last'),
+    runReplay:       (body: unknown) => post('/alpaca/replay', body),
+    replayHistory:   () => get('/alpaca/replay/history'),
+  },
+
   credentials: {
     status: () => get('/credentials/status'),
     hlConnect: (data: { walletAddress: string; agentPrivateKey: string; isMainnet: boolean; dryRun?: boolean; maxDrawdownPct?: number; defaultLeverage?: number }) =>
@@ -252,6 +276,10 @@ export const api = {
     tosRefreshAccounts: () => post('/credentials/tos/accounts/refresh', {}),
     tosSetViewAccount: (data: { accountNumber: string }) => put('/credentials/tos/accounts/view', data),
     tosSetAutoTradeAccount: (data: { accountNumber: string }) => put('/credentials/tos/accounts/autotrade', data),
+    alpacaConnect: (data: { apiKeyId: string; secretKey: string; dryRun?: boolean; maxDrawdownPct?: number }) =>
+      post('/credentials/alpaca/connect', data),
+    alpacaDisconnect: () => del('/credentials/alpaca/disconnect'),
+    alpacaStatus: () => get('/credentials/alpaca/status'),
   },
 
   scans: {

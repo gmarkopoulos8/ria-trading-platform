@@ -296,6 +296,89 @@ class CredentialService {
     return target ?? { accountNumber, accountNumberMasked: `...${accountNumber.slice(-4)}`, type: 'UNKNOWN', isPaper: false, label: `Account (..${accountNumber.slice(-4)})`, equity: 0, buyingPower: 0, dayTradingBuyingPower: 0, positionCount: 0 };
   }
 
+  async getAlpacaCredentials(userId: string): Promise<{ apiKeyId: string; secretKey: string; dryRun: boolean; maxDrawdownPct: number } | null> {
+    try {
+      const rec = await prisma.exchangeCredential.findUnique({
+        where: { userId_exchange: { userId, exchange: 'alpaca' } },
+      });
+      if (rec?.alpacaApiKeyId && rec?.encryptedAlpacaSecret) {
+        const secretKey = decryptIfPresent(rec.encryptedAlpacaSecret);
+        if (!secretKey) return null;
+        return {
+          apiKeyId:       rec.alpacaApiKeyId,
+          secretKey,
+          dryRun:         rec.alpacaDryRun,
+          maxDrawdownPct: rec.alpacaMaxDrawdownPct,
+        };
+      }
+    } catch (err) {
+      console.warn('[CredentialService] Error reading Alpaca credentials from DB:', (err as Error).message);
+    }
+    return null;
+  }
+
+  async saveAlpacaCredentials(
+    userId: string,
+    creds: { apiKeyId: string; secretKey: string; dryRun?: boolean; maxDrawdownPct?: number },
+  ): Promise<void> {
+    const encryptedSecret = encryptIfPresent(creds.secretKey);
+    await prisma.exchangeCredential.upsert({
+      where: { userId_exchange: { userId, exchange: 'alpaca' } },
+      create: {
+        userId,
+        exchange:             'alpaca',
+        alpacaApiKeyId:       creds.apiKeyId,
+        encryptedAlpacaSecret: encryptedSecret ?? undefined,
+        alpacaDryRun:         creds.dryRun ?? true,
+        alpacaMaxDrawdownPct: creds.maxDrawdownPct ?? 8.0,
+        isConnected:          true,
+        lastVerifiedAt:       new Date(),
+      },
+      update: {
+        alpacaApiKeyId:        creds.apiKeyId,
+        encryptedAlpacaSecret: encryptedSecret ?? undefined,
+        alpacaDryRun:          creds.dryRun ?? true,
+        alpacaMaxDrawdownPct:  creds.maxDrawdownPct ?? 8.0,
+        isConnected:           true,
+        lastVerifiedAt:        new Date(),
+        lastError:             null,
+      },
+    });
+  }
+
+  async deleteAlpacaCredentials(userId: string): Promise<void> {
+    await prisma.exchangeCredential.updateMany({
+      where: { userId, exchange: 'alpaca' },
+      data: {
+        alpacaApiKeyId:        null,
+        encryptedAlpacaSecret: null,
+        isConnected:           false,
+      },
+    });
+  }
+
+  async getAlpacaConnectionStatus(userId: string): Promise<{
+    isConnected: boolean;
+    apiKeyId?: string;
+    dryRun: boolean;
+    lastVerifiedAt: Date | null;
+    lastError: string | null;
+  }> {
+    const rec = await prisma.exchangeCredential.findUnique({
+      where: { userId_exchange: { userId, exchange: 'alpaca' } },
+    });
+    if (!rec?.alpacaApiKeyId) {
+      return { isConnected: false, dryRun: true, lastVerifiedAt: null, lastError: null };
+    }
+    return {
+      isConnected:   rec.isConnected,
+      apiKeyId:      rec.alpacaApiKeyId ? `...${rec.alpacaApiKeyId.slice(-4)}` : undefined,
+      dryRun:        rec.alpacaDryRun,
+      lastVerifiedAt: rec.lastVerifiedAt,
+      lastError:     rec.lastError,
+    };
+  }
+
   async getConnectionStatus(userId: string): Promise<{ hl: ConnectionStatus; tos: ConnectionStatus }> {
     const [hlRec, tosRec] = await Promise.all([
       prisma.exchangeCredential.findUnique({ where: { userId_exchange: { userId, exchange: 'hyperliquid' } } }).catch(() => null),

@@ -28,6 +28,7 @@ const navItems = [
   { path: '/hyperliquid', label: 'Hyperliquid', icon: Activity, description: 'Perpetual DEX · live trading' },
   { path: '/tos', label: 'Thinkorswim', icon: BarChart2, description: 'Schwab API · equities · options · futures' },
   { path: '/autotrader', label: 'Auto Trader', icon: Bot, description: 'Autonomous AI order execution' },
+  { path: '/alpaca', label: 'Alpaca Paper', icon: FlaskConical, description: 'Paper trading · test suite · replay' },
   { path: '/scanner', label: 'Opportunity Scanner', icon: ScanSearch, description: 'AI-scored picks' },
   { path: '/symbol', label: 'Symbol Intelligence', icon: LineChart, description: 'Deep dive' },
   { path: '/portfolio', label: 'Paper Portfolio', icon: Briefcase, description: 'Active positions' },

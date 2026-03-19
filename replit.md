@@ -5,6 +5,26 @@ Full-stack AI paper trading research simulator. Premium dark-mode terminal UI fo
 
 ## Major Features (Recently Added)
 
+### Alpaca Paper Trading Tab
+- `server/src/services/alpaca/alpacaConfig.ts` — runtime credential store, pause/killswitch state machine, `assertSafe()` guard, `getControlLevel()`. HARDCODED PAPER URL (`https://paper-api.alpaca.markets`).
+- `server/src/services/alpaca/alpacaInfoService.ts` — account, positions, orders, portfolio history, market clock, drawdown computation
+- `server/src/services/alpaca/alpacaExchangeService.ts` — placeOrder (with dry-run mode + AlpacaOrderLog), cancelOrder, cancelAllOrders, closePosition, closeAllPositions
+- `server/src/services/alpaca/alpacaKillswitchService.ts` — pauseTrading, hardStop, emergencyExit, resumeTrading, drawdown monitor (60s polling)
+- `server/src/services/alpaca/AlpacaTestSuite.ts` — 10-test automated suite (market buy/sell, limit, bracket, fractional, balance check, latency)
+- `server/src/services/alpaca/StrategyReplayService.ts` — replay completed scan runs on Alpaca paper account
+- `server/src/services/alpaca/LatencyMonitor.ts` — 5s polling for fill latency, slippage, p95 stats tracking via `AlpacaOrderLog`
+- `server/src/routes/alpaca.ts` — 17 REST endpoints (status, account, positions, orders, portfolio history, order log, clock, controls, test suite, replay, latency)
+- `CredentialService.ts` — `getAlpacaCredentials`, `saveAlpacaCredentials`, `deleteAlpacaCredentials`, `getAlpacaConnectionStatus` (AES-256-GCM encrypted secrets)
+- `CredentialLoader.ts` — loads Alpaca credentials at startup
+- `routes/credentials.ts` — `/alpaca/connect`, `/alpaca/disconnect`, `/alpaca/status`
+- `client/src/pages/alpaca/AlpacaDashboard.tsx` — full dashboard with connect panel, stats, equity curve, position/order tables, tab navigation, 3-level control panel, test suite, fill simulator, strategy replay, latency monitor, paper vs live comparison card
+- `client/src/api/client.ts` — `api.alpaca.*` (18 methods) + `credentials.alpacaConnect/Disconnect/Status`
+- `App.tsx` — `/alpaca` route, `Sidebar.tsx` — Alpaca Paper nav item
+- `Settings.tsx` — Connections section with Alpaca connect/disconnect form
+- `Dashboard.tsx` — Alpaca Paper status card in exchange grid
+- **Prisma**: `AlpacaOrderLog` + `AlpacaKillEvent` models, `ExchangeCredential` extended with 4 Alpaca fields
+- **Safety**: `dryRun: true` default (orders logged but NOT sent to API); `client_order_id` always prefixed `riabot-`; live URL never used
+
 ### Full Market Universe Scanner
 - `FinnhubProvider` + `FullUniverseScanner` — two-phase NYSE/NASDAQ scanning (5000+ tickers)
 - `scanProgressStore` — in-memory SSE progress tracking

@@ -18,6 +18,7 @@ import StockHealthAnalyzer from './pages/StockHealthAnalyzer';
 import ScanReport from './pages/ScanReport';
 import ScanHistory from './pages/ScanHistory';
 import AutoTrader from './pages/AutoTrader';
+import AlpacaDashboard from './pages/alpaca/AlpacaDashboard';
 import Login from './pages/Login';
 import Register from './pages/Register';
 
@@ -54,6 +55,7 @@ export default function App() {
           <Route path="hyperliquid" element={<HyperliquidDashboard />} />
           <Route path="tos" element={<TosDashboard />} />
           <Route path="autotrader" element={<AutoTrader />} />
+          <Route path="alpaca" element={<AlpacaDashboard />} />
         </Route>
 
         <Route path="*" element={<Navigate to="/dashboard" replace />} />

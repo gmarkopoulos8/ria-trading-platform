@@ -4,6 +4,12 @@ import { credentialService } from '../services/credentials/CredentialService';
 import { loadDefaultCredentials } from '../services/credentials/CredentialLoader';
 import { setHLRuntimeCredentials, clearHLRuntimeCredentials } from '../services/hyperliquid/hyperliquidConfig';
 import { setTOSRuntimeCredentials, clearTOSRuntimeCredentials } from '../services/tos/tosConfig';
+import {
+  setAlpacaRuntimeCredentials,
+  clearAlpacaRuntimeCredentials,
+  getAlpacaCredentials,
+} from '../services/alpaca/alpacaConfig';
+import { getAccount as getAlpacaAccount } from '../services/alpaca/alpacaInfoService';
 import { isEncryptionConfigured } from '../lib/encryption';
 
 const router = Router();
@@ -329,6 +335,69 @@ router.get('/status', requireAuth, async (req, res) => {
         hyperliquid: { ...status.hl, accountValue: hlBalance },
         tos: { ...status.tos, equity: tosBalance },
         encryptionConfigured: isEncryptionConfigured(),
+      },
+    });
+  } catch (err) {
+    return res.status(500).json({ success: false, error: (err as Error).message });
+  }
+});
+
+// ─── Alpaca Credential Routes ───────────────────────────────────────────────
+
+router.post('/alpaca/connect', requireAuth, async (req, res) => {
+  try {
+    const userId = (req as any).session?.userId;
+    if (!userId) return res.status(401).json({ success: false, error: 'Not authenticated' });
+
+    const { apiKeyId, secretKey, dryRun = true, maxDrawdownPct = 8.0 } = req.body;
+    if (!apiKeyId || !secretKey) {
+      return res.status(400).json({ success: false, error: 'apiKeyId and secretKey are required' });
+    }
+
+    setAlpacaRuntimeCredentials({ apiKeyId, secretKey, dryRun, maxDrawdownPct });
+
+    let verified = false;
+    try {
+      await getAlpacaAccount();
+      verified = true;
+    } catch (err: any) {
+      clearAlpacaRuntimeCredentials();
+      return res.status(400).json({ success: false, error: `Alpaca API verification failed: ${err?.message ?? 'unknown error'}` });
+    }
+
+    await credentialService.saveAlpacaCredentials(userId, { apiKeyId, secretKey, dryRun, maxDrawdownPct });
+
+    return res.json({ success: true, data: { connected: true, verified, dryRun } });
+  } catch (err) {
+    clearAlpacaRuntimeCredentials();
+    return res.status(500).json({ success: false, error: (err as Error).message });
+  }
+});
+
+router.delete('/alpaca/disconnect', requireAuth, async (req, res) => {
+  try {
+    const userId = (req as any).session?.userId;
+    if (!userId) return res.status(401).json({ success: false, error: 'Not authenticated' });
+    clearAlpacaRuntimeCredentials();
+    await credentialService.deleteAlpacaCredentials(userId);
+    return res.json({ success: true, data: { disconnected: true } });
+  } catch (err) {
+    return res.status(500).json({ success: false, error: (err as Error).message });
+  }
+});
+
+router.get('/alpaca/status', requireAuth, async (req, res) => {
+  try {
+    const userId = (req as any).session?.userId;
+    if (!userId) return res.status(401).json({ success: false, error: 'Not authenticated' });
+    const status = await credentialService.getAlpacaConnectionStatus(userId);
+    const runtimeCreds = getAlpacaCredentials();
+    return res.json({
+      success: true,
+      data: {
+        ...status,
+        runtimeLoaded: !!runtimeCreds,
+        dryRun: runtimeCreds?.dryRun ?? status.dryRun,
       },
     });
   } catch (err) {

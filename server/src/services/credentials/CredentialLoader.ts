@@ -2,6 +2,7 @@ import { prisma } from '../../lib/prisma';
 import { credentialService } from './CredentialService';
 import { setHLRuntimeCredentials } from '../hyperliquid/hyperliquidConfig';
 import { setTOSRuntimeCredentials } from '../tos/tosConfig';
+import { setAlpacaRuntimeCredentials } from '../alpaca/alpacaConfig';
 
 export async function loadDefaultCredentials(): Promise<void> {
   try {
@@ -36,6 +37,11 @@ export async function loadDefaultCredentials(): Promise<void> {
         viewAccountNumber: tosRec?.viewAccountNumber ?? undefined,
         autoTradeAccountNumber: tosRec?.autoTradeAccountNumber ?? undefined,
       });
+    }
+
+    const alpacaCreds = await credentialService.getAlpacaCredentials(firstUser.id);
+    if (alpacaCreds) {
+      setAlpacaRuntimeCredentials(alpacaCreds);
     }
 
     console.info('[CredentialLoader] Exchange credentials loaded from database');
