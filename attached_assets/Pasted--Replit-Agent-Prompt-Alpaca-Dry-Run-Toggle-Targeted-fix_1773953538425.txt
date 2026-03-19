@@ -1,0 +1,227 @@
+# Replit Agent Prompt — Alpaca Dry Run Toggle
+
+Targeted fix. Only touch the three files listed. Do not change anything else.
+
+-----
+
+## THE PROBLEM
+
+The Alpaca tab shows `isDryRun` as a read-only badge in the header. There is no way to toggle it without disconnecting and reconnecting. There is also no `PATCH /credentials/alpaca/settings` route like the HL and TOS integrations have.
+
+-----
+
+## PHASE 1 — Add Backend Settings Route
+
+**File**: `server/src/routes/credentials.ts`
+
+Add this route immediately before the final `export default router` line at the bottom of the file:
+
+```typescript
+router.patch('/alpaca/settings', requireAuth, async (req, res) => {
+  try {
+    const userId = (req as any).session?.userId;
+    if (!userId) return res.status(401).json({ success: false, error: 'Not authenticated' });
+
+    const { dryRun, maxDrawdownPct } = req.body;
+
+    // Load existing credentials from DB
+    const existing = await credentialService.getAlpacaCredentials(userId);
+    if (!existing) {
+      return res.status(400).json({ success: false, error: 'Alpaca not connected. Connect first.' });
+    }
+
+    // Build updated values — only change what was passed in
+    const updatedDryRun        = typeof dryRun === 'boolean' ? dryRun : existing.dryRun;
+    const updatedMaxDrawdown   = typeof maxDrawdownPct === 'number' ? maxDrawdownPct : existing.maxDrawdownPct;
+
+    // Save to DB
+    await credentialService.saveAlpacaCredentials(userId, {
+      apiKeyId:       existing.apiKeyId,
+      secretKey:      existing.secretKey,  // already decrypted by getAlpacaCredentials()
+      dryRun:         updatedDryRun,
+      maxDrawdownPct: updatedMaxDrawdown,
+    });
+
+    // Update runtime credentials immediately so it takes effect without restart
+    setAlpacaRuntimeCredentials({
+      apiKeyId:       existing.apiKeyId,
+      secretKey:      existing.secretKey,
+      dryRun:         updatedDryRun,
+      maxDrawdownPct: updatedMaxDrawdown,
+    });
+
+    return res.json({
+      success: true,
+      data: { dryRun: updatedDryRun, maxDrawdownPct: updatedMaxDrawdown },
+    });
+  } catch (err) {
+    return res.status(500).json({ success: false, error: (err as Error).message });
+  }
+});
+```
+
+Also ensure `setAlpacaRuntimeCredentials` and `getAlpacaCredentials` are imported at the top of `credentials.ts`. Check the existing imports — they are likely already there from the connect route. If not, add:
+
+```typescript
+import { setAlpacaRuntimeCredentials, getAlpacaCredentials as getRuntimeAlpacaCreds } from '../services/alpaca/alpacaConfig';
+```
+
+-----
+
+## PHASE 2 — Add API Client Method
+
+**File**: `client/src/api/client.ts`
+
+In the `credentials` section, add alongside the existing `alpacaConnect`, `alpacaDisconnect`, `alpacaStatus`:
+
+```typescript
+alpacaUpdateSettings: (data: { dryRun?: boolean; maxDrawdownPct?: number }) =>
+  patch('/credentials/alpaca/settings', data),
+```
+
+If a `patch` helper doesn’t exist in this file, add it alongside the existing `get`, `post`, `del` helpers:
+
+```typescript
+const patch = (path: string, body?: unknown) =>
+  client.patch(`/api${path}`, body).then(r => r.data);
+```
+
+-----
+
+## PHASE 3 — Dry Run Toggle in Dashboard Header
+
+**File**: `client/src/pages/alpaca/AlpacaDashboard.tsx`
+
+### Step A — Add mutation to the main `AlpacaDashboardInner` component
+
+Find where the other mutations are defined in `AlpacaDashboardInner` (near the top, before the return statement). Add:
+
+```typescript
+const toggleDryRun = useMutation({
+  mutationFn: (newDryRun: boolean) =>
+    api.credentials.alpacaUpdateSettings({ dryRun: newDryRun }),
+  onSuccess: (_, newDryRun) => {
+    toast.success(newDryRun ? 'Dry Run enabled — orders will be simulated' : 'Dry Run disabled — orders will go to Alpaca paper');
+    qc.invalidateQueries({ queryKey: ['alpaca-status'] });
+  },
+  onError: (e: any) => toast.error(e?.response?.data?.error ?? 'Failed to update setting'),
+});
+```
+
+### Step B — Replace the read-only badge with a clickable toggle
+
+In the dashboard header, find this read-only badge:
+
+```tsx
+<span className={cn('flex items-center gap-1 text-xs px-2 py-0.5 rounded-full', isDryRun ? 'bg-violet-900/50 text-violet-300' : 'bg-emerald-900/50 text-emerald-300')}>
+  <Activity className="w-3 h-3" />
+  {isDryRun ? 'Dry Run Mode' : 'Live Paper'}
+</span>
+```
+
+Replace it with a clickable toggle button:
+
+```tsx
+<button
+  onClick={() => toggleDryRun.mutate(!isDryRun)}
+  disabled={toggleDryRun.isPending}
+  title={isDryRun ? 'Click to enable live paper orders' : 'Click to enable dry run (simulate only)'}
+  className={cn(
+    'flex items-center gap-1.5 text-xs px-2.5 py-1 rounded-full border transition-all',
+    isDryRun
+      ? 'bg-violet-900/50 border-violet-500/40 text-violet-300 hover:bg-violet-900/70'
+      : 'bg-emerald-900/50 border-emerald-500/40 text-emerald-300 hover:bg-emerald-900/70',
+    toggleDryRun.isPending && 'opacity-50 cursor-not-allowed',
+  )}
+>
+  {toggleDryRun.isPending
+    ? <RefreshCw className="w-3 h-3 animate-spin" />
+    : <Activity className="w-3 h-3" />
+  }
+  {isDryRun ? 'Dry Run' : 'Live Paper'}
+  {/* Toggle indicator */}
+  <span className={cn(
+    'w-1.5 h-1.5 rounded-full',
+    isDryRun ? 'bg-violet-400' : 'bg-emerald-400 animate-pulse',
+  )} />
+</button>
+```
+
+### Step C — Keep the AutoTradingPanel toggle in sync
+
+The `AutoTradingPanel` component has its own local `dryRun` state. Update it to initialize from the live `isDryRun` value from the status query, so they always match.
+
+In `AutoTradingPanel`, change the state initialization from:
+
+```typescript
+const [dryRun, setDryRun] = useState(true);
+```
+
+To accept it as a prop and stay in sync:
+
+```typescript
+function AutoTradingPanel({ isDryRun: externalDryRun }: { isDryRun: boolean }) {
+  const qc = useQueryClient();
+  const [dryRun, setDryRun] = useState(externalDryRun);
+
+  // Sync with external value when it changes (e.g. toggled from header)
+  useEffect(() => {
+    setDryRun(externalDryRun);
+  }, [externalDryRun]);
+```
+
+Add the `useEffect` import if not already present at the top of the file:
+
+```typescript
+import { useState, useEffect } from 'react';
+```
+
+Update the toggle button inside `AutoTradingPanel` to also persist the change via the API (not just local state):
+
+Replace the existing toggle button `onClick` in `AutoTradingPanel`:
+
+```tsx
+// FIND:
+onClick={() => setDryRun(d => !d)}
+
+// REPLACE WITH:
+onClick={async () => {
+  const newVal = !dryRun;
+  setDryRun(newVal);
+  try {
+    await api.credentials.alpacaUpdateSettings({ dryRun: newVal });
+    qc.invalidateQueries({ queryKey: ['alpaca-status'] });
+  } catch {
+    setDryRun(!newVal); // revert on error
+  }
+}}
+```
+
+Update wherever `AutoTradingPanel` is rendered in `AlpacaDashboardInner` to pass the prop:
+
+```tsx
+// FIND:
+<AutoTradingPanel />
+
+// REPLACE WITH:
+<AutoTradingPanel isDryRun={isDryRun} />
+```
+
+-----
+
+## SUMMARY
+
+### What this adds
+
+- `PATCH /api/credentials/alpaca/settings` — persists `dryRun` and `maxDrawdownPct` changes to DB and updates runtime immediately
+- Header dry run badge becomes a **clickable toggle** — tap once to flip between Dry Run and Live Paper
+- `AutoTradingPanel` toggle is now **persistent** — it saves to the backend, not just local component state
+- Both toggles stay in sync — changing one updates the other
+
+### Files modified
+
+```
+server/src/routes/credentials.ts          → add PATCH /alpaca/settings route
+client/src/api/client.ts                  → add alpacaUpdateSettings + patch helper
+client/src/pages/alpaca/AlpacaDashboard.tsx → toggleDryRun mutation, clickable header badge, AutoTradingPanel prop sync
+```

@@ -845,6 +845,16 @@ function AlpacaDashboardInner() {
   const qc = useQueryClient();
   const [activeTab, setActiveTab] = useState<'overview' | 'orders' | 'log'>('overview');
 
+  const toggleDryRun = useMutation({
+    mutationFn: (newDryRun: boolean) =>
+      api.credentials.alpacaUpdateSettings({ dryRun: newDryRun }),
+    onSuccess: (_: any, newDryRun: boolean) => {
+      toast.success(newDryRun ? 'Dry Run enabled — orders will be simulated' : 'Dry Run disabled — orders will go to Alpaca paper');
+      qc.invalidateQueries({ queryKey: ['alpaca-status'] });
+    },
+    onError: (e: any) => toast.error(e?.response?.data?.error ?? 'Failed to update setting'),
+  });
+
   const { data: statusRaw, isLoading } = useQuery({
     queryKey: ['alpaca-status'],
     queryFn: () => api.alpaca.status().then((r: any) => r.data),
@@ -934,10 +944,28 @@ function AlpacaDashboardInner() {
           <div>
             <h1 className="text-2xl font-bold text-white">Alpaca Paper Trading</h1>
             <div className="flex items-center gap-2 mt-0.5">
-              <span className={cn('flex items-center gap-1 text-xs px-2 py-0.5 rounded-full', isDryRun ? 'bg-violet-900/50 text-violet-300' : 'bg-emerald-900/50 text-emerald-300')}>
-                <Activity className="w-3 h-3" />
-                {isDryRun ? 'Dry Run Mode' : 'Live Paper'}
-              </span>
+              <button
+                onClick={() => toggleDryRun.mutate(!isDryRun)}
+                disabled={toggleDryRun.isPending}
+                title={isDryRun ? 'Click to enable live paper orders' : 'Click to enable dry run (simulate only)'}
+                className={cn(
+                  'flex items-center gap-1.5 text-xs px-2.5 py-1 rounded-full border transition-all',
+                  isDryRun
+                    ? 'bg-violet-900/50 border-violet-500/40 text-violet-300 hover:bg-violet-900/70'
+                    : 'bg-emerald-900/50 border-emerald-500/40 text-emerald-300 hover:bg-emerald-900/70',
+                  toggleDryRun.isPending && 'opacity-50 cursor-not-allowed',
+                )}
+              >
+                {toggleDryRun.isPending
+                  ? <RefreshCw className="w-3 h-3 animate-spin" />
+                  : <Activity className="w-3 h-3" />
+                }
+                {isDryRun ? 'Dry Run' : 'Live Paper'}
+                <span className={cn(
+                  'w-1.5 h-1.5 rounded-full',
+                  isDryRun ? 'bg-violet-400' : 'bg-emerald-400 animate-pulse',
+                )} />
+              </button>
               <span className={cn('text-xs font-bold px-2 py-0.5 rounded-full border', {
                 'border-emerald-500/40 bg-emerald-900/30 text-emerald-400': controlLevel === 'ACTIVE',
                 'border-yellow-500/40 bg-yellow-900/30 text-yellow-400':  controlLevel === 'PAUSE',

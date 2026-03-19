@@ -287,6 +287,8 @@ export const api = {
       post('/credentials/alpaca/connect', data),
     alpacaDisconnect: () => del('/credentials/alpaca/disconnect'),
     alpacaStatus: () => get('/credentials/alpaca/status'),
+    alpacaUpdateSettings: (data: { dryRun?: boolean; maxDrawdownPct?: number }) =>
+      patch('/credentials/alpaca/settings', data),
   },
 
   scans: {

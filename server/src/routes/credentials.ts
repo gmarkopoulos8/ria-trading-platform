@@ -405,4 +405,42 @@ router.get('/alpaca/status', requireAuth, async (req, res) => {
   }
 });
 
+router.patch('/alpaca/settings', requireAuth, async (req, res) => {
+  try {
+    const userId = (req as any).session?.userId;
+    if (!userId) return res.status(401).json({ success: false, error: 'Not authenticated' });
+
+    const { dryRun, maxDrawdownPct } = req.body;
+
+    const existing = await credentialService.getAlpacaCredentials(userId);
+    if (!existing) {
+      return res.status(400).json({ success: false, error: 'Alpaca not connected. Connect first.' });
+    }
+
+    const updatedDryRun      = typeof dryRun === 'boolean' ? dryRun : existing.dryRun;
+    const updatedMaxDrawdown = typeof maxDrawdownPct === 'number' ? maxDrawdownPct : existing.maxDrawdownPct;
+
+    await credentialService.saveAlpacaCredentials(userId, {
+      apiKeyId:       existing.apiKeyId,
+      secretKey:      existing.secretKey,
+      dryRun:         updatedDryRun,
+      maxDrawdownPct: updatedMaxDrawdown,
+    });
+
+    setAlpacaRuntimeCredentials({
+      apiKeyId:       existing.apiKeyId,
+      secretKey:      existing.secretKey,
+      dryRun:         updatedDryRun,
+      maxDrawdownPct: updatedMaxDrawdown,
+    });
+
+    return res.json({
+      success: true,
+      data: { dryRun: updatedDryRun, maxDrawdownPct: updatedMaxDrawdown },
+    });
+  } catch (err) {
+    return res.status(500).json({ success: false, error: (err as Error).message });
+  }
+});
+
 export default router;
