@@ -12,6 +12,7 @@ import {
   getSchedulerStatus,
   setSchedulerEnabled,
 } from '../services/scans/dailyScanScheduler';
+import { getScanProgress } from '../services/scans/scanProgressStore';
 
 const router = Router();
 router.use(requireAuth);
@@ -24,6 +25,8 @@ router.post('/trigger', async (req: Request, res: Response) => {
       assetScope = 'ALL',
       riskMode = 'ALL',
       force = false,
+      fullUniverse = false,
+      filterCriteria = {},
     } = req.body ?? {};
 
     const scanRunId = await runDailyScan({
@@ -32,6 +35,8 @@ router.post('/trigger', async (req: Request, res: Response) => {
       assetScope,
       riskMode,
       skipDuplicateCheck: force === true || force === 'true',
+      fullUniverse,
+      filterCriteria,
     });
 
     res.json({ success: true, data: { scanRunId } });
@@ -39,6 +44,24 @@ router.post('/trigger', async (req: Request, res: Response) => {
     const message = err instanceof Error ? err.message : 'Scan trigger failed';
     res.status(400).json({ success: false, error: message });
   }
+});
+
+router.get('/runs/:id/progress', requireAuth, (req: Request, res: Response) => {
+  res.setHeader('Content-Type', 'text/event-stream');
+  res.setHeader('Cache-Control', 'no-cache');
+  res.setHeader('Connection', 'keep-alive');
+  res.flushHeaders();
+
+  const send = () => {
+    const progress = getScanProgress(req.params.id);
+    if (progress) {
+      res.write(`data: ${JSON.stringify(progress)}\n\n`);
+    }
+  };
+
+  send();
+  const interval = setInterval(send, 2000);
+  req.on('close', () => clearInterval(interval));
 });
 
 router.get('/latest', async (req: Request, res: Response) => {

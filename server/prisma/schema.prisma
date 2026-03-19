@@ -578,11 +578,16 @@ model DailyScanRun {
   marketSession       String   @default("MARKET_OPEN") // PREMARKET | MARKET_OPEN | MIDDAY
   assetScope          String   @default("ALL")          // ALL | STOCKS_ONLY | CRYPTO_ONLY
   riskMode            String   @default("ALL")          // ALL | CONSERVATIVE | AGGRESSIVE
-  totalUniverseCount  Int      @default(0)
-  totalRankedCount    Int      @default(0)
-  topSymbol           String?
-  summary             String?
-  errorMessage        String?
+  totalUniverseCount    Int      @default(0)
+  totalRankedCount      Int      @default(0)
+  topSymbol             String?
+  summary               String?
+  errorMessage          String?
+  isFullUniverseScan    Boolean  @default(false)
+  totalSymbolsScreened  Int?
+  totalPassedFilter     Int?
+  totalPrescored        Int?
+  filterCriteriaJson    Json?
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt

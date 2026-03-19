@@ -8,6 +8,7 @@ export interface CreateRunOptions {
   assetScope?: AssetScope;
   riskMode?: RiskMode;
   scheduledFor?: Date;
+  isFullUniverseScan?: boolean;
 }
 
 export async function createScanRun(opts: CreateRunOptions = {}) {
@@ -19,6 +20,7 @@ export async function createScanRun(opts: CreateRunOptions = {}) {
       assetScope: opts.assetScope ?? 'ALL',
       riskMode: opts.riskMode ?? 'ALL',
       scheduledFor: opts.scheduledFor,
+      isFullUniverseScan: opts.isFullUniverseScan ?? false,
     },
   });
 }
@@ -35,13 +37,24 @@ export async function markRunCompleted(id: string, extras: {
   totalRankedCount: number;
   topSymbol?: string;
   summary?: string;
+  isFullUniverseScan?: boolean;
+  totalSymbolsScreened?: number;
+  totalPassedFilter?: number;
+  totalPrescored?: number;
+  filterCriteriaJson?: object;
 }) {
+  const { isFullUniverseScan, totalSymbolsScreened, totalPassedFilter, totalPrescored, filterCriteriaJson, ...rest } = extras;
   return prisma.dailyScanRun.update({
     where: { id },
     data: {
       status: 'COMPLETED',
       completedAt: new Date(),
-      ...extras,
+      ...rest,
+      ...(isFullUniverseScan !== undefined && { isFullUniverseScan }),
+      ...(totalSymbolsScreened !== undefined && { totalSymbolsScreened }),
+      ...(totalPassedFilter !== undefined && { totalPassedFilter }),
+      ...(totalPrescored !== undefined && { totalPrescored }),
+      ...(filterCriteriaJson !== undefined && { filterCriteriaJson }),
     },
   });
 }

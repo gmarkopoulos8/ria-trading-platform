@@ -38,7 +38,7 @@ const STOCK_UNIVERSE: CandidateAsset[] = [
   { ticker: 'ARKK', name: 'ARK Innovation ETF', assetClass: 'etf', sector: 'ETF', isCrypto: false },
 ];
 
-const CRYPTO_UNIVERSE: CandidateAsset[] = [
+export const CRYPTO_UNIVERSE: CandidateAsset[] = [
   { ticker: 'BTC', name: 'Bitcoin', assetClass: 'crypto', sector: 'Crypto', isCrypto: true },
   { ticker: 'ETH', name: 'Ethereum', assetClass: 'crypto', sector: 'Crypto', isCrypto: true },
   { ticker: 'SOL', name: 'Solana', assetClass: 'crypto', sector: 'Crypto', isCrypto: true },

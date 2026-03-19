@@ -128,15 +128,16 @@ export async function rankCandidates(
   candidates: CandidateAsset[],
   limit = 100,
   onProgress?: (done: number, total: number) => void,
+  scanMode = false,
 ): Promise<RankedResult[]> {
-  const CONCURRENCY = 3;
+  const CONCURRENCY = scanMode ? 5 : 3;
   const results: { asset: CandidateAsset; thesis: FullThesisResult; scores: ReturnType<typeof computeCompositeScore> }[] = [];
   let done = 0;
 
   for (let i = 0; i < candidates.length; i += CONCURRENCY) {
     const batch = candidates.slice(i, i + CONCURRENCY);
     const settled = await Promise.allSettled(
-      batch.map((a) => thesisEngine.analyze(a.ticker, a.assetClass))
+      batch.map((a) => thesisEngine.analyze(a.ticker, a.assetClass, { scanMode }))
     );
     for (let j = 0; j < settled.length; j++) {
       const s = settled[j];

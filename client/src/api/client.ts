@@ -228,7 +228,10 @@ export const api = {
       assetScope?: string;
       riskMode?: string;
       force?: boolean;
+      fullUniverse?: boolean;
+      filterCriteria?: Record<string, unknown>;
     }) => post('/daily-scans/trigger', body),
+    progress: (id: string) => `/api/daily-scans/runs/${id}/progress`,
     latest: () => get('/daily-scans/latest'),
     runs: (params?: Record<string, unknown>) => get('/daily-scans/runs', params),
     run: (id: string) => get(`/daily-scans/runs/${id}`),

@@ -1,13 +1,15 @@
 import { useState } from 'react';
 import { useQuery } from '@tanstack/react-query';
 import { useNavigate } from 'react-router-dom';
+import { toast } from 'sonner';
 import {
   ScanSearch, Filter, Zap, TrendingUp, TrendingDown, ChevronRight,
-  RefreshCw, AlertCircle, Target, Shield, Brain, Activity,
+  RefreshCw, Target, Brain, Activity,
   CheckCircle, XCircle, MinusCircle, ChevronDown, ChevronUp,
+  Globe, Bookmark, Tag,
 } from 'lucide-react';
 import { Card, CardHeader } from '../components/ui/Card';
-import { Badge, RiskBadge, ScoreBadge } from '../components/ui/Badge';
+import { Badge } from '../components/ui/Badge';
 import { EmptyState } from '../components/ui/EmptyState';
 import { LoadingState } from '../components/ui/LoadingState';
 import { ErrorState } from '../components/ui/ErrorState';
@@ -45,17 +47,21 @@ interface ScanMeta {
   avgConviction: number;
 }
 
+interface LatestRunStats {
+  id: string;
+  completedAt: string | null;
+  isFullUniverseScan: boolean;
+  totalUniverseCount: number;
+  totalRankedCount: number;
+  totalSymbolsScreened?: number;
+  totalPassedFilter?: number;
+}
+
 function formatPrice(price: number): string {
   if (price < 0.001) return `$${price.toFixed(8)}`;
   if (price < 1) return `$${price.toFixed(4)}`;
   if (price >= 1000) return `$${price.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
   return `$${price.toFixed(2)}`;
-}
-
-function biasColor(bias: Bias): string {
-  if (bias === 'BULLISH') return 'text-emerald-400';
-  if (bias === 'BEARISH') return 'text-red-400';
-  return 'text-slate-400';
 }
 
 function biasBg(bias: Bias): string {
@@ -97,6 +103,29 @@ function ConvictionBar({ value, color = 'bg-accent-blue' }: { value: number; col
   );
 }
 
+function UniverseStatsBanner({ run }: { run: LatestRunStats }) {
+  const scanTime = run.completedAt ? new Date(run.completedAt).toLocaleString('en-US', { hour: 'numeric', minute: '2-digit', hour12: true }) : '—';
+  const scanDate = run.completedAt ? new Date(run.completedAt).toLocaleDateString('en-US', { month: 'short', day: 'numeric' }) : '—';
+
+  return (
+    <div className="bg-accent-purple/5 border border-accent-purple/20 rounded-lg px-4 py-3 flex flex-wrap items-center gap-x-4 gap-y-1 text-xs">
+      <div className="flex items-center gap-1.5 text-accent-purple">
+        <Globe className="h-3.5 w-3.5" />
+        <span className="font-semibold">Full Universe Scan</span>
+      </div>
+      <span className="text-slate-500">Last scan: <span className="text-slate-300">{scanDate} {scanTime}</span></span>
+      {run.totalSymbolsScreened && (
+        <span className="text-slate-500">Screened: <span className="text-slate-300 font-mono">{run.totalSymbolsScreened.toLocaleString()}</span> stocks</span>
+      )}
+      {run.totalPassedFilter && (
+        <span className="text-slate-500">Passed filters: <span className="text-slate-300 font-mono">{run.totalPassedFilter.toLocaleString()}</span></span>
+      )}
+      <span className="text-slate-500">Fully analyzed: <span className="text-slate-300 font-mono">{run.totalRankedCount}</span></span>
+      <span className="text-slate-500">Top picks: <span className="text-slate-300 font-mono">{run.totalRankedCount}</span></span>
+    </div>
+  );
+}
+
 function ScanCard({
   summary,
   expanded,
@@ -108,6 +137,11 @@ function ScanCard({
   onToggle: () => void;
   onClick: () => void;
 }) {
+  const handleWatchlist = (e: React.MouseEvent) => {
+    e.stopPropagation();
+    toast.success(`${summary.ticker} added to watchlist`, { description: 'View in your watchlist to manage alerts' });
+  };
+
   return (
     <div className={`rounded-lg border transition-all ${
       expanded ? 'border-accent-blue/30 bg-surface-2' : 'border-surface-border bg-surface-2 hover:border-surface-border/60 hover:bg-surface-3'
@@ -156,6 +190,13 @@ function ScanCard({
 
         <div className="col-span-1 flex items-center justify-end gap-1">
           <button
+            onClick={handleWatchlist}
+            title="Add to watchlist"
+            className="p-1 rounded text-slate-600 hover:text-accent-blue transition-colors"
+          >
+            <Bookmark className="h-3.5 w-3.5" />
+          </button>
+          <button
             onClick={(e) => { e.stopPropagation(); onToggle(); }}
             className="p-1 rounded text-slate-600 hover:text-slate-400 transition-colors"
           >
@@ -167,7 +208,6 @@ function ScanCard({
 
       {expanded && (
         <div className="px-4 pb-5 border-t border-white/5 pt-4 space-y-4">
-          {/* Verdict + meta row */}
           <div className="flex items-center gap-3 flex-wrap">
             <MiniVerdictBadge action={summary.recommendedAction} score={summary.convictionScore} />
             <div className="flex gap-4">
@@ -181,15 +221,17 @@ function ScanCard({
                   {summary.riskScore}<span className="text-slate-600">/100</span>
                 </span>
               </div>
+              <div className="flex flex-col">
+                <span className="text-[9px] font-mono text-slate-600 uppercase tracking-widest">Class</span>
+                <span className="text-[11px] font-mono font-bold text-slate-400 uppercase">{summary.assetClass}</span>
+              </div>
             </div>
           </div>
 
-          {/* Thesis summary */}
           {summary.thesisSummary && (
             <p className="text-[12px] text-slate-400 leading-relaxed border-l-2 border-white/10 pl-3">{summary.thesisSummary}</p>
           )}
 
-          {/* Risk / Reward */}
           <RiskRewardPanel
             stopLoss={summary.invalidation}
             takeProfit1={summary.takeProfit1}
@@ -197,7 +239,6 @@ function ScanCard({
             currentPrice={summary.price}
           />
 
-          {/* Entry zone + CTA */}
           <div className="flex items-center justify-between gap-3">
             <div className="rounded-xl bg-white/3 border border-white/6 px-3.5 py-2.5 flex-1 min-w-0">
               <p className="text-[9px] font-mono text-slate-600 uppercase tracking-widest mb-1">Entry Zone</p>
@@ -205,6 +246,12 @@ function ScanCard({
                 {formatPrice(summary.entryLow)} – {formatPrice(summary.entryHigh)}
               </p>
             </div>
+            <button
+              onClick={handleWatchlist}
+              className="flex items-center gap-2 px-3 py-2.5 bg-surface-3 hover:bg-surface-2 border border-surface-border rounded-xl text-xs font-semibold transition-all duration-150 flex-shrink-0 text-slate-300"
+            >
+              <Bookmark className="h-3.5 w-3.5" /> Watchlist
+            </button>
             <button
               onClick={onClick}
               className="flex items-center gap-2 px-4 py-2.5 bg-blue-600 hover:bg-blue-500 rounded-xl text-xs font-semibold transition-all duration-150 flex-shrink-0"
@@ -223,6 +270,8 @@ export default function OpportunityScanner() {
   const [filter, setFilter] = useState<'all' | 'stock' | 'crypto'>('all');
   const [sortBy, setSortBy] = useState<'conviction' | 'risk' | 'change'>('conviction');
   const [expandedTickers, setExpandedTickers] = useState<Set<string>>(new Set());
+  const [minConviction, setMinConviction] = useState(0);
+  const [biasFilter, setBiasFilter] = useState<'all' | 'BULLISH' | 'BEARISH' | 'NEUTRAL'>('all');
 
   const {
     data: scanResponse,
@@ -242,10 +291,21 @@ export default function OpportunityScanner() {
     staleTime: 10 * 60 * 1000,
   });
 
+  const { data: latestRunData } = useQuery({
+    queryKey: ['daily-scan-latest-stats'],
+    queryFn: () => api.scans.latest(),
+    staleTime: 5 * 60 * 1000,
+  });
+  const latestRun: LatestRunStats | null = (latestRunData as any)?.data?.run ?? null;
+
   const summaries = scanResponse?.summaries ?? [];
   const meta = scanResponse?.meta;
 
-  const sorted = [...summaries].sort((a, b) => {
+  const filtered = summaries
+    .filter((s) => s.convictionScore >= minConviction)
+    .filter((s) => biasFilter === 'all' || s.bias === biasFilter);
+
+  const sorted = [...filtered].sort((a, b) => {
     if (sortBy === 'conviction') return b.convictionScore - a.convictionScore;
     if (sortBy === 'risk') return a.riskScore - b.riskScore;
     return Math.abs(b.changePercent) - Math.abs(a.changePercent);
@@ -271,6 +331,10 @@ export default function OpportunityScanner() {
         </div>
       </div>
 
+      {latestRun?.isFullUniverseScan && (
+        <UniverseStatsBanner run={latestRun} />
+      )}
+
       <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
         {[
           { label: 'Total Scanned', value: meta?.total ?? '—', color: 'text-white', icon: <ScanSearch className="h-4 w-4" /> },
@@ -289,13 +353,13 @@ export default function OpportunityScanner() {
       </div>
 
       <Card>
-        <div className="flex items-center justify-between mb-4">
+        <div className="flex items-center justify-between mb-4 flex-wrap gap-2">
           <div className="flex items-center gap-2">
             <Brain className="h-4 w-4 text-accent-blue" />
             <span className="text-sm font-semibold">AI Thesis Scan</span>
             <span className="text-xs text-slate-600 font-mono">· Market structure + catalysts + risk</span>
           </div>
-          <div className="flex items-center gap-2">
+          <div className="flex items-center gap-2 flex-wrap">
             {(['all', 'stock', 'crypto'] as const).map((f) => (
               <button key={f} onClick={() => setFilter(f)}
                 className={`px-3 py-1 rounded text-xs font-mono transition-colors ${
@@ -304,6 +368,17 @@ export default function OpportunityScanner() {
                     : 'text-slate-500 hover:text-white hover:bg-surface-3'
                 }`}>
                 {f.toUpperCase()}
+              </button>
+            ))}
+            <div className="w-px h-4 bg-surface-border" />
+            {(['all', 'BULLISH', 'BEARISH', 'NEUTRAL'] as const).map((b) => (
+              <button key={b} onClick={() => setBiasFilter(b)}
+                className={`px-2.5 py-1 rounded text-xs font-mono transition-colors ${
+                  biasFilter === b
+                    ? b === 'BULLISH' ? 'bg-emerald-500/20 text-emerald-400' : b === 'BEARISH' ? 'bg-red-500/20 text-red-400' : b === 'NEUTRAL' ? 'bg-slate-500/20 text-slate-300' : 'bg-surface-3 text-white'
+                    : 'text-slate-500 hover:text-white hover:bg-surface-3'
+                }`}>
+                {b === 'all' ? 'All Bias' : b}
               </button>
             ))}
             <div className="w-px h-4 bg-surface-border" />
@@ -321,12 +396,31 @@ export default function OpportunityScanner() {
           </div>
         </div>
 
+        <div className="flex items-center gap-3 mb-4 px-1 flex-wrap">
+          <span className="text-xs text-slate-500">Min Conviction:</span>
+          <div className="flex items-center gap-2">
+            <input
+              type="range"
+              min={0}
+              max={90}
+              step={5}
+              value={minConviction}
+              onChange={(e) => setMinConviction(Number(e.target.value))}
+              className="w-32 h-1.5 accent-accent-blue"
+            />
+            <span className="text-xs font-mono text-slate-300 w-6">{minConviction}+</span>
+          </div>
+          {minConviction > 0 && (
+            <button onClick={() => setMinConviction(0)} className="text-xs text-slate-500 hover:text-white transition-colors">Reset</button>
+          )}
+        </div>
+
         {isLoading ? (
           <LoadingState message="Running multi-agent thesis scan..." />
         ) : isError ? (
           <ErrorState message="Failed to run thesis scan" onRetry={refetch} />
         ) : sorted.length === 0 ? (
-          <EmptyState icon={<ScanSearch className="h-8 w-8" />} title="No results" description="Try switching asset class filter" />
+          <EmptyState icon={<ScanSearch className="h-8 w-8" />} title="No results" description="Try switching asset class filter or adjusting conviction threshold" />
         ) : (
           <div className="space-y-1">
             <div className="grid grid-cols-12 gap-3 px-4 py-2 text-xs text-slate-600 font-mono uppercase tracking-wider border-b border-surface-border">

@@ -46,16 +46,19 @@ async function schedulerTick() {
 
   const dateKey = getDateKey(nyTime);
 
+  const enableFullUniverse = process.env.ENABLE_FULL_UNIVERSE_SCAN === 'true';
+
   if (isMarketOpenTime(nyTime)) {
     const runKey = `open:${dateKey}`;
     if (lastScheduledDate === runKey) return;
     lastScheduledDate = runKey;
-    console.log(`[Scheduler] Triggering market open scan at ${nyTime.toISOString()}`);
+    console.log(`[Scheduler] Triggering market open scan at ${nyTime.toISOString()} (fullUniverse=${enableFullUniverse})`);
     try {
       await runDailyScan({
         runType: 'SCHEDULED',
         marketSession: 'MARKET_OPEN',
         scheduledFor: nyTime,
+        fullUniverse: enableFullUniverse,
       });
     } catch (err) {
       console.error('[Scheduler] Market open scan failed:', err instanceof Error ? err.message : err);
@@ -72,6 +75,7 @@ async function schedulerTick() {
         runType: 'PREMARKET',
         marketSession: 'PREMARKET',
         scheduledFor: nyTime,
+        fullUniverse: false,
       });
     } catch (err) {
       console.error('[Scheduler] Premarket scan failed:', err instanceof Error ? err.message : err);

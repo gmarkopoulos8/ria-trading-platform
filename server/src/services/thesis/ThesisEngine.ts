@@ -1,6 +1,7 @@
 import { marketService } from '../market/MarketService';
 import { technicalService } from '../technical/TechnicalService';
 import { newsService } from '../news/NewsService';
+import { finnhubProvider } from '../market/stocks/FinnhubProvider';
 import { runMarketStructureAgent } from './MarketStructureAgent';
 import { runCatalystAgent } from './CatalystAgent';
 import { runRiskAgent } from './RiskAgent';
@@ -28,16 +29,21 @@ const SCAN_TICKERS = [
 ];
 
 class ThesisEngine {
-  async analyze(ticker: string, assetClass?: string): Promise<FullThesisResult> {
+  async analyze(ticker: string, assetClass?: string, opts?: { scanMode?: boolean }): Promise<FullThesisResult> {
     const key = `${ticker}:${assetClass ?? ''}`;
     const cached = cache.get(key);
     if (cached && Date.now() - cached.ts < CACHE_TTL_MS) return cached.result;
 
     const resolvedClass = assetClass ?? (isCryptoSymbol(ticker) ? 'crypto' : 'stock');
+    const useFinnhubHistory = !!(opts?.scanMode && process.env.FINNHUB_API_KEY && resolvedClass !== 'crypto');
+
+    const historyProvider = useFinnhubHistory
+      ? () => finnhubProvider.history(ticker, '3M')
+      : () => marketService.history(ticker, '3M', resolvedClass as 'stock' | 'crypto' | 'etf');
 
     const [quote, historyResult, catalystAnalysis] = await Promise.allSettled([
       marketService.quote(ticker, resolvedClass as 'stock' | 'crypto' | 'etf'),
-      marketService.history(ticker, '3M', resolvedClass as 'stock' | 'crypto' | 'etf'),
+      historyProvider(),
       newsService.getCatalysts(ticker, { limit: 15 }),
     ]);
 
