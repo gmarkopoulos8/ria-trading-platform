@@ -150,6 +150,19 @@ app.listen(PORT, async () => {
 
   await loadDefaultCredentials();
 
+  // Reset any scans left in RUNNING state from a previous server instance
+  try {
+    const result = await prisma.dailyScanRun.updateMany({
+      where: { status: 'RUNNING' },
+      data:  { status: 'FAILED', errorMessage: 'Reset on server startup — was stuck in RUNNING state' },
+    });
+    if (result.count > 0) {
+      console.log(`[Startup] Reset ${result.count} stuck RUNNING scan(s) to FAILED`);
+    }
+  } catch (err: any) {
+    console.warn('[Startup] Could not reset stuck scans:', err?.message);
+  }
+
   setTimeout(() => {
     monitorAllOpenPositions().catch((err) => {
       console.warn('[Monitor] Initial cycle error:', err?.message);

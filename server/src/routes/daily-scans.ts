@@ -1,6 +1,7 @@
 import { Router, type Request, type Response } from 'express';
 import { requireAuth } from '../middleware/requireAuth';
 import { runDailyScan } from '../services/scans/dailyScanOrchestrator';
+import { prisma } from '../lib/prisma';
 import {
   listScanRuns,
   getRunById,
@@ -163,6 +164,19 @@ router.post('/scheduler/toggle', async (req: Request, res: Response) => {
     res.json({ success: true, data: { scheduler: status } });
   } catch (err) {
     res.status(500).json({ success: false, error: 'Failed to toggle scheduler' });
+  }
+});
+
+// Reset any stuck RUNNING scans to FAILED (manual emergency fix)
+router.post('/reset-stuck', async (req: Request, res: Response) => {
+  try {
+    const result = await prisma.dailyScanRun.updateMany({
+      where: { status: 'RUNNING' },
+      data:  { status: 'FAILED', errorMessage: 'Manually reset via API' },
+    });
+    res.json({ success: true, data: { reset: result.count, message: `Reset ${result.count} stuck scan(s)` } });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err instanceof Error ? err.message : 'Reset failed' });
   }
 });
 

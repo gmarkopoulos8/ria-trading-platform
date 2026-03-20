@@ -113,10 +113,9 @@ export async function runDailyScan(opts: RunScanOptions = {}): Promise<string> {
       const universe = buildUniverse(assetScope, riskMode);
       console.log(`[DailyScan] Universe: ${universe.length} candidates (scope=${assetScope}, mode=${riskMode})`);
 
-      let progressTick = 0;
       const results = await rankCandidates(universe, 100, (done, total) => {
-        progressTick++;
-        if (progressTick % 5 === 0 || done === total) {
+        updateScanProgress(scanRun.id, 'ANALYZING', done, total);
+        if (done % 5 === 0 || done === total) {
           console.log(`[DailyScan] Progress: ${done}/${total} analyzed`);
         }
       });

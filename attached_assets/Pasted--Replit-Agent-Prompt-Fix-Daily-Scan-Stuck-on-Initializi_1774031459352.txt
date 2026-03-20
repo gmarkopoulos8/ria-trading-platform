@@ -1,0 +1,354 @@
+# Replit Agent Prompt — Fix Daily Scan (Stuck on Initializing)
+
+Three separate bugs cause the daily scan to get stuck on "Initializing" forever. Fix all three. Only touch the files listed.
+
+---
+
+## ROOT CAUSE 1 — Stuck RUNNING Records Block All New Scans
+
+The duplicate check queries for any scan with `status: 'RUNNING'` or `status: 'COMPLETED'` today. If a previous scan crashed mid-run (e.g. due to a timeout or server restart), it leaves a `RUNNING` record in the database that never gets cleaned up. Every new scan attempt is silently blocked with "A scan for this session already completed today" — the UI receives this error, never gets a scanRunId, and sits on "Initializing" forever.
+
+**Fix A — Add a startup cleanup that resets stuck RUNNING scans:**
+
+**File**: `server/src/index.ts`
+
+Add this import near the top:
+```typescript
+import { prisma } from './lib/prisma';
+```
+
+Add this function and call it inside the `app.listen` callback, before `startDailyScanScheduler()`:
+
+```typescript
+// Reset any scans that were left in RUNNING state from a previous server instance
+// (happens on Replit restarts, crashes, or timeouts)
+async function resetStuckScans(): Promise<void> {
+  try {
+    const result = await prisma.dailyScanRun.updateMany({
+      where:  { status: 'RUNNING' },
+      data:   { status: 'FAILED', errorMessage: 'Reset on server startup — was stuck in RUNNING state' },
+    });
+    if (result.count > 0) {
+      console.log(`[Startup] Reset ${result.count} stuck RUNNING scan(s) to FAILED`);
+    }
+  } catch (err: any) {
+    console.warn('[Startup] Could not reset stuck scans:', err?.message);
+  }
+}
+```
+
+Call it:
+```typescript
+app.listen(PORT, async () => {
+  // ... existing startup logs ...
+
+  await resetStuckScans();   // ADD THIS — before startDailyScanScheduler
+  await loadDefaultCredentials();
+  startDailyScanScheduler();
+  // ... rest of startup ...
+});
+```
+
+**Fix B — Also add a reset endpoint so you can fix it manually from the UI without restarting:**
+
+**File**: `server/src/routes/daily-scans.ts`
+
+Add this route before `export default router`:
+
+```typescript
+// Emergency: reset any stuck RUNNING scans to FAILED
+// Useful when scan gets stuck and blocks all new runs
+router.post('/reset-stuck', async (req: Request, res: Response) => {
+  try {
+    const result = await prisma.dailyScanRun.updateMany({
+      where: { status: 'RUNNING' },
+      data:  { status: 'FAILED', errorMessage: 'Manually reset via API' },
+    });
+    res.json({ success: true, data: { reset: result.count, message: `Reset ${result.count} stuck scan(s)` } });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err instanceof Error ? err.message : 'Reset failed' });
+  }
+});
+```
+
+Add the prisma import at the top of `daily-scans.ts` if not already there:
+```typescript
+import { prisma } from '../lib/prisma';
+```
+
+---
+
+## ROOT CAUSE 2 — Trigger Route Blocks the HTTP Response (Times Out on Replit)
+
+The `/trigger` route does `await runDailyScan(...)` which runs the entire scan — potentially 2–10 minutes — inside a single HTTP request. Replit's infrastructure times out HTTP connections after ~30 seconds. When this happens:
+
+1. The client gets a network error
+2. The scan ID is never returned to the UI  
+3. The scan keeps running in the background as an orphaned process
+4. The UI has no ID to connect the SSE progress stream to
+5. The UI is stuck on "Initializing" forever
+
+**File**: `server/src/routes/daily-scans.ts`
+
+Replace the entire `/trigger` route:
+
+```typescript
+router.post('/trigger', async (req: Request, res: Response) => {
+  try {
+    const {
+      runType        = 'MANUAL',
+      marketSession  = 'MARKET_OPEN',
+      assetScope     = 'ALL',
+      riskMode       = 'ALL',
+      force          = false,
+      fullUniverse   = false,
+      filterCriteria = {},
+    } = req.body ?? {};
+
+    // Check for duplicates BEFORE creating a record
+    const { hasDuplicateRunToday, createScanRun, markRunStarted } = await import('../services/scans/scanPersistenceService');
+
+    if (!(force === true || force === 'true')) {
+      const isDuplicate = await hasDuplicateRunToday(runType, marketSession);
+      if (isDuplicate) {
+        return res.status(400).json({
+          success: false,
+          error:   'A scan for this session already ran today. Click "Run Scan" again with Force enabled, or wait until tomorrow.',
+        });
+      }
+    }
+
+    // Create the DB record immediately so we have an ID to return RIGHT NOW
+    // The scan itself runs in the background after we respond
+    const scanRun = await createScanRun({
+      runType,
+      marketSession,
+      assetScope:         assetScope as any,
+      riskMode:           riskMode as any,
+      isFullUniverseScan: fullUniverse,
+    });
+    await markRunStarted(scanRun.id);
+
+    // ── Respond immediately with the scan ID ──────────────────────────────
+    // The SSE progress stream (/runs/:id/progress) can now connect
+    res.json({ success: true, data: { scanRunId: scanRun.id } });
+
+    // ── Run the scan in the background (non-blocking) ─────────────────────
+    const { runDailyScan } = await import('../services/scans/dailyScanOrchestrator');
+    runDailyScan({
+      runType,
+      marketSession,
+      assetScope:           assetScope as any,
+      riskMode:             riskMode as any,
+      skipDuplicateCheck:   true,           // already checked and record already created
+      fullUniverse,
+      filterCriteria,
+      _existingScanRunId:   scanRun.id,     // pass pre-created ID so orchestrator doesn't create another
+    }).catch((err: any) => {
+      console.error('[Trigger] Background scan error:', err?.message);
+    });
+
+  } catch (err) {
+    const message = err instanceof Error ? err.message : 'Scan trigger failed';
+    res.status(400).json({ success: false, error: message });
+  }
+});
+```
+
+**File**: `server/src/services/scans/dailyScanOrchestrator.ts`
+
+Add `_existingScanRunId` to `RunScanOptions`:
+
+```typescript
+export interface RunScanOptions {
+  runType?:             string;
+  marketSession?:       string;
+  assetScope?:          AssetScope;
+  riskMode?:            RiskMode;
+  scheduledFor?:        Date;
+  skipDuplicateCheck?:  boolean;
+  fullUniverse?:        boolean;
+  filterCriteria?:      Partial<FilterCriteria>;
+  _existingScanRunId?:  string;   // ADD — used when trigger route pre-creates the record
+}
+```
+
+At the top of `runDailyScan()`, replace the `createScanRun` + `markRunStarted` block:
+
+```typescript
+// FIND and REPLACE this block:
+const scanRun = await createScanRun({ runType, marketSession, assetScope, riskMode, scheduledFor, isFullUniverseScan: fullUniverse });
+console.log(`[DailyScan] Starting scan run ${scanRun.id} (${runType}/${marketSession})`);
+await markRunStarted(scanRun.id);
+
+// REPLACE WITH:
+const scanRun = opts._existingScanRunId
+  ? { id: opts._existingScanRunId }   // reuse pre-created record from trigger route
+  : await createScanRun({ runType, marketSession, assetScope, riskMode, scheduledFor, isFullUniverseScan: fullUniverse });
+
+if (!opts._existingScanRunId) {
+  await markRunStarted(scanRun.id);
+}
+console.log(`[DailyScan] Starting scan run ${scanRun.id} (${runType}/${marketSession})`);
+```
+
+---
+
+## ROOT CAUSE 3 — Static Scan Never Writes Progress Updates (SSE Stream Always Empty)
+
+The full universe scan calls `updateScanProgress()` on every symbol analyzed. The **static scan** (the default, non-full-universe scan) only logs to console — it never calls `updateScanProgress()`. This means the SSE stream has nothing to send, the UI `ProgressPanel` never receives a `progress` event, and it shows "INITIALIZING" for the entire duration of the scan.
+
+**File**: `server/src/services/scans/dailyScanOrchestrator.ts`
+
+In the static universe branch, find this callback:
+
+```typescript
+const results = await rankCandidates(universe, 100, (done, total) => {
+  progressTick++;
+  if (progressTick % 5 === 0 || done === total) {
+    console.log(`[DailyScan] Progress: ${done}/${total} analyzed`);
+  }
+});
+```
+
+Replace with:
+
+```typescript
+const results = await rankCandidates(universe, 100, (done, total) => {
+  // Write to SSE progress store so the UI progress bar actually moves
+  updateScanProgress(scanRun.id, 'ANALYZING', done, total);
+  if (done % 5 === 0 || done === total) {
+    console.log(`[DailyScan] Progress: ${done}/${total} analyzed`);
+  }
+});
+```
+
+This is a one-line change — just add the `updateScanProgress(scanRun.id, 'ANALYZING', done, total)` call inside the callback. The `updateScanProgress` function is already imported at the top of the file.
+
+---
+
+## ROOT CAUSE 4 — UI Shows "INITIALIZING" With No Helpful Feedback
+
+Even after the above fixes, there is a gap between when the scan starts (record created, response sent) and when the first progress event arrives (after the first batch of stocks is analyzed). During this gap the UI shows "INITIALIZING" with no indication that anything is happening.
+
+**File**: `client/src/pages/DailyScan.tsx`
+
+In the `ProgressPanel` component, find this state and useEffect block (around line 134):
+
+```typescript
+const [progress, setProgress] = useState<ScanProgress | null>(null);
+```
+
+Add a startup message state immediately after:
+```typescript
+const [startupMsg, setStartupMsg] = useState('Starting scan engine…');
+```
+
+Add a useEffect to cycle through startup messages while waiting:
+```typescript
+useEffect(() => {
+  const msgs = [
+    'Starting scan engine…',
+    'Connecting to market data…',
+    'Loading universe…',
+    'First symbols being analyzed…',
+  ];
+  let i = 0;
+  const t = setInterval(() => {
+    i = Math.min(i + 1, msgs.length - 1);
+    setStartupMsg(msgs[i]);
+  }, 4_000);
+  return () => clearInterval(t);
+}, []);
+```
+
+Find the line that displays the phase label:
+```tsx
+{progress ? phaseLabel(progress.phase) : 'INITIALIZING'}
+```
+
+Replace with:
+```tsx
+{progress ? phaseLabel(progress.phase) : startupMsg}
+```
+
+---
+
+## ROOT CAUSE 5 — No "Reset Stuck Scan" Button in the UI
+
+Add a one-click fix to the Daily Scan page for future stuck scans.
+
+**File**: `client/src/api/client.ts`
+
+In the `scans` section, add:
+```typescript
+resetStuck: () => post('/daily-scans/reset-stuck', {}),
+```
+
+**File**: `client/src/pages/DailyScan.tsx`
+
+Add a mutation near the other mutations:
+```typescript
+const resetStuckMut = useMutation({
+  mutationFn: () => api.scans.resetStuck(),
+  onSuccess: (d: any) => {
+    toast.success(d?.data?.message ?? 'Stuck scans reset');
+    qc.invalidateQueries({ queryKey: ['daily-scan-runs'] });
+    qc.invalidateQueries({ queryKey: ['daily-scan-latest'] });
+  },
+  onError: (e: any) => toast.error(e?.response?.data?.error ?? 'Reset failed'),
+});
+```
+
+Find the Run Scan button area and add a small reset button next to it — only show it when a scan appears to be stuck (i.e. `isRunning` has been true for more than 60 seconds, or there's a run with RUNNING status in the list):
+
+```tsx
+{/* Show reset button if scan appears stuck */}
+{isRunning && (
+  <button
+    onClick={() => {
+      resetStuckMut.mutate();
+      setActiveScanId(null);
+      setIsFullScanRunning(false);
+    }}
+    className="text-xs text-slate-500 hover:text-red-400 underline transition-colors ml-2"
+    title="Click if scan is stuck and not progressing"
+  >
+    Stuck? Reset
+  </button>
+)}
+```
+
+---
+
+## SUMMARY
+
+### Files Modified
+```
+server/src/index.ts                                  → resetStuckScans() on startup
+server/src/routes/daily-scans.ts                    → non-blocking trigger, reset-stuck endpoint
+server/src/services/scans/dailyScanOrchestrator.ts  → accept _existingScanRunId, fix static scan progress
+client/src/pages/DailyScan.tsx                      → startup messages, reset stuck button
+client/src/api/client.ts                            → scans.resetStuck()
+```
+
+### What Each Fix Does
+
+| # | Problem | Fix |
+|---|---------|-----|
+| 1 | Previous crashed scan left `RUNNING` in DB, blocking all new scans | Reset on startup + manual reset button |
+| 2 | Scan runs inside HTTP request, times out after 30s, UI never gets scan ID | Return scan ID immediately, run scan in background |
+| 3 | Static scan never calls `updateScanProgress()` so SSE stream is empty | Add one `updateScanProgress()` call inside the progress callback |
+| 4 | UI shows static "INITIALIZING" with no feedback during startup gap | Cycle through helpful startup messages |
+| 5 | No way to unstick a scan from the UI | "Stuck? Reset" link appears while scan is running |
+
+### After applying this prompt
+
+The normal scan flow becomes:
+1. Click **Run Scan**
+2. Response returns immediately (< 1 second) with a scan ID
+3. Progress bar starts moving within 15-30 seconds as first stocks are analyzed
+4. Scan completes in 2-5 minutes — progress shows `X / Y analyzed`
+5. Results appear automatically
+
+If a scan ever gets stuck again, click the **Stuck? Reset** link that appears next to the Run Scan button, then click Run Scan again.

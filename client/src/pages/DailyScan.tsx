@@ -134,8 +134,24 @@ function phaseLabel(phase: string): string {
 function ProgressPanel({ scanRunId, onComplete }: { scanRunId: string; onComplete: () => void }) {
   const [progress, setProgress] = useState<ScanProgress | null>(null);
   const [elapsed, setElapsed] = useState(0);
+  const [startupMsg, setStartupMsg] = useState('Starting scan engine…');
   const startRef = useRef(Date.now());
   const doneRef = useRef(false);
+
+  useEffect(() => {
+    const msgs = [
+      'Starting scan engine…',
+      'Connecting to market data…',
+      'Loading universe…',
+      'First symbols being analyzed…',
+    ];
+    let i = 0;
+    const t = setInterval(() => {
+      i = Math.min(i + 1, msgs.length - 1);
+      setStartupMsg(msgs[i]);
+    }, 4_000);
+    return () => clearInterval(t);
+  }, []);
 
   useEffect(() => {
     const progressUrl = api.scans.progress(scanRunId);
@@ -180,7 +196,7 @@ function ProgressPanel({ scanRunId, onComplete }: { scanRunId: string; onComplet
 
         <div className="space-y-2">
           <div className="flex justify-between text-xs text-slate-400">
-            <span className="font-mono uppercase tracking-wider">{progress ? phaseLabel(progress.phase) : 'INITIALIZING'}</span>
+            <span className="font-mono uppercase tracking-wider">{progress ? phaseLabel(progress.phase) : startupMsg}</span>
             <span className="font-mono">{progress ? `${progress.done} / ${progress.total}` : '—'}</span>
           </div>
           <div className="h-2 bg-surface-border rounded-full overflow-hidden">
@@ -451,6 +467,16 @@ export default function DailyScan() {
     },
   });
 
+  const resetStuckMut = useMutation({
+    mutationFn: () => api.scans.resetStuck(),
+    onSuccess: (d: any) => {
+      toast.success((d as any)?.data?.message ?? 'Stuck scans reset');
+      qc.invalidateQueries({ queryKey: ['daily-scan-runs'] });
+      qc.invalidateQueries({ queryKey: ['daily-scan-latest'] });
+    },
+    onError: (e: any) => toast.error(e?.response?.data?.error ?? 'Reset failed'),
+  });
+
   const handleToggle = useCallback((id: string) => {
     setExpandedId((prev) => (prev === id ? null : id));
   }, []);
@@ -487,6 +513,19 @@ export default function DailyScan() {
             >
               {isRunning ? <><RefreshCw className="h-4 w-4 animate-spin" /> Scanning…</> : <><Play className="h-4 w-4" /> Run Scan</>}
             </button>
+            {isRunning && (
+              <button
+                onClick={() => {
+                  resetStuckMut.mutate();
+                  setActiveScanId(null);
+                  setIsFullScanRunning(false);
+                }}
+                className="text-xs text-slate-500 hover:text-red-400 underline transition-colors"
+                title="Click if scan is stuck and not progressing"
+              >
+                Stuck? Reset
+              </button>
+            )}
           </div>
         </div>
 

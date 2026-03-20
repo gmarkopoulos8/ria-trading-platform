@@ -340,5 +340,6 @@ export const api = {
     schedulerStatus: () => get('/daily-scans/scheduler/status'),
     schedulerToggle: (enabled: boolean) =>
       post('/daily-scans/scheduler/toggle', { enabled }),
+    resetStuck: () => post('/daily-scans/reset-stuck', {}),
   },
 };
