@@ -13,7 +13,7 @@ requiredFiles = [".replit", "replit.nix"]
 [deployment]
 run = ["bash", "-c", "NODE_ENV=production tsx server/src/index.ts"]
 deploymentTarget = "vm"
-build = ["bash", "-c", "cd shared && npm run build && cd ../client && npx vite build"]
+build = ["bash", "-c", "npm install && npx prisma generate --schema=server/prisma/schema.prisma && cd shared && npm run build && cd ../client && npx vite build"]
 
 [agent]
 expertMode = true
