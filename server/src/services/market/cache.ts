@@ -56,14 +56,14 @@ async function persistSymbol(quote: NormalizedQuote): Promise<void> {
     await prisma.symbol.upsert({
       where: { ticker: quote.symbol },
       create: {
-        ticker: quote.symbol,
-        name: quote.name,
+        ticker:     quote.symbol,
+        name:       quote.name ?? quote.symbol,
         assetClass: assetClass as 'STOCK' | 'CRYPTO' | 'ETF',
-        exchange: quote.exchange,
-        isActive: true,
+        exchange:   quote.exchange,
+        isActive:   true,
       },
       update: {
-        name: quote.name,
+        name:      quote.name ?? undefined,
         updatedAt: new Date(),
       },
     });
