@@ -190,4 +190,40 @@ router.put('/password', requireAuth, async (req: Request, res: Response, next: N
   }
 });
 
+// Emergency seed — only works on empty database, disabled once any user exists
+router.post('/setup', async (req: Request, res: Response) => {
+  try {
+    const userCount = await prisma.user.count();
+    if (userCount > 0) {
+      return res.status(403).json({ success: false, error: 'Setup already completed' });
+    }
+
+    const passwordHash = await hashPassword('password123');
+
+    const user = await prisma.user.create({
+      data: {
+        email:       'dev@riabot.local',
+        username:    'devtrader',
+        displayName: 'Dev Trader',
+        passwordHash,
+        settings:   { create: {} },
+        portfolios: { create: { name: 'Main Portfolio', cashBalance: 100000 } },
+        watchlists: { create: { name: 'My Watchlist', isDefault: true } },
+      },
+    });
+
+    res.json({
+      success: true,
+      data: {
+        message:  'Dev account created',
+        email:    'dev@riabot.local',
+        password: 'password123',
+        userId:   user.id,
+      },
+    });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err instanceof Error ? err.message : 'Setup failed' });
+  }
+});
+
 export default router;

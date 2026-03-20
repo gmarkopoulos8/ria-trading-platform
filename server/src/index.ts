@@ -1,5 +1,6 @@
 import 'dotenv/config';
 import path from 'path';
+import { execSync } from 'child_process';
 import express from 'express';
 import cors from 'cors';
 import helmet from 'helmet';
@@ -41,7 +42,10 @@ import { prisma } from './lib/prisma';
 
 const app = express();
 const PORT = process.env.PORT ?? 3001;
-const isProd = process.env.NODE_ENV === 'production';
+// On Replit, deployed apps run over HTTPS regardless of NODE_ENV.
+// REPLIT_DEPLOYMENT=1 is only set in published/deployed environments, never in the dev workspace.
+const isProd = process.env.NODE_ENV === 'production' ||
+               process.env.REPLIT_DEPLOYMENT === '1';
 
 const SESSION_SECRET = process.env.SESSION_SECRET ?? '';
 if (!SESSION_SECRET || SESSION_SECRET === 'ria-bot-dev-secret-change-in-production') {
@@ -159,6 +163,24 @@ app.listen(PORT, async () => {
   console.log(`   Database    : ${process.env.DATABASE_URL ? 'connected' : 'not configured'}`);
   console.log(`   Sessions    : PostgreSQL (ria.sid)`);
   console.log(`   Monitor     : ${MONITOR_INTERVAL_MS / 1000}s interval (first run in 15s)`);
+
+  // Auto-seed if no users exist (first deploy with empty database)
+  try {
+    const userCount = await prisma.user.count();
+    if (userCount === 0) {
+      console.log('[Startup] No users found — running seed...');
+      try {
+        execSync('cd server && npx tsx prisma/seed.ts', {
+          stdio: 'inherit',
+          timeout: 60_000,
+          cwd: process.cwd().includes('/server') ? '..' : '.',
+        });
+        console.log('[Startup] Seed completed — dev account created');
+      } catch (seedErr: any) {
+        console.warn('[Startup] Seed failed:', seedErr?.message);
+      }
+    }
+  } catch { /* non-fatal */ }
 
   await loadDefaultCredentials();
 

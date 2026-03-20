@@ -1,0 +1,193 @@
+# Replit Agent Prompt — Fix Login on Deployed App
+
+Two bugs cause login to fail on the published app at ria-bot.replit.app. Fix both.
+
+---
+
+## BUG 1 — Dev account doesn't exist in the production database
+
+The seed script creates `dev@riabot.local / password123` but it only runs locally. The deployed app's database has no users. Anyone visiting the published URL can't log in because there's no account.
+
+**Fix A — Make the seed run automatically on startup if no users exist**
+
+**File**: `server/src/index.ts`
+
+Add this import near the top:
+```typescript
+import { execSync } from 'child_process';
+```
+
+Inside `app.listen`, add this BEFORE `await loadDefaultCredentials()`:
+
+```typescript
+// Auto-seed if no users exist in the database (first deploy)
+try {
+  const userCount = await prisma.user.count();
+  if (userCount === 0) {
+    console.log('[Startup] No users found — running seed...');
+    try {
+      execSync('cd server && npx tsx prisma/seed.ts', {
+        stdio: 'inherit',
+        timeout: 60_000,
+        cwd: process.cwd().includes('/server') ? '..' : '.',
+      });
+      console.log('[Startup] Seed completed — dev account created');
+    } catch (seedErr: any) {
+      console.warn('[Startup] Seed failed:', seedErr?.message);
+    }
+  }
+} catch { /* non-fatal */ }
+```
+
+**Fix B — Also add a manual seed endpoint for emergencies**
+
+**File**: `server/src/routes/auth.ts`
+
+Add this route at the bottom before `export default router`. It only works when no users exist:
+
+```typescript
+// Emergency seed — only works on empty database, disabled once any user exists
+router.post('/setup', async (req: Request, res: Response) => {
+  try {
+    const userCount = await prisma.user.count();
+    if (userCount > 0) {
+      return res.status(403).json({ success: false, error: 'Setup already completed' });
+    }
+
+    const { hashPassword } = await import('../lib/auth');
+    const passwordHash = await hashPassword('password123');
+
+    const user = await prisma.user.create({
+      data: {
+        email:        'dev@riabot.local',
+        username:     'devtrader',
+        displayName:  'Dev Trader',
+        passwordHash,
+        settings:   { create: {} },
+        portfolios: { create: { name: 'Main Portfolio', cashBalance: 100000 } },
+        watchlists: { create: { name: 'My Watchlist', isDefault: true } },
+      },
+    });
+
+    res.json({
+      success: true,
+      data: {
+        message: 'Dev account created',
+        email:    'dev@riabot.local',
+        password: 'password123',
+        userId:   user.id,
+      },
+    });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err instanceof Error ? err.message : 'Setup failed' });
+  }
+});
+```
+
+---
+
+## BUG 2 — Session cookie fails on the deployed app (HTTPS/CORS issue)
+
+The session cookie is configured with `secure: isProd` and `sameSite: isProd ? 'none' : 'lax'`. On Replit's deployed environment, `NODE_ENV` may not be set to `production`, OR the `trust proxy` setting is not working correctly, causing cookies to fail silently — login appears to work but the session is never saved.
+
+**File**: `server/src/index.ts`
+
+Find:
+```typescript
+const isProd = process.env.NODE_ENV === 'production';
+```
+
+Replace with:
+```typescript
+// On Replit, deployed apps run over HTTPS regardless of NODE_ENV
+// Detect production by the presence of a non-localhost host or explicit env var
+const isProd = process.env.NODE_ENV === 'production' ||
+               process.env.REPLIT_DEPLOYMENT === '1' ||
+               !!process.env.REPLIT_DB_URL ||
+               (process.env.REPL_SLUG !== undefined && process.env.NODE_ENV !== 'development');
+```
+
+Also make the session config more resilient. Find the session cookie block:
+
+```typescript
+cookie: {
+  secure: isProd,
+  httpOnly: true,
+  maxAge: 24 * 60 * 60 * 1000,
+  sameSite: isProd ? 'none' : 'lax',
+},
+```
+
+Replace with:
+
+```typescript
+cookie: {
+  secure:   isProd,
+  httpOnly: true,
+  maxAge:   24 * 60 * 60 * 1000,
+  // 'none' is required for cross-origin requests (Replit dev URL → API)
+  // 'lax' works when frontend and API share the same origin
+  sameSite: isProd ? 'none' : 'lax',
+  // Don't set domain — let the browser handle it
+  // domain: undefined
+},
+```
+
+Also ensure `trust proxy` is set correctly. Find:
+```typescript
+app.set('trust proxy', 1);
+```
+
+Make sure this line is present and is at the very top of the Express config, before any middleware. If it's missing, add it. This is required for `secure` cookies to work behind Replit's reverse proxy.
+
+---
+
+## BUG 3 — CORS may block the login request from the deployed domain
+
+**File**: `server/src/index.ts`
+
+Find the `allowedOrigins` array. Make sure it includes the deployed app URL pattern:
+
+```typescript
+const allowedOrigins: (string | RegExp)[] = [
+  'http://localhost:5000',
+  'http://localhost:3000',
+  /\.replit\.dev$/,
+  /\.replit\.app$/,       // ← deployed app domain
+  /\.repl\.co$/,
+  /\.kirk\.replit\.dev$/, // ← dev workspace
+];
+```
+
+The `/\.replit\.app$/` pattern should already be there — verify it is. If the `CLIENT_URL` environment variable is set in Replit Secrets, it gets added automatically too.
+
+---
+
+## AFTER APPLYING — How to get into the deployed app
+
+**Option 1 (automatic):** Deploy the app. On first startup with an empty database, the seed runs automatically and creates the dev account. Log in with:
+- Email: `dev@riabot.local`
+- Password: `password123`
+
+**Option 2 (manual, if auto-seed doesn't run):** Visit:
+```
+https://ria-bot.replit.app/api/auth/setup
+```
+Send a POST request (or open in browser with a REST client). This creates the dev account if no users exist. It's disabled once any user is registered.
+
+**Option 3 (Replit Shell):** Run the seed directly from the shell:
+```bash
+cd server && npx tsx prisma/seed.ts
+```
+
+**Option 4 (register a new account):** Go to `https://ria-bot.replit.app/register` and create your own account. The registration form works — it's only the pre-seeded dev account that doesn't exist on the production DB.
+
+---
+
+## Summary
+
+| Bug | Cause | Fix |
+|-----|-------|-----|
+| Dev account missing | Seed never runs on deployed DB | Auto-seed on startup + `/api/auth/setup` endpoint |
+| Session cookie fails | `isProd` detection unreliable on Replit | Check multiple Replit env vars to detect deployment |
+| CORS blocks login request | Origin patterns | Verify `/\.replit\.app$/` is in allowed origins |
