@@ -77,6 +77,7 @@ router.get('/status', requireAuth, async (req, res) => {
       success: true,
       data: {
         hasCredentials: true,
+        connected:      true,
         account,
         positionCount: positions.length,
         openOrderCount: openOrders.length,

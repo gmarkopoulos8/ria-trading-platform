@@ -133,7 +133,16 @@ function LivePositionsPanel() {
 function AlpacaCommandPanel() {
   const qc = useQueryClient();
 
-  const { data: statusRaw }    = useQuery({ queryKey: ['alpaca-status'],          queryFn: () => api.alpaca.status().then((r: any) => r.data),          refetchInterval: 15_000 });
+  const { data: statusRaw } = useQuery({
+    queryKey: ['alpaca-status'],
+    queryFn:  () => api.alpaca.status().then((r: any) => r.data),
+    refetchInterval: 15_000,
+  });
+  const { data: credStatusRaw } = useQuery({
+    queryKey: ['alpaca-cred-status'],
+    queryFn:  () => api.credentials.alpacaStatus().then((r: any) => r.data),
+    refetchInterval: 30_000,
+  });
   const { data: accountRaw }   = useQuery({ queryKey: ['alpaca-account'],         queryFn: () => api.alpaca.account().then((r: any) => r.data),         refetchInterval: 30_000 });
   const { data: positionsRaw } = useQuery({ queryKey: ['alpaca-positions-cmd'],   queryFn: () => api.alpaca.positions().then((r: any) => r.data ?? []),  refetchInterval: 10_000 });
   const { data: autoStatusRaw} = useQuery({ queryKey: ['alpaca-auto-status-cmd'], queryFn: () => api.alpaca.autoStatus().then((r: any) => r.data),       refetchInterval: 30_000 });
@@ -151,7 +160,12 @@ function AlpacaCommandPanel() {
   const totalPnl     = positions.reduce((s: number, p: any) => s + parseFloat(p.unrealized_pl ?? '0'), 0);
   const isMarketOpen = clock?.is_open ?? false;
   const controlLevel = status?.killswitch?.controlLevel ?? 'ACTIVE';
-  const isConnected  = status?.connected ?? false;
+  const isConnected = !!(
+    (statusRaw as any)?.hasCredentials  === true ||
+    (statusRaw as any)?.connected        === true ||
+    (credStatusRaw as any)?.isConnected  === true ||
+    (credStatusRaw as any)?.runtimeLoaded === true
+  );
 
   const pauseMut    = useMutation({ mutationFn: () => api.alpaca.pause('Manual pause'),                                    onSuccess: () => { toast.info('Alpaca paused');                        qc.invalidateQueries({ queryKey: ['alpaca-status'] }); } });
   const hardStopMut = useMutation({ mutationFn: () => api.alpaca.hardStop('Manual hard stop'),                             onSuccess: () => { toast.warning('Alpaca hard stopped');               qc.invalidateQueries({ queryKey: ['alpaca-status'] }); } });

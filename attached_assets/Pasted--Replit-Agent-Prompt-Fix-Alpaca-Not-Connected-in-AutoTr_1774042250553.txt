@@ -1,0 +1,190 @@
+# Replit Agent Prompt — Fix "Alpaca Not Connected" in AutoTrader Command Center
+
+The AlpacaCommandPanel in AutoTrader.tsx checks status?.connected but the /api/alpaca/status endpoint returns { hasCredentials: true } — the field is called hasCredentials, not connected. This one mismatch causes "NOT CONNECTED" to always show even when Alpaca is fully connected.
+
+---
+
+## FIX 1 — Make /api/alpaca/status return both field names + auto-reload credentials
+
+**File**: server/src/routes/alpaca.ts
+
+Find the /status route. Replace the opening block (everything up to and including the !hasAlpacaCredentials() early return):
+
+Replace:
+```typescript
+router.get("/status", requireAuth, async (req, res) => {
+  try {
+    const controlStatus = getControlStatus();
+    if (!hasAlpacaCredentials()) {
+      return res.json({
+        success: true,
+        data: {
+          hasCredentials: false,
+          killswitch: { ...controlStatus, controlLevel: controlStatus.controlLevel },
+        },
+      });
+    }
+```
+
+With:
+```typescript
+router.get("/status", requireAuth, async (req, res) => {
+  try {
+    const controlStatus = getControlStatus();
+
+    // Auto-reload credentials from DB if runtime cache is empty (server restart)
+    if (!hasAlpacaCredentials()) {
+      try {
+        const userId = (req as any).session?.userId as string;
+        if (userId) {
+          const { credentialService } = await import("../services/credentials/CredentialService");
+          const creds = await credentialService.getAlpacaCredentials(userId);
+          if (creds) {
+            const { setAlpacaRuntimeCredentials: _set } = await import("../services/alpaca/alpacaConfig");
+            _set(creds);
+          }
+        }
+      } catch { /* non-fatal */ }
+    }
+
+    if (!hasAlpacaCredentials()) {
+      return res.json({
+        success: true,
+        data: {
+          hasCredentials: false,
+          connected:      false,
+          killswitch: { ...controlStatus, controlLevel: controlStatus.controlLevel },
+        },
+      });
+    }
+```
+
+Also find the success data block and add connected: true.
+
+Find:
+```typescript
+      data: {
+        hasCredentials: true,
+        account,
+```
+
+Replace with:
+```typescript
+      data: {
+        hasCredentials: true,
+        connected:      true,
+        account,
+```
+
+---
+
+## FIX 2 — Fix AlpacaCommandPanel isConnected check
+
+**File**: client/src/pages/AutoTrader.tsx
+
+Inside AlpacaCommandPanel, add a second query for credentials status. Find:
+```typescript
+const { data: statusRaw } = useQuery({ queryKey: ["alpaca-status"], queryFn: () => api.alpaca.status().then((r: any) => r.data), refetchInterval: 15_000 });
+```
+
+Replace with:
+```typescript
+const { data: statusRaw } = useQuery({
+  queryKey: ["alpaca-status"],
+  queryFn:  () => api.alpaca.status().then((r: any) => r.data),
+  refetchInterval: 15_000,
+});
+const { data: credStatusRaw } = useQuery({
+  queryKey: ["alpaca-cred-status"],
+  queryFn:  () => api.credentials.alpacaStatus().then((r: any) => r.data),
+  refetchInterval: 30_000,
+});
+```
+
+Find the isConnected line:
+```typescript
+const isConnected = status?.connected ?? false;
+```
+
+Replace with:
+```typescript
+const isConnected = !!(
+  (statusRaw as any)?.hasCredentials  === true ||
+  (statusRaw as any)?.connected        === true ||
+  (credStatusRaw as any)?.isConnected  === true ||
+  (credStatusRaw as any)?.runtimeLoaded === true
+);
+```
+
+---
+
+## FIX 3 — CredentialLoader retry on startup
+
+**File**: server/src/services/credentials/CredentialLoader.ts
+
+Replace the entire loadDefaultCredentials export:
+
+```typescript
+export async function loadDefaultCredentials(): Promise<void> {
+  const MAX_ATTEMPTS = 5;
+  const DELAY_MS     = 2_000;
+
+  for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+    try {
+      const firstUser = await prisma.user.findFirst({ orderBy: { createdAt: "asc" } });
+      if (!firstUser) { console.info("[CredentialLoader] No users yet"); return; }
+
+      const alpacaCreds = await credentialService.getAlpacaCredentials(firstUser.id);
+      if (alpacaCreds) {
+        setAlpacaRuntimeCredentials(alpacaCreds);
+        console.info("[CredentialLoader] Alpaca credentials loaded");
+      }
+
+      const hlCreds = await credentialService.getHLCredentials(firstUser.id);
+      if (hlCreds && hlCreds.source === "database") {
+        setHLRuntimeCredentials({
+          walletAddress: hlCreds.walletAddress, agentPrivateKey: hlCreds.agentPrivateKey ?? undefined,
+          isMainnet: hlCreds.isMainnet, dryRun: hlCreds.dryRun,
+          maxDrawdownPct: hlCreds.maxDrawdownPct, defaultLeverage: hlCreds.defaultLeverage,
+        });
+      }
+
+      const tosCreds = await credentialService.getTOSCredentials(firstUser.id);
+      if (tosCreds && tosCreds.source === "database") {
+        const tosRec = await prisma.exchangeCredential.findUnique({
+          where: { userId_exchange: { userId: firstUser.id, exchange: "tos" } },
+        }).catch(() => null);
+        setTOSRuntimeCredentials({
+          clientId: tosCreds.clientId, clientSecret: tosCreds.clientSecret,
+          redirectUri: tosCreds.redirectUri, refreshToken: tosCreds.refreshToken,
+          accountNumber: tosCreds.accountNumber, dryRun: tosCreds.dryRun,
+          maxDrawdownPct: tosCreds.maxDrawdownPct,
+          viewAccountNumber: tosRec?.viewAccountNumber ?? undefined,
+          autoTradeAccountNumber: tosRec?.autoTradeAccountNumber ?? undefined,
+        });
+      }
+
+      console.info("[CredentialLoader] All credentials loaded");
+      return;
+
+    } catch (err: any) {
+      if (attempt === MAX_ATTEMPTS) {
+        console.warn(`[CredentialLoader] Failed after ${MAX_ATTEMPTS} attempts:`, err?.message);
+        return;
+      }
+      console.warn(`[CredentialLoader] Attempt ${attempt} failed, retrying in ${DELAY_MS}ms:`, err?.message);
+      await new Promise(r => setTimeout(r, DELAY_MS));
+    }
+  }
+}
+```
+
+---
+
+## Root cause summary
+
+The AlpacaCommandPanel queries api.alpaca.status() which returns { hasCredentials: true }. The panel checks status?.connected — a field that does not exist in the response — so it is always undefined/false, always showing NOT CONNECTED regardless of actual state.
+
+Fix 1: add connected: true to the response (one line)
+Fix 2: check hasCredentials as well as connected — belt and suspenders
+Fix 3: retry credential loading on startup so runtime cache is always populated after a server restart
