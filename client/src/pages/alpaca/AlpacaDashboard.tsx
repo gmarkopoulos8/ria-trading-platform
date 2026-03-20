@@ -1079,12 +1079,23 @@ function AutoTradingPanel({ isDryRun: externalDryRun }: { isDryRun: boolean }) {
       </div>
 
       {(tradingMode === 'options' || tradingMode === 'both') && (
-        <div className="mb-3 p-2.5 bg-blue-500/10 border border-blue-500/20 rounded-lg">
-          <p className="text-[11px] text-blue-300 mb-2">
-            Options trades use a small % of your per-trade capital for premium. The AI picks the best strategy (calls, spreads, or cash-secured puts) based on IV rank and conviction.
-          </p>
-          <div className="flex items-center justify-between">
-            <span className="text-xs text-zinc-400">Max options risk per trade (%)</span>
+        <div className="mb-3 p-2.5 bg-blue-500/10 border border-blue-500/20 rounded-lg space-y-2">
+          <ul className="space-y-0.5">
+            {[
+              '📈 Bullish + low IV → Buy calls or spread',
+              '📈 Bullish + high IV → Sell cash-secured put or covered call',
+              '➡️ Neutral + high IV → Iron condor (range-bound income)',
+              '📉 Bearish + high IV → Bear put spread / iron condor',
+              '⚡ No stock signals → Sell premium on SPY, AAPL, etc.',
+            ].map(line => (
+              <li key={line} className="text-[10px] text-zinc-400 flex items-start gap-1.5">
+                <span className="flex-shrink-0">{line.slice(0, 2)}</span>
+                <span>{line.slice(2)}</span>
+              </li>
+            ))}
+          </ul>
+          <div className="flex items-center justify-between pt-1 border-t border-blue-500/10">
+            <span className="text-xs text-zinc-400">Options risk per trade (%)</span>
             <div className="flex items-center gap-2">
               <input
                 type="range" min={0.5} max={5} step={0.5} value={maxOptionsRiskPct}
@@ -1094,8 +1105,8 @@ function AutoTradingPanel({ isDryRun: externalDryRun }: { isDryRun: boolean }) {
               <span className="text-xs font-mono text-white w-8">{maxOptionsRiskPct}%</span>
             </div>
           </div>
-          <p className="text-[10px] text-zinc-600 mt-1">
-            ~${Math.floor((capitalTotal / maxPositions) * maxOptionsRiskPct / 100)} per trade with current settings. Requires FINNHUB_API_KEY.
+          <p className="text-[10px] text-zinc-600">
+            ~${Math.floor((capitalTotal / maxPositions) * maxOptionsRiskPct / 100)} per trade · Requires FINNHUB_API_KEY
           </p>
         </div>
       )}

@@ -713,6 +713,14 @@ export default function AutoTrader() {
     onError: () => toast.error('Failed to save configuration'),
   });
 
+  const { data: adaptiveRaw } = useQuery({
+    queryKey: ['autotrader-adaptive'],
+    queryFn: () => api.autotrader.adaptiveStatus(),
+    refetchInterval: 5 * 60_000,
+    staleTime: 2 * 60_000,
+  });
+  const adaptive = (adaptiveRaw as any)?.data;
+
   const cycleMut = useMutation({
     mutationFn: () => api.autotrader.runCycle(),
     onSuccess: (data) => {
@@ -833,6 +841,50 @@ export default function AutoTrader() {
           color={status && status.todayPnl >= 0 ? 'green' : 'red'}
         />
       </div>
+
+      {adaptive && (
+        <Card className="p-4">
+          <div className="flex items-center gap-2 mb-3">
+            <div className="w-7 h-7 rounded-lg bg-violet-500/20 border border-violet-500/30 flex items-center justify-center">
+              <Bot className="h-4 w-4 text-violet-400" />
+            </div>
+            <div>
+              <h3 className="text-sm font-bold text-white">AI Adaptive Engine</h3>
+              <p className="text-xs text-slate-500">Live parameter adjustment · {adaptive.exchange}</p>
+            </div>
+            <div className="ml-auto flex items-center gap-1.5 px-2 py-0.5 rounded-full bg-violet-500/10 border border-violet-500/20">
+              <div className="w-1.5 h-1.5 rounded-full bg-violet-400 animate-pulse" />
+              <span className="text-[10px] text-violet-300 font-semibold uppercase">{adaptive.regime?.replace(/_/g, ' ')}</span>
+            </div>
+          </div>
+          <div className="grid grid-cols-2 md:grid-cols-4 gap-3 mb-3">
+            {[
+              { label: 'Stop Loss',  value: `${adaptive.stopLossPct}%`,        color: 'text-red-400' },
+              { label: 'Target',     value: `${adaptive.takeProfitPct}%`,       color: 'text-accent-green' },
+              { label: 'Conviction', value: `≥ ${adaptive.minConvictionScore}`, color: 'text-yellow-400' },
+              { label: 'Size Mult',  value: `${adaptive.positionSizeMultiplier}×`, color: 'text-accent-blue' },
+            ].map(({ label, value, color }) => (
+              <div key={label} className="bg-surface-3 rounded-lg p-2.5 border border-surface-border">
+                <p className="text-[10px] text-slate-500 uppercase tracking-wider mb-0.5">{label}</p>
+                <p className={`text-sm font-bold font-mono ${color}`}>{value}</p>
+              </div>
+            ))}
+          </div>
+          <div className="space-y-1">
+            {(adaptive.reasoning ?? []).map((r: string, i: number) => (
+              <div key={i} className="flex items-start gap-2 text-xs text-slate-400">
+                <span className="text-violet-500 flex-shrink-0">›</span>
+                <span>{r}</span>
+              </div>
+            ))}
+          </div>
+          {adaptive.nextAdjustAt && (
+            <p className="text-[10px] text-slate-600 mt-2">
+              Next adjustment: {new Date(adaptive.nextAdjustAt).toLocaleTimeString()}
+            </p>
+          )}
+        </Card>
+      )}
 
       <Card className="p-4">
         <div className="flex items-center gap-2 mb-4">

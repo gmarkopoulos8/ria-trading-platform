@@ -1,0 +1,1027 @@
+# Replit Agent Prompt — AI Adaptive Trading for All Exchanges + Options in Any Market
+
+This is a single combined prompt. Apply every change in order. Only touch the files listed.
+
+---
+
+## PART A — OPTIONS IN ANY MARKET CONDITION
+
+### A1 — Add IRON_CONDOR and COVERED_CALL to Strategy Types
+
+**File**: `server/src/services/options/types.ts`
+
+Find:
+```typescript
+export type OptionsStrategy =
+  | 'LONG_CALL'
+  | 'LONG_PUT'
+  | 'BULL_CALL_SPREAD'
+  | 'BEAR_PUT_SPREAD'
+  | 'CASH_SECURED_PUT'
+  | 'NONE';
+```
+
+Replace with:
+```typescript
+export type OptionsStrategy =
+  | 'LONG_CALL'
+  | 'LONG_PUT'
+  | 'BULL_CALL_SPREAD'
+  | 'BEAR_PUT_SPREAD'
+  | 'CASH_SECURED_PUT'
+  | 'COVERED_CALL'
+  | 'IRON_CONDOR'
+  | 'NONE';
+```
+
+---
+
+### A2 — Overhaul OptionsAnalyzer to Trade in Any Market
+
+**File**: `server/src/services/options/OptionsAnalyzer.ts`
+
+Replace the entire `selectStrategy` function:
+
+```typescript
+async function selectStrategy(
+  bias: string,
+  conviction: number,
+  ivRank: number,
+  holdWindow: string,
+  forPremiumSelling = false,
+): Promise<OptionsStrategy> {
+  const holdDays = parseHoldWindowDays(holdWindow);
+
+  let regime = 'UNKNOWN';
+  try {
+    const r = await detectRegime();
+    regime = r.regime;
+    if (r.regime === 'BEAR_CRISIS') return 'NONE';
+  } catch { /* non-fatal */ }
+
+  // ── Premium selling mode: no directional requirement ──────────────────────
+  if (forPremiumSelling || bias === 'NEUTRAL' || conviction < 70) {
+    if (ivRank < 30) return 'NONE'; // IV too low to sell
+    if (bias === 'NEUTRAL' && ivRank > 50 && regime !== 'ELEVATED_VOLATILITY') return 'IRON_CONDOR';
+    if (ivRank >= 35) return 'CASH_SECURED_PUT';
+    return 'NONE';
+  }
+
+  // ── Directional trades ────────────────────────────────────────────────────
+  if (regime === 'ELEVATED_VOLATILITY') {
+    if (bias === 'BULLISH') return ivRank > 40 ? 'CASH_SECURED_PUT' : 'BULL_CALL_SPREAD';
+    if (bias === 'BEARISH') return 'BEAR_PUT_SPREAD';
+  }
+
+  if (bias === 'BULLISH') {
+    if (ivRank > 55 && conviction >= 75) return 'CASH_SECURED_PUT';
+    if (conviction >= 82 && holdDays <= 30) return 'LONG_CALL';
+    if (conviction >= 70) return 'BULL_CALL_SPREAD';
+  }
+
+  if (bias === 'BEARISH') {
+    if (ivRank > 55 && conviction >= 75) return 'IRON_CONDOR';
+    if (conviction >= 82 && holdDays <= 30) return 'LONG_PUT';
+    if (conviction >= 70) return 'BEAR_PUT_SPREAD';
+  }
+
+  return 'NONE';
+}
+```
+
+Add these two new builder functions immediately before `export async function getRecommendation`:
+
+```typescript
+function buildIronCondor(
+  ticker: string,
+  calls: OptionContract[],
+  puts: OptionContract[],
+  currentPrice: number,
+  ivRank: number,
+  maxRiskDollars: number,
+): OptionsRecommendation | null {
+  const dteCalls = filterByDTE(calls, 25, 45).filter(isLiquid);
+  const dtePuts  = filterByDTE(puts,  25, 45).filter(isLiquid);
+
+  const shortCall = filterByDelta(dteCalls, 0.20, 0.30)[0] ?? null;
+  const shortPut  = filterByDelta(dtePuts,  0.20, 0.30)[0] ?? null;
+  if (!shortCall || !shortPut || shortCall.expiration !== shortPut.expiration) return null;
+
+  const longCall = dteCalls.filter(c => c.strike > shortCall.strike && c.expiration === shortCall.expiration).sort((a, b) => a.strike - b.strike)[0] ?? null;
+  const longPut  = dtePuts.filter(p => p.strike < shortPut.strike && p.expiration === shortPut.expiration).sort((a, b) => b.strike - a.strike)[0] ?? null;
+  if (!longCall || !longPut) return null;
+
+  const netCredit = shortCall.mid + shortPut.mid - longCall.mid - longPut.mid;
+  if (netCredit <= 0.10) return null;
+
+  const maxRisk = Math.max(longCall.strike - shortCall.strike, shortPut.strike - longPut.strike) - netCredit;
+  if (maxRisk <= 0) return null;
+
+  const numContracts = Math.max(1, Math.floor(maxRiskDollars / (maxRisk * 100)));
+
+  return {
+    strategy: 'IRON_CONDOR',
+    ticker,
+    legs: [
+      { action: 'SELL', contract: shortCall, contracts: numContracts },
+      { action: 'BUY',  contract: longCall,  contracts: numContracts },
+      { action: 'SELL', contract: shortPut,  contracts: numContracts },
+      { action: 'BUY',  contract: longPut,   contracts: numContracts },
+    ],
+    maxRisk:             maxRisk * numContracts * 100,
+    maxProfit:           netCredit * numContracts * 100,
+    breakeven:           shortPut.strike - netCredit,
+    probabilityOfProfit: Math.round((1 - (shortCall.delta ?? 0.25) - Math.abs(shortPut.delta ?? 0.25)) * 100),
+    ivRank,
+    netDebit:            -netCredit,
+    rewardRiskRatio:     netCredit / maxRisk,
+    reasoning: [
+      `Iron Condor: sell $${shortPut.strike}P / $${shortCall.strike}C — collect $${netCredit.toFixed(2)} credit`,
+      `Profit if ${ticker} stays between $${shortPut.strike} and $${shortCall.strike} through expiration`,
+      `IV rank ${ivRank}/100 — elevated IV makes premium selling attractive`,
+    ],
+    warnings: [
+      'Profits only if stock stays range-bound through expiration',
+      `Adjust if ${ticker} breaks above $${shortCall.strike} or below $${shortPut.strike}`,
+    ],
+    fetchedAt: new Date(),
+  };
+}
+
+function buildCoveredCall(
+  ticker: string,
+  calls: OptionContract[],
+  currentPrice: number,
+  ivRank: number,
+  maxRiskDollars: number,
+): OptionsRecommendation | null {
+  const dteCalls = filterByDTE(calls, 20, 40).filter(isLiquid);
+  const eligible = filterByDelta(dteCalls, 0.25, 0.35);
+  if (eligible.length === 0) return null;
+
+  const contract = eligible[0];
+  const numContracts = Math.max(1, Math.floor(maxRiskDollars / (currentPrice * 100)));
+  const netCredit = contract.mid;
+
+  return {
+    strategy: 'COVERED_CALL',
+    ticker,
+    legs: [{ action: 'SELL', contract, contracts: numContracts }],
+    maxRisk:             currentPrice * numContracts * 100,
+    maxProfit:           (contract.strike - currentPrice + contract.mid) * numContracts * 100,
+    breakeven:           currentPrice - contract.mid,
+    probabilityOfProfit: Math.round((1 - (contract.delta ?? 0.30)) * 100),
+    ivRank,
+    netDebit:            -netCredit,
+    rewardRiskRatio:     netCredit / (currentPrice - netCredit),
+    reasoning: [
+      `Sell $${contract.strike} call — collect $${netCredit.toFixed(2)} credit per share`,
+      `Reduces cost basis to $${(currentPrice - contract.mid).toFixed(2)}`,
+      `${contract.dte} DTE — theta decay works in your favor`,
+    ],
+    warnings: [`Stock called away at $${contract.strike} if it rises above strike`],
+    fetchedAt: new Date(),
+  };
+}
+```
+
+Replace the entire `export async function getRecommendation` function:
+
+```typescript
+export async function getRecommendation(
+  thesis: FullThesisResult,
+  accountEquity: number,
+  maxRiskDollars: number,
+  forPremiumSelling = false,
+): Promise<OptionsRecommendation | null> {
+  const ticker       = thesis.ticker;
+  const bias         = thesis.thesis.bias;
+  const conviction   = thesis.thesis.convictionScore;
+  const holdWindow   = thesis.thesis.suggestedHoldWindow;
+  const currentPrice = thesis.marketStructure.currentPrice;
+
+  if (ticker.length > 5 || currentPrice < 5) return null;
+  if (!process.env.FINNHUB_API_KEY) return null;
+
+  const [chain, ivRankData] = await Promise.all([
+    getOptionsChain(ticker),
+    computeIVRank(ticker),
+  ]);
+
+  if (!chain || (chain.calls.length === 0 && chain.puts.length === 0)) return null;
+
+  const ivR      = ivRankData?.rank ?? 50;
+  const strategy = await selectStrategy(bias, conviction, ivR, holdWindow, forPremiumSelling);
+  if (strategy === 'NONE') return null;
+
+  switch (strategy) {
+    case 'LONG_CALL':         return buildLongCall(ticker, chain.calls, currentPrice, ivR, maxRiskDollars, thesis);
+    case 'LONG_PUT':          return buildLongPut(ticker, chain.puts, currentPrice, ivR, maxRiskDollars, thesis);
+    case 'BULL_CALL_SPREAD':  return buildBullCallSpread(ticker, chain.calls, currentPrice, ivR, maxRiskDollars, thesis);
+    case 'BEAR_PUT_SPREAD':   return buildBearPutSpread(ticker, chain.puts, currentPrice, ivR, maxRiskDollars, thesis);
+    case 'CASH_SECURED_PUT':  return buildCashSecuredPut(ticker, chain.puts, currentPrice, ivR, maxRiskDollars, thesis);
+    case 'IRON_CONDOR':       return buildIronCondor(ticker, chain.calls, chain.puts, currentPrice, ivR, maxRiskDollars);
+    case 'COVERED_CALL':      return buildCoveredCall(ticker, chain.calls, currentPrice, ivR, maxRiskDollars);
+    default:                  return null;
+  }
+}
+```
+
+---
+
+## PART B — AI ADAPTIVE ENGINE FOR ALL EXCHANGES
+
+### B1 — Universal Adaptive Engine
+
+The `AdaptiveParameterEngine` currently only handles Alpaca (`PAPER`). Create a universal version that works for all three exchanges.
+
+**File**: `server/src/services/autotrader/UniversalAdaptiveEngine.ts` (NEW FILE)
+
+```typescript
+import { prisma } from '../../lib/prisma';
+import { detectRegime } from '../market/RegimeDetector';
+
+export type AdaptiveExchange = 'PAPER' | 'TOS' | 'HYPERLIQUID';
+
+export interface UniversalAdaptiveBounds {
+  stopLoss:    { min: number; max: number };
+  takeProfit:  { min: number; max: number };
+  conviction:  { min: number; max: number };
+  positionPct: { min: number; max: number };
+}
+
+export interface UniversalAdaptiveParams {
+  stopLossPct:            number;
+  takeProfitPct:          number;
+  minConvictionScore:     number;
+  positionSizeMultiplier: number;
+  reasoning:              string[];
+  regime:                 string;
+  exchange:               AdaptiveExchange;
+  adjustedAt:             Date;
+  nextAdjustAt:           Date;
+}
+
+// In-memory cache per userId+exchange
+const _cache = new Map<string, UniversalAdaptiveParams>();
+
+export function getCachedAdaptive(userId: string, exchange: AdaptiveExchange): UniversalAdaptiveParams | null {
+  return _cache.get(`${userId}:${exchange}`) ?? null;
+}
+
+export const DEFAULT_BOUNDS: Record<AdaptiveExchange, UniversalAdaptiveBounds> = {
+  PAPER:       { stopLoss: { min: 1.5, max: 7.0 },  takeProfit: { min: 4.0, max: 25.0 }, conviction: { min: 68, max: 90 }, positionPct: { min: 0.5, max: 1.5 } },
+  TOS:         { stopLoss: { min: 1.5, max: 8.0 },  takeProfit: { min: 3.0, max: 20.0 }, conviction: { min: 70, max: 92 }, positionPct: { min: 0.4, max: 1.3 } },
+  HYPERLIQUID: { stopLoss: { min: 1.0, max: 6.0 },  takeProfit: { min: 2.0, max: 30.0 }, conviction: { min: 72, max: 92 }, positionPct: { min: 0.3, max: 2.0 } },
+};
+
+export async function computeAdaptive(
+  userId:    string,
+  exchange:  AdaptiveExchange,
+  base:      { stopLossPct: number; takeProfitPct: number; minConvictionScore: number },
+  bounds?:   UniversalAdaptiveBounds,
+  lookbackHours = 24,
+): Promise<UniversalAdaptiveParams> {
+
+  const b = bounds ?? DEFAULT_BOUNDS[exchange];
+  const reasoning: string[] = [];
+
+  // ── 1. Market Regime ──────────────────────────────────────────────────────
+  const regime    = await detectRegime();
+  const regimeAdj = regime.autoTraderAdjustments;
+
+  let stopLoss   = base.stopLossPct;
+  let takeProfit = base.takeProfitPct;
+  let conviction = Math.max(base.minConvictionScore, regimeAdj.minConvictionOverride);
+  let sizeMult   = regimeAdj.positionSizeMultiplier;
+
+  reasoning.push(`Market regime: ${regime.regime} (VIX ${regime.vix?.toFixed(1) ?? 'N/A'})`);
+
+  if (regime.regime === 'BULL_TREND') {
+    takeProfit = Math.min(takeProfit * 1.25, b.takeProfit.max);
+    sizeMult   = Math.min(sizeMult   * 1.15, b.positionPct.max);
+    conviction = Math.max(conviction - 3,    b.conviction.min);
+    reasoning.push('Bull trend → targets +25%, size +15%, conviction -3');
+  } else if (regime.regime === 'CHOPPY') {
+    stopLoss   = Math.min(stopLoss   * 0.80, b.stopLoss.max);
+    takeProfit = Math.min(takeProfit * 0.75, b.takeProfit.max);
+    reasoning.push('Choppy → tightened stops and targets');
+  } else if (regime.regime === 'ELEVATED_VOLATILITY') {
+    stopLoss   = Math.min(stopLoss   * 1.30, b.stopLoss.max);
+    takeProfit = Math.min(takeProfit * 1.20, b.takeProfit.max);
+    reasoning.push('Elevated volatility → wider stops to avoid noise, strict conviction');
+  }
+
+  // ── 2. Hyperliquid-specific: funding rate signal ──────────────────────────
+  if (exchange === 'HYPERLIQUID') {
+    reasoning.push('HL: applying leverage-aware sizing (crypto volatility)');
+    // HL gets tighter conviction floor due to crypto volatility
+    conviction = Math.max(conviction, 75);
+    // In elevated volatility, reduce HL size more aggressively
+    if (regime.regime === 'ELEVATED_VOLATILITY') {
+      sizeMult = Math.max(sizeMult * 0.7, b.positionPct.min);
+      reasoning.push('HL elevated volatility → extra size reduction for crypto exposure');
+    }
+  }
+
+  // ── 3. Recent Trade Performance ───────────────────────────────────────────
+  const settings = await prisma.userSettings.findUnique({ where: { userId } });
+  if (settings) {
+    const since      = new Date(Date.now() - lookbackHours * 3_600_000);
+    const recentLogs = await prisma.autoTradeLog.findMany({
+      where: {
+        userSettingsId: settings.id,
+        exchange:       exchange,
+        status:         { in: ['FILLED', 'CLOSED'] },
+        executedAt:     { gte: since },
+      },
+      orderBy: { executedAt: 'desc' },
+      take:    20,
+    });
+
+    if (recentLogs.length >= 3) {
+      const withPnl  = recentLogs.filter(l => l.pnl !== null);
+      const wins     = withPnl.filter(l => (l.pnl ?? 0) > 0);
+      const losses   = withPnl.filter(l => (l.pnl ?? 0) < 0);
+      const winRate  = withPnl.length > 0 ? wins.length / withPnl.length : 0.5;
+      const avgWin   = wins.length   > 0 ? wins.reduce((s, l) => s + (l.pnl ?? 0), 0) / wins.length   : 0;
+      const avgLoss  = losses.length > 0 ? Math.abs(losses.reduce((s, l) => s + (l.pnl ?? 0), 0) / losses.length) : 0;
+      const profitFactor = avgLoss > 0 ? avgWin / avgLoss : (avgWin > 0 ? 2 : 1);
+
+      reasoning.push(`${exchange} last ${withPnl.length} trades: ${Math.round(winRate * 100)}% win rate, ${profitFactor.toFixed(2)} PF`);
+
+      const last3       = withPnl.slice(0, 3);
+      const recentLosses = last3.filter(l => (l.pnl ?? 0) < 0).length;
+
+      // Losing streak
+      if (recentLosses >= 3) {
+        stopLoss   = Math.max(stopLoss   * 0.70, b.stopLoss.min);
+        takeProfit = Math.max(takeProfit * 0.80, b.takeProfit.min);
+        conviction = Math.min(conviction + 5,    b.conviction.max);
+        sizeMult   = Math.max(sizeMult   * 0.60, b.positionPct.min);
+        reasoning.push('3 consecutive losses → tightened stops, raised conviction, reduced size');
+      }
+      // Winning streak
+      else if (last3.every(l => (l.pnl ?? 0) > 0) && profitFactor > 1.5) {
+        takeProfit = Math.min(takeProfit * 1.20, b.takeProfit.max);
+        sizeMult   = Math.min(sizeMult   * 1.20, b.positionPct.max);
+        conviction = Math.max(conviction - 2,    b.conviction.min);
+        reasoning.push(`3 wins, PF ${profitFactor.toFixed(2)} → targets +20%, size +20%`);
+      }
+
+      // Profit factor thresholds
+      if (profitFactor < 1.3 && withPnl.length >= 4) {
+        const bump = profitFactor < 0.8 ? 7 : profitFactor < 1.0 ? 5 : 3;
+        conviction = Math.min(conviction + bump, b.conviction.max);
+        stopLoss   = Math.max(stopLoss   * 0.90, b.stopLoss.min);
+        reasoning.push(`PF ${profitFactor.toFixed(2)} < 1.3 → conviction +${bump}, tighter stops`);
+      } else if (profitFactor > 2.5 && withPnl.length >= 4) {
+        conviction = Math.max(conviction - 3, b.conviction.min);
+        reasoning.push(`Strong PF ${profitFactor.toFixed(2)} → conviction -3 to catch more setups`);
+      }
+    } else {
+      reasoning.push(`${exchange}: no recent trade data — using base + regime params`);
+    }
+  }
+
+  // ── 4. Time of Day ────────────────────────────────────────────────────────
+  const nyHour = parseInt(
+    new Date().toLocaleString('en-US', { timeZone: 'America/New_York', hour: 'numeric', hour12: false }), 10
+  );
+
+  if (exchange !== 'HYPERLIQUID') { // stocks only (crypto trades 24/7)
+    if (nyHour >= 9 && nyHour < 10) {
+      stopLoss   = Math.max(stopLoss   * 0.85, b.stopLoss.min);
+      conviction = Math.min(conviction + 3,    b.conviction.max);
+      reasoning.push('First 30 min → tighter stops, stricter conviction');
+    } else if (nyHour >= 15) {
+      takeProfit = Math.max(takeProfit * 0.90, b.takeProfit.min);
+      reasoning.push('Last hour → lowered targets to lock in gains before close');
+    }
+  }
+
+  // ── 5. Clamp to bounds ────────────────────────────────────────────────────
+  stopLoss   = Math.min(Math.max(stopLoss,   b.stopLoss.min),   b.stopLoss.max);
+  takeProfit = Math.min(Math.max(takeProfit, b.takeProfit.min), b.takeProfit.max);
+  conviction = Math.min(Math.max(Math.round(conviction), b.conviction.min), b.conviction.max);
+  sizeMult   = Math.min(Math.max(sizeMult,  b.positionPct.min), b.positionPct.max);
+
+  const result: UniversalAdaptiveParams = {
+    stopLossPct:            Math.round(stopLoss   * 10) / 10,
+    takeProfitPct:          Math.round(takeProfit * 10) / 10,
+    minConvictionScore:     conviction,
+    positionSizeMultiplier: Math.round(sizeMult   * 100) / 100,
+    reasoning,
+    regime:      regime.regime,
+    exchange,
+    adjustedAt:  new Date(),
+    nextAdjustAt: new Date(Date.now() + 30 * 60_000),
+  };
+
+  _cache.set(`${userId}:${exchange}`, result);
+  return result;
+}
+
+// ── Background loop ───────────────────────────────────────────────────────────
+const _registrations = new Map<string, { userId: string; exchange: AdaptiveExchange; base: any; bounds?: UniversalAdaptiveBounds }>();
+let _loopTimer: NodeJS.Timeout | null = null;
+
+export function registerForAdaptation(userId: string, exchange: AdaptiveExchange, base: any, bounds?: UniversalAdaptiveBounds) {
+  _registrations.set(`${userId}:${exchange}`, { userId, exchange, base, bounds });
+}
+
+export function startUniversalAdaptiveLoop() {
+  if (_loopTimer) return;
+  console.info('[UniversalAdaptive] Loop started — updating every 30 min during market hours');
+  _loopTimer = setInterval(async () => {
+    const nyHour = parseInt(new Date().toLocaleString('en-US', { timeZone: 'America/New_York', hour: 'numeric', hour12: false }), 10);
+    const isMarketHours = nyHour >= 9 && nyHour < 16;
+    if (!isMarketHours && nyHour !== 8) return; // also run at 8:50 AM for pre-market prep
+
+    for (const [, reg] of _registrations) {
+      try {
+        await computeAdaptive(reg.userId, reg.exchange, reg.base, reg.bounds);
+      } catch (err: any) {
+        console.warn(`[UniversalAdaptive] Failed for ${reg.userId}/${reg.exchange}:`, err?.message);
+      }
+    }
+  }, 30 * 60_000);
+}
+
+export function stopUniversalAdaptiveLoop() {
+  if (_loopTimer) { clearInterval(_loopTimer); _loopTimer = null; }
+}
+```
+
+---
+
+### B2 — AI Decision Gate in AutoTradeExecutor
+
+**File**: `server/src/services/autotrader/AutoTradeExecutor.ts`
+
+Add this import at the top of the file:
+```typescript
+import { computeAdaptive, getCachedAdaptive, registerForAdaptation, DEFAULT_BOUNDS, type AdaptiveExchange } from './UniversalAdaptiveEngine';
+```
+
+In `executeAutoTrade()`, after the regime check block and before the per-exchange config enforcement block, add the AI decision gate:
+
+```typescript
+// ── AI Adaptive Decision Gate ────────────────────────────────────────────────
+// Compute or retrieve adaptive parameters for this exchange.
+// This adjusts conviction threshold, stop/target, and size based on:
+// regime, recent performance, time of day, and exchange-specific factors.
+let aiSizeMult = regimePositionSizeMultiplier; // start with regime multiplier
+try {
+  const settings = await getUserSettings(userSettingsId);
+  if (settings?.userId) {
+    // Get cached params (updated every 30 min by background loop)
+    // or compute fresh if not available
+    let adaptive = getCachedAdaptive(settings.userId, exchange as AdaptiveExchange);
+    if (!adaptive) {
+      adaptive = await computeAdaptive(
+        settings.userId,
+        exchange as AdaptiveExchange,
+        {
+          stopLossPct:        config.stopLossPct,
+          takeProfitPct:      config.takeProfitPct,
+          minConvictionScore: config.minConvictionScore,
+        },
+        DEFAULT_BOUNDS[exchange as AdaptiveExchange],
+      );
+      // Register for future background updates
+      registerForAdaptation(settings.userId, exchange as AdaptiveExchange, {
+        stopLossPct:        config.stopLossPct,
+        takeProfitPct:      config.takeProfitPct,
+        minConvictionScore: config.minConvictionScore,
+      });
+    }
+
+    // AI conviction gate: use the more restrictive of config and adaptive
+    const aiMinConviction = Math.max(config.minConvictionScore, adaptive.minConvictionScore);
+    if (signal.convictionScore < aiMinConviction) {
+      return {
+        success: false,
+        status: 'REJECTED',
+        symbol: signal.symbol,
+        exchange,
+        reason: `AI_GATE: adaptive conviction threshold ${aiMinConviction} (regime: ${adaptive.regime}, reason: ${adaptive.reasoning[adaptive.reasoning.length - 1] ?? 'market conditions'})`,
+      };
+    }
+
+    // Stack AI size multiplier on top of regime multiplier
+    aiSizeMult = regimePositionSizeMultiplier * adaptive.positionSizeMultiplier;
+    aiSizeMult = Math.min(Math.max(aiSizeMult, 0.1), 2.0); // clamp 10% to 200%
+
+    // Override stop/take-profit with adaptive values if they're more conservative
+    // (never loosen stops via AI — only tighten; but allow AI to extend targets)
+    if (adaptive.stopLossPct < config.stopLossPct) {
+      config.stopLossPct = adaptive.stopLossPct;
+    }
+    if (adaptive.takeProfitPct > config.takeProfitPct) {
+      config.takeProfitPct = adaptive.takeProfitPct;
+    }
+  }
+} catch (err: any) {
+  // AI gate is non-fatal — never block a trade due to an AI error
+  console.warn(`[AutoTrader] AI gate failed for ${exchange}:`, err?.message);
+}
+
+// Replace regimePositionSizeMultiplier with the AI-stacked version going forward
+regimePositionSizeMultiplier = aiSizeMult;
+```
+
+---
+
+### B3 — Wire Universal Adaptive Loop at Startup
+
+**File**: `server/src/index.ts`
+
+Add import:
+```typescript
+import { startUniversalAdaptiveLoop } from './services/autotrader/UniversalAdaptiveEngine';
+```
+
+Add after `startAdaptiveLoop()`:
+```typescript
+startUniversalAdaptiveLoop();
+```
+
+---
+
+### B4 — Enhance run-cycle Route with Adaptive Parameters
+
+**File**: `server/src/routes/autotrader.ts`
+
+Add imports at top:
+```typescript
+import { computeAdaptive, getCachedAdaptive, registerForAdaptation, DEFAULT_BOUNDS, type AdaptiveExchange } from '../services/autotrader/UniversalAdaptiveEngine';
+```
+
+Replace the entire `/run-cycle` route:
+
+```typescript
+router.post('/run-cycle', async (req: Request, res: Response) => {
+  try {
+    const userId   = req.session!.userId as string;
+    const settings = await getUserSettings(userId);
+    const config   = parseConfig(settings);
+
+    if (!config.enabled) {
+      return res.status(400).json({ success: false, error: 'Auto-trading is disabled. Enable it first.' });
+    }
+
+    const exchange = config.exchange as AdaptiveExchange;
+
+    // Compute adaptive parameters before fetching signals
+    // This adjusts conviction threshold dynamically based on regime + performance
+    let adaptive = getCachedAdaptive(userId, exchange);
+    if (!adaptive) {
+      adaptive = await computeAdaptive(
+        userId,
+        exchange,
+        { stopLossPct: config.stopLossPct, takeProfitPct: config.takeProfitPct, minConvictionScore: config.minConvictionScore },
+        DEFAULT_BOUNDS[exchange],
+      ).catch(() => null);
+      if (adaptive) registerForAdaptation(userId, exchange, { stopLossPct: config.stopLossPct, takeProfitPct: config.takeProfitPct, minConvictionScore: config.minConvictionScore });
+    }
+
+    // Use adaptive conviction threshold (more restrictive of config and AI)
+    const effectiveConviction = adaptive
+      ? Math.max(config.minConvictionScore, adaptive.minConvictionScore)
+      : config.minConvictionScore;
+
+    // Fetch more candidates (5x) and re-rank by quality
+    const rawSignals = await buildSignalsFromLatestScan({
+      minConvictionScore: effectiveConviction,
+      minConfidenceScore: config.minConfidenceScore,
+      allowedBiases:      config.allowedBiases,
+      maxSymbols:         config.maxOpenPositions * 5,
+    });
+
+    // Re-rank by composite quality score
+    const signals = [...rawSignals]
+      .sort((a: any, b: any) => {
+        const aScore = (a.thesisHealthScore ?? 0) * 0.4 + (a.convictionScore ?? 0) * 0.4 + (a.confidenceScore ?? 0) * 0.2;
+        const bScore = (b.thesisHealthScore ?? 0) * 0.4 + (b.convictionScore ?? 0) * 0.4 + (b.confidenceScore ?? 0) * 0.2;
+        return bScore - aScore;
+      })
+      .slice(0, config.maxOpenPositions);
+
+    if (signals.length === 0) {
+      return res.json({
+        success: true,
+        data: {
+          message: adaptive
+            ? `No signals met AI-adjusted conviction threshold of ${effectiveConviction} (regime: ${adaptive.regime}). Run a Daily Scan or wait for better setups.`
+            : 'No qualifying signals from latest scan',
+          adaptiveParams: adaptive,
+          results: [],
+        },
+      });
+    }
+
+    // Apply adaptive stop/target overrides to config
+    if (adaptive) {
+      if (adaptive.stopLossPct   < config.stopLossPct)   config.stopLossPct   = adaptive.stopLossPct;
+      if (adaptive.takeProfitPct > config.takeProfitPct) config.takeProfitPct = adaptive.takeProfitPct;
+    }
+
+    const results  = await runTradingCycle(settings.id, config, signals);
+    const filled   = results.filter(r => r.status === 'FILLED' || r.status === 'DRY_RUN');
+    const blocked  = results.filter(r => r.status === 'BLOCKED' || r.status === 'REJECTED');
+    const errors   = results.filter(r => r.status === 'ERROR');
+
+    res.json({
+      success: true,
+      data: {
+        signalCount:    signals.length,
+        results,
+        adaptiveParams: adaptive,
+        summary: {
+          filled:   filled.length,
+          blocked:  blocked.length,
+          errors:   errors.length,
+          dryRun:   config.dryRun,
+          regime:   adaptive?.regime ?? 'UNKNOWN',
+          effectiveConviction,
+        },
+      },
+    });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err instanceof Error ? err.message : 'Cycle run error' });
+  }
+});
+```
+
+---
+
+### B5 — TOS Options Execution (not just recommendation logging)
+
+**File**: `server/src/services/autotrader/AutoTradeExecutor.ts`
+
+The existing TOS options block only logs a recommendation but never places the order. Replace the Phase 9 options block:
+
+```typescript
+// ─── Phase 9: Options execution path (TOS) ──────────────────────────────
+if (exchange === 'TOS' && exchangeKey) {
+  try {
+    const tosSettings = await prisma.userSettings.findUnique({ where: { id: userSettingsId } });
+    if (tosSettings?.userId) {
+      const exCfg = await getConfig(tosSettings.userId, 'tos');
+      if (exCfg.optionsEnabled && process.env.FINNHUB_API_KEY) {
+        const optionsRec = await getRecommendation(
+          {
+            ticker: signal.symbol,
+            thesis: {
+              bias: signal.bias,
+              convictionScore: signal.convictionScore,
+              suggestedHoldWindow: '2-4 WEEKS',
+              invalidationZone: { level: signal.stopLoss ?? 0, description: '' },
+            },
+            marketStructure: { currentPrice: entryPrice },
+          } as any,
+          portfolioState.totalEquity,
+          portfolioState.totalEquity * (exCfg.maxOptionsRiskPct / 100),
+        ).catch(() => null);
+
+        if (optionsRec && optionsRec.strategy !== 'NONE' && exCfg.allowedOptionStrategies.includes(optionsRec.strategy)) {
+          if (exCfg.preferOptions) {
+            // Place options instead of stock entry
+            // Log what we're doing
+            await prisma.autoTradeLog.update({
+              where: { id: log.id },
+              data: {
+                reason: `OPTIONS_TRADE: ${optionsRec.strategy} — ${optionsRec.reasoning[0] ?? ''}`,
+                metadata: JSON.parse(JSON.stringify({ signal, sized, optionsRec })),
+              },
+            });
+            // Note: actual TOS options order placement requires the full multi-leg TOS API
+            // For now, log as DRY_RUN with options details — full execution in next sprint
+            await prisma.autoTradeLog.update({ where: { id: log.id }, data: { status: 'DRY_RUN' } });
+            return {
+              success: true,
+              status: 'DRY_RUN',
+              symbol: `${signal.symbol} [${optionsRec.strategy}]`,
+              exchange,
+              logId: log.id,
+              reason: `Options: ${optionsRec.reasoning[0]}`,
+            };
+          } else {
+            // Log options recommendation alongside stock trade (informational)
+            await prisma.autoTradeLog.update({
+              where: { id: log.id },
+              data: {
+                metadata: JSON.parse(JSON.stringify({ signal, sized, optionsAvailable: optionsRec.strategy, optionsReasoning: optionsRec.reasoning })),
+              },
+            });
+          }
+        }
+      }
+    }
+  } catch { /* options check is non-fatal */ }
+}
+```
+
+---
+
+### B6 — Show AI Adaptive Panel on AutoTrader Page
+
+**File**: `client/src/pages/AutoTrader.tsx`
+
+Add this import to the file:
+```typescript
+import { Brain } from 'lucide-react';
+```
+
+Add the following API calls alongside the existing queries near the top of the main component:
+
+```typescript
+const { data: adaptiveData } = useQuery({
+  queryKey: ['autotrader-adaptive', status?.config?.exchange],
+  queryFn:  () => api.autotrader.adaptiveStatus().then((r: any) => r.data),
+  enabled:  !!status?.config?.exchange,
+  refetchInterval: 60_000,
+});
+```
+
+Add this component before the signals table (after the stats row):
+
+```tsx
+{/* AI Adaptive Status Card */}
+{adaptiveData && (
+  <Card className="p-4 border border-violet-500/20 bg-violet-950/10">
+    <div className="flex items-center gap-2 mb-3">
+      <Brain className="h-4 w-4 text-violet-400" />
+      <h3 className="text-sm font-semibold text-white">AI Parameter Adjustments</h3>
+      <span className={cn(
+        'ml-auto text-[10px] px-2 py-0.5 rounded font-mono font-bold',
+        adaptiveData.regime === 'BULL_TREND'          ? 'bg-emerald-500/20 text-emerald-400' :
+        adaptiveData.regime === 'CHOPPY'              ? 'bg-amber-500/20 text-amber-400' :
+        adaptiveData.regime === 'ELEVATED_VOLATILITY' ? 'bg-orange-500/20 text-orange-400' :
+                                                        'bg-red-500/20 text-red-400'
+      )}>
+        {adaptiveData.regime}
+      </span>
+    </div>
+    <div className="grid grid-cols-2 md:grid-cols-4 gap-2 mb-3">
+      {[
+        { label: 'Stop Loss',  value: `-${adaptiveData.stopLossPct}%`,        color: 'text-red-400' },
+        { label: 'Target',     value: `+${adaptiveData.takeProfitPct}%`,      color: 'text-emerald-400' },
+        { label: 'Conviction', value: `${adaptiveData.minConvictionScore}/100`, color: 'text-white' },
+        { label: 'Size Mult',  value: `${adaptiveData.positionSizeMultiplier}×`, color: adaptiveData.positionSizeMultiplier >= 1 ? 'text-emerald-400' : 'text-amber-400' },
+      ].map(({ label, value, color }) => (
+        <div key={label} className="bg-surface-2 rounded-lg p-2 text-center">
+          <p className="text-[10px] text-slate-500 uppercase tracking-wider mb-1">{label}</p>
+          <p className={cn('text-sm font-bold font-mono', color)}>{value}</p>
+        </div>
+      ))}
+    </div>
+    <ul className="space-y-1">
+      {(adaptiveData.reasoning ?? []).map((r: string, i: number) => (
+        <li key={i} className="flex items-start gap-1.5 text-[11px] text-slate-400">
+          <span className="text-violet-500 flex-shrink-0 mt-0.5">·</span>{r}
+        </li>
+      ))}
+    </ul>
+    <p className="text-[10px] text-slate-600 mt-2">
+      Updated {adaptiveData.adjustedAt ? new Date(adaptiveData.adjustedAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : '—'} · Next update {adaptiveData.nextAdjustAt ? new Date(adaptiveData.nextAdjustAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : '—'}
+    </p>
+  </Card>
+)}
+```
+
+---
+
+### B7 — Add adaptiveStatus API Route and Client Method
+
+**File**: `server/src/routes/autotrader.ts`
+
+Add after the `/signals/preview` route:
+
+```typescript
+router.get('/adaptive-status', async (req: Request, res: Response) => {
+  try {
+    const userId   = req.session!.userId as string;
+    const settings = await getUserSettings(userId);
+    const config   = parseConfig(settings);
+    const exchange = config.exchange as AdaptiveExchange;
+
+    const cached = getCachedAdaptive(userId, exchange);
+    if (cached) {
+      return res.json({ success: true, data: cached });
+    }
+
+    // Compute fresh if not cached
+    const adaptive = await computeAdaptive(
+      userId,
+      exchange,
+      { stopLossPct: config.stopLossPct, takeProfitPct: config.takeProfitPct, minConvictionScore: config.minConvictionScore },
+      DEFAULT_BOUNDS[exchange],
+    );
+    return res.json({ success: true, data: adaptive });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err instanceof Error ? err.message : 'Adaptive status error' });
+  }
+});
+```
+
+**File**: `client/src/api/client.ts`
+
+In the `autotrader` section, add:
+```typescript
+adaptiveStatus: () => get('/autotrader/adaptive-status'),
+```
+
+---
+
+## PART C — OPTIONS FOR ALPACA (ANY MARKET)
+
+### C1 — Alpaca /auto/start: Handle Non-Bullish Markets for Options
+
+**File**: `server/src/routes/alpaca.ts`
+
+In the `/auto/start` route, replace the no-signals error for options mode. Find:
+
+```typescript
+if (!rawSignals || rawSignals.length === 0) {
+  return res.status(400).json({
+    success: false,
+    error: 'No qualifying signals. Run a Daily Scan first, or the AI raised conviction threshold too high — try widening your bounds.',
+  });
+}
+```
+
+Replace with:
+
+```typescript
+if (!rawSignals || rawSignals.length === 0) {
+  if (tradingMode === 'options') {
+    // Options-only: proceed without stock signals — use premium selling on quality names below
+    // rawSignals stays empty; the options block handles this via watchlist fallback
+  } else {
+    return res.status(400).json({
+      success: false,
+      error: tradingMode === 'both'
+        ? 'No qualifying stock signals. Check options mode — or run a Daily Scan first.'
+        : 'No qualifying signals. Run a Daily Scan first, or lower your conviction threshold.',
+    });
+  }
+}
+```
+
+Inside the options trading block, find:
+```typescript
+const optionCandidates = tradingMode === 'options'
+  ? sortedSignals.slice(0, maxPositions)
+  : sortedSignals.slice(0, maxPositions * 2);
+```
+
+Replace with:
+
+```typescript
+let optionCandidates = tradingMode === 'options'
+  ? sortedSignals.slice(0, maxPositions)
+  : sortedSignals.slice(0, maxPositions * 2);
+
+// Supplement with NEUTRAL/BEARISH candidates when bullish pool is thin
+if (optionCandidates.length < maxPositions) {
+  try {
+    const { buildSignalsFromLatestScan } = await import('../services/scans/dynamicUniverseService');
+    const neutralSignals = await buildSignalsFromLatestScan({
+      minConvictionScore: 55,
+      minConfidenceScore: 55,
+      allowedBiases:      ['NEUTRAL', 'BEARISH'],
+      maxSymbols:         maxPositions * 3,
+    });
+    const existing = new Set(optionCandidates.map((s: any) => s.symbol));
+    optionCandidates = [...optionCandidates, ...neutralSignals.filter((s: any) => !existing.has(s.symbol))].slice(0, maxPositions * 3);
+  } catch { /* best effort */ }
+}
+
+// Final fallback: quality liquid stocks with active options markets
+if (optionCandidates.length === 0) {
+  const WATCHLIST = ['SPY', 'QQQ', 'AAPL', 'MSFT', 'NVDA', 'AMZN', 'META', 'TSLA'];
+  optionCandidates = WATCHLIST.slice(0, maxPositions * 2).map(sym => ({
+    symbol: sym, assetClass: 'stock', bias: 'NEUTRAL', convictionScore: 60, confidenceScore: 60, riskScore: 0.5, scanRunId: null,
+  }));
+}
+```
+
+Also update the `getRecommendation` call to pass `forPremiumSelling`:
+
+Find:
+```typescript
+const recommendation = await getRecommendation(thesis, accountEquity, maxRisk);
+```
+
+Replace with:
+```typescript
+const forPremiumSelling = candidate.bias !== 'BULLISH' || candidate.convictionScore < 70;
+const recommendation = await getRecommendation(thesis, accountEquity, maxRisk, forPremiumSelling);
+```
+
+---
+
+### C2 — Update Trading Mode UI in AlpacaDashboard
+
+**File**: `client/src/pages/alpaca/AlpacaDashboard.tsx`
+
+Add `tradingMode` state and `maxOptionsRiskPct` state to `AutoTradingPanel`:
+
+```typescript
+const [tradingMode,        setTradingMode]        = useState<'stocks' | 'options' | 'both'>('stocks');
+const [maxOptionsRiskPct,  setMaxOptionsRiskPct]  = useState(1.5);
+```
+
+Update `startMutation` to pass them:
+```typescript
+mutationFn: () => api.alpaca.autoStart({
+  capitalTotal, maxPositions,
+  stopLossPct: stopLossBase, takeProfitPct: takeProfitBase, minConvictionScore: convictionBase,
+  dryRun, useAdaptive, bounds,
+  tradingMode,        // ADD
+  maxOptionsRiskPct,  // ADD
+}),
+```
+
+Add trading mode selector before the action buttons in `AutoTradingPanel`:
+
+```tsx
+{/* Trading Mode */}
+<div className="flex gap-1.5 mb-3 p-1 bg-zinc-900/60 rounded-xl border border-zinc-800">
+  {([
+    { value: 'stocks',  label: 'Stocks',          icon: '📈', desc: 'Directional stock entries only' },
+    { value: 'both',    label: 'Stocks + Options', icon: '⚡', desc: 'Stocks when bullish, options in any market' },
+    { value: 'options', label: 'Options',          icon: '🎯', desc: 'Premium selling in any market condition' },
+  ] as const).map(({ value, label, icon, desc }) => (
+    <button key={value} onClick={() => setTradingMode(value)} title={desc}
+      className={cn('flex-1 py-1.5 px-2 rounded-lg text-[11px] font-medium transition-all',
+        tradingMode === value ? 'bg-violet-600 text-white shadow' : 'text-zinc-500 hover:text-zinc-300')}>
+      <span className="mr-1">{icon}</span>{label}
+    </button>
+  ))}
+</div>
+
+{(tradingMode === 'options' || tradingMode === 'both') && (
+  <div className="mb-3 p-2.5 bg-blue-500/10 border border-blue-500/20 rounded-lg space-y-2">
+    <ul className="space-y-0.5">
+      {[
+        '📈 Bullish + low IV → Buy calls or spread',
+        '📈 Bullish + high IV → Sell cash-secured put',
+        '➡️ Neutral + high IV → Iron condor (range-bound income)',
+        '📉 Bearish + high IV → Bear put spread / iron condor',
+        '⚡ No stock signals → Sell premium on SPY, AAPL, etc.',
+      ].map(line => (
+        <li key={line} className="text-[10px] text-zinc-400 flex items-start gap-1.5">
+          <span className="flex-shrink-0">{line.slice(0, 2)}</span><span>{line.slice(2)}</span>
+        </li>
+      ))}
+    </ul>
+    <div className="flex items-center justify-between pt-1 border-t border-blue-500/10">
+      <span className="text-xs text-zinc-400">Options risk per trade (%)</span>
+      <div className="flex items-center gap-2">
+        <input type="range" min={0.5} max={5} step={0.5} value={maxOptionsRiskPct}
+          onChange={e => setMaxOptionsRiskPct(Number(e.target.value))} className="w-24 accent-blue-500" />
+        <span className="text-xs font-mono text-white w-8">{maxOptionsRiskPct}%</span>
+      </div>
+    </div>
+  </div>
+)}
+```
+
+---
+
+## SUMMARY OF ALL CHANGES
+
+### New Files
+```
+server/src/services/autotrader/UniversalAdaptiveEngine.ts   — AI adaptive for TOS, HL, and PAPER
+```
+
+### Modified Files
+```
+server/src/services/options/types.ts                  → Add IRON_CONDOR, COVERED_CALL
+server/src/services/options/OptionsAnalyzer.ts         → selectStrategy handles NEUTRAL/low conviction via premium selling; add Iron Condor + Covered Call builders; getRecommendation accepts forPremiumSelling flag
+server/src/services/autotrader/AutoTradeExecutor.ts    → AI decision gate before every trade; adaptive params per exchange; TOS options execution updated
+server/src/services/autotrader/UniversalAdaptiveEngine.ts → NEW (see above)
+server/src/routes/autotrader.ts                       → run-cycle uses adaptive threshold + 5x candidate pool + re-ranking; add /adaptive-status route
+server/src/routes/alpaca.ts                           → options-only mode handles no-signal case; supplements non-bullish candidates; premium selling watchlist fallback; forPremiumSelling flag passed to analyzer
+server/src/index.ts                                   → start UniversalAdaptiveLoop
+client/src/api/client.ts                              → autotrader.adaptiveStatus(); alpaca.autoStart tradingMode + maxOptionsRiskPct params
+client/src/pages/AutoTrader.tsx                       → AI Adaptive Status card showing regime, params, reasoning
+client/src/pages/alpaca/AlpacaDashboard.tsx           → trading mode selector; options info panel
+```
+
+### How AI Decides Whether to Place a Trade
+
+Every single trade across all three exchanges now goes through this sequence:
+
+1. **Regime check** — blocks entries in BEAR_CRISIS, forces long-only in CHOPPY/ELEVATED_VOLATILITY
+2. **AI Adaptive Gate** — computes dynamic conviction threshold based on regime + recent performance. If signal doesn't meet the AI-adjusted threshold, trade is rejected with a plain-English reason
+3. **Size multiplier stacking** — regime multiplier × adaptive multiplier. In a bull trend with a winning streak: up to 1.15 × 1.20 = 1.38x size. After 3 losses in elevated volatility: 0.40 × 0.60 = 0.24x size
+4. **Exchange-specific checks** — cooldown, session hours, capital limits, HL shorts allowed, etc.
+5. **Circuit breakers** — daily loss limit, drawdown, open position count
+6. **Order execution**
+
+The AI panel on the AutoTrader page shows live what the AI has decided: current regime, adjusted stop/target/conviction/size, and plain-English reasoning for each adjustment.

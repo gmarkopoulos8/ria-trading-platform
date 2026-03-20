@@ -13,6 +13,7 @@ import {
   startSession,
   pauseSession,
 } from '../services/autotrader/ExchangeAutoConfigService';
+import { computeAdaptive, getCachedAdaptive, DEFAULT_BOUNDS, type AdaptiveExchange } from '../services/autotrader/UniversalAdaptiveEngine';
 
 const router = Router();
 router.use(requireAuth);
@@ -126,15 +127,33 @@ router.post('/run-cycle', async (req: Request, res: Response) => {
       return res.status(400).json({ success: false, error: 'Auto-trading is disabled. Enable it first.' });
     }
 
-    const signals = await buildSignalsFromLatestScan({
+    const exchange = (config.exchange ?? 'PAPER') as AdaptiveExchange;
+    const base = {
+      stopLossPct:        config.stopLossPct,
+      takeProfitPct:      config.takeProfitPct,
       minConvictionScore: config.minConvictionScore,
+    };
+
+    const adaptive = await computeAdaptive(userId, exchange, base, undefined, 24).catch(() => null);
+    const effectiveConviction = adaptive?.minConvictionScore ?? config.minConvictionScore;
+
+    const rawSignals = await buildSignalsFromLatestScan({
+      minConvictionScore: Math.max(50, effectiveConviction - 10),
       minConfidenceScore: config.minConfidenceScore,
-      allowedBiases: config.allowedBiases,
-      maxSymbols: config.maxOpenPositions,
+      allowedBiases:      config.allowedBiases,
+      maxSymbols:         config.maxOpenPositions * 5,
     });
 
+    const sortedSignals = rawSignals.sort((a: any, b: any) => {
+      const scoreA = (a.thesisHealthScore ?? 0) * 0.4 + (a.convictionScore ?? 0) * 0.4 + (a.confidenceScore ?? 0) * 0.2;
+      const scoreB = (b.thesisHealthScore ?? 0) * 0.4 + (b.convictionScore ?? 0) * 0.4 + (b.confidenceScore ?? 0) * 0.2;
+      return scoreB - scoreA;
+    });
+
+    const signals = sortedSignals.slice(0, config.maxOpenPositions);
+
     if (signals.length === 0) {
-      return res.json({ success: true, data: { message: 'No qualifying signals from latest scan', results: [] } });
+      return res.json({ success: true, data: { message: 'No qualifying signals from latest scan', results: [], adaptive } });
     }
 
     const results = await runTradingCycle(settings.id, config, signals);
@@ -147,6 +166,7 @@ router.post('/run-cycle', async (req: Request, res: Response) => {
       data: {
         signalCount: signals.length,
         results,
+        adaptive,
         summary: {
           filled: filled.length,
           blocked: blocked.length,
@@ -200,6 +220,32 @@ router.get('/signals/preview', async (req: Request, res: Response) => {
     res.json({ success: true, data: { signals, count: signals.length } });
   } catch (err) {
     res.status(500).json({ success: false, error: err instanceof Error ? err.message : 'Signals error' });
+  }
+});
+
+// ─── Adaptive Status ──────────────────────────────────────────────
+
+router.get('/adaptive-status', async (req: Request, res: Response) => {
+  try {
+    const userId = req.session!.userId as string;
+    const settings = await getUserSettings(userId);
+    const config = parseConfig(settings);
+    const exchange = (config.exchange ?? 'PAPER') as AdaptiveExchange;
+
+    const cached = getCachedAdaptive(userId, exchange);
+    if (cached) {
+      return res.json({ success: true, data: cached });
+    }
+
+    const base = {
+      stopLossPct:        config.stopLossPct,
+      takeProfitPct:      config.takeProfitPct,
+      minConvictionScore: config.minConvictionScore,
+    };
+    const fresh = await computeAdaptive(userId, exchange, base, undefined, 24);
+    res.json({ success: true, data: fresh });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err instanceof Error ? err.message : 'Adaptive status error' });
   }
 });
 

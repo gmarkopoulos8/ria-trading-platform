@@ -360,7 +360,9 @@ router.post('/auto/start', requireAuth, requireAlpacaCredentials, async (req: Re
       maxSymbols:          maxPositions * 5,
     });
 
-    if (!rawSignals || rawSignals.length === 0) {
+    const isOptionsMode = tradingMode === 'options' || tradingMode === 'both';
+
+    if ((!rawSignals || rawSignals.length === 0) && !isOptionsMode) {
       return res.status(400).json({
         success: false,
         error: 'No qualifying signals. Run a Daily Scan first, or the AI raised conviction threshold too high — try widening your bounds.',
@@ -415,9 +417,33 @@ router.post('/auto/start', requireAuth, requireAlpacaCredentials, async (req: Re
       const { thesisEngine }      = await import('../services/thesis/ThesisEngine');
       const { placeOptionsOrder } = await import('../services/alpaca/alpacaExchangeService');
 
-      const optionCandidates = tradingMode === 'options'
+      let optionCandidates: any[] = tradingMode === 'options'
         ? sortedSignals.slice(0, maxPositions)
         : sortedSignals.slice(0, maxPositions * 2);
+
+      if (optionCandidates.length < maxPositions) {
+        try {
+          const { buildSignalsFromLatestScan: buildNeutral } = await import('../services/scans/dynamicUniverseService');
+          const neutralSignals = await buildNeutral({
+            minConvictionScore: 55,
+            minConfidenceScore: 55,
+            allowedBiases:      ['NEUTRAL', 'BEARISH'],
+            maxSymbols:         maxPositions * 3,
+          });
+          const existing = new Set(optionCandidates.map((s: any) => s.symbol));
+          optionCandidates = [
+            ...optionCandidates,
+            ...neutralSignals.filter((s: any) => !existing.has(s.symbol)),
+          ].slice(0, maxPositions * 3);
+        } catch { /* best effort */ }
+      }
+
+      if (optionCandidates.length === 0) {
+        const WATCHLIST = ['SPY', 'QQQ', 'AAPL', 'MSFT', 'NVDA', 'AMZN', 'META', 'TSLA'];
+        optionCandidates = WATCHLIST.slice(0, maxPositions * 2).map(sym => ({
+          symbol: sym, assetClass: 'stock', bias: 'NEUTRAL', convictionScore: 60, confidenceScore: 60, riskScore: 0.5, scanRunId: null,
+        }));
+      }
 
       const maxOptionsRisk = Math.max(50, Math.floor(adjustedPerTrade * (maxOptionsRiskPct / 100)));
 
@@ -429,7 +455,8 @@ router.post('/auto/start', requireAuth, requireAlpacaCredentials, async (req: Re
           const thesis       = await thesisEngine.analyze(candidate.symbol, 'stock');
           const acct         = await getAccount();
           const accountEquity = parseFloat((acct as any).equity ?? '100000');
-          const recommendation = await getRecommendation(thesis, accountEquity, maxOptionsRisk);
+          const forPremiumSelling = candidate.bias !== 'BULLISH' || (candidate.convictionScore ?? 60) < 70;
+          const recommendation = await getRecommendation(thesis, accountEquity, maxOptionsRisk, forPremiumSelling);
 
           if (!recommendation || recommendation.strategy === 'NONE') {
             optionsRejected.push({ symbol: candidate.symbol, reason: 'No viable options strategy found' });

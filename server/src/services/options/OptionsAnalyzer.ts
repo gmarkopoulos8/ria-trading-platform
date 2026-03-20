@@ -26,31 +26,40 @@ async function selectStrategy(
   conviction: number,
   ivRank: number,
   holdWindow: string,
+  forPremiumSelling = false,
 ): Promise<OptionsStrategy> {
-  if (bias === 'NEUTRAL') return 'NONE';
-  if (conviction < 70) return 'NONE';
-
   const holdDays = parseHoldWindowDays(holdWindow);
 
-  // Check regime for adjustments
   try {
     const regime = await detectRegime();
-    if (regime.regime === 'ELEVATED_VOLATILITY') {
-      if (bias === 'BULLISH' && ivRank > 40) return 'CASH_SECURED_PUT';
-      if (bias === 'BULLISH') return 'BULL_CALL_SPREAD';
-      if (bias === 'BEARISH') return 'BEAR_PUT_SPREAD';
-    }
     if (regime.regime === 'BEAR_CRISIS') return 'NONE';
+
+    if (regime.regime === 'ELEVATED_VOLATILITY') {
+      if (ivRank > 50) {
+        if (bias === 'NEUTRAL' || forPremiumSelling) return 'IRON_CONDOR';
+        if (bias === 'BULLISH') return ivRank > 65 ? 'COVERED_CALL' : 'CASH_SECURED_PUT';
+        if (bias === 'BEARISH') return ivRank > 65 ? 'IRON_CONDOR' : 'BEAR_PUT_SPREAD';
+      }
+    }
   } catch {
-    // non-fatal
+    // non-fatal regime check
   }
 
+  if (bias === 'NEUTRAL' || forPremiumSelling) {
+    if (ivRank > 50) return 'IRON_CONDOR';
+    return 'NONE';
+  }
+
+  if (conviction < 70 && !forPremiumSelling) return 'NONE';
+
   if (bias === 'BULLISH') {
-    if (ivRank > 55 && conviction >= 75) return 'CASH_SECURED_PUT';
+    if (ivRank > 65 && conviction >= 72) return 'COVERED_CALL';
+    if (ivRank > 50 && conviction >= 72) return 'CASH_SECURED_PUT';
     if (conviction >= 82 && holdDays <= 30) return 'LONG_CALL';
     if (conviction >= 70) return 'BULL_CALL_SPREAD';
   }
   if (bias === 'BEARISH') {
+    if (ivRank > 55 && conviction >= 70) return 'IRON_CONDOR';
     if (conviction >= 82 && holdDays <= 30) return 'LONG_PUT';
     if (conviction >= 70) return 'BEAR_PUT_SPREAD';
   }
@@ -305,10 +314,114 @@ function buildCashSecuredPut(
   };
 }
 
+function buildIronCondor(
+  ticker: string,
+  calls: OptionContract[],
+  puts: OptionContract[],
+  currentPrice: number,
+  ivRank: number,
+  maxRiskDollars: number,
+  thesis: FullThesisResult,
+): OptionsRecommendation | null {
+  const dte30Calls = filterByDTE(calls, 25, 45).filter(isLiquid);
+  const dte30Puts  = filterByDTE(puts,  25, 45).filter(isLiquid);
+
+  const shortCall = findClosestDelta(dte30Calls, 0.20);
+  const shortPut  = findClosestDelta(dte30Puts,  0.20);
+  if (!shortCall || !shortPut) return null;
+
+  const longCallEligible = dte30Calls.filter(c => c.strike > shortCall.strike + 2);
+  const longPutEligible  = dte30Puts.filter(c  => c.strike < shortPut.strike  - 2);
+  if (longCallEligible.length === 0 || longPutEligible.length === 0) return null;
+
+  const longCall = longCallEligible.sort((a, b) => a.strike - b.strike)[0];
+  const longPut  = longPutEligible.sort((a, b) => b.strike - a.strike)[0];
+
+  const callSpreadWidth = longCall.strike - shortCall.strike;
+  const putSpreadWidth  = shortPut.strike - longPut.strike;
+  const maxRiskPerSide  = Math.max(callSpreadWidth, putSpreadWidth) * 100;
+  const netCredit       = (shortCall.mid + shortPut.mid - longCall.mid - longPut.mid);
+  if (netCredit <= 0) return null;
+
+  const numContracts = Math.max(1, Math.floor(maxRiskDollars / maxRiskPerSide));
+  const maxRisk      = (maxRiskPerSide - netCredit * 100) * numContracts;
+  const maxProfit    = netCredit * 100 * numContracts;
+
+  return {
+    strategy: 'IRON_CONDOR',
+    ticker,
+    legs: [
+      { action: 'SELL', contract: shortCall, contracts: numContracts },
+      { action: 'BUY',  contract: longCall,  contracts: numContracts },
+      { action: 'SELL', contract: shortPut,  contracts: numContracts },
+      { action: 'BUY',  contract: longPut,   contracts: numContracts },
+    ],
+    maxRisk,
+    maxProfit,
+    breakeven: shortCall.strike,
+    probabilityOfProfit: Math.round((1 - Math.abs(shortCall.delta ?? 0.20) - Math.abs(shortPut.delta ?? 0.20)) * 100),
+    ivRank,
+    netDebit: -netCredit,
+    rewardRiskRatio: maxProfit / maxRisk,
+    reasoning: [
+      `Iron condor: sell $${shortCall.strike}C / $${shortPut.strike}P, buy $${longCall.strike}C / $${longPut.strike}P`,
+      `Collect $${(netCredit * numContracts * 100).toFixed(0)} credit — profitable if ${ticker} stays between $${shortPut.strike}–$${shortCall.strike}`,
+      `IV Rank ${ivRank}/100 — high IV favors premium selling`,
+    ],
+    warnings: [
+      `Loss if ${ticker} moves sharply beyond $${shortCall.strike} or below $${shortPut.strike}`,
+      'Best for range-bound markets or when expecting mean reversion',
+    ],
+    fetchedAt: new Date(),
+  };
+}
+
+function buildCoveredCall(
+  ticker: string,
+  calls: OptionContract[],
+  currentPrice: number,
+  ivRank: number,
+  maxRiskDollars: number,
+  thesis: FullThesisResult,
+): OptionsRecommendation | null {
+  const dteCalls   = filterByDTE(calls, 20, 40).filter(isLiquid);
+  const otmCalls   = dteCalls.filter(c => c.strike > currentPrice * 1.03);
+  const contract   = findClosestDelta(otmCalls, 0.30);
+  if (!contract) return null;
+
+  const numContracts = Math.max(1, Math.floor(maxRiskDollars / (currentPrice * 100)));
+  const credit       = contract.mid;
+  const maxProfit    = (contract.strike - currentPrice + credit) * numContracts * 100;
+
+  return {
+    strategy: 'COVERED_CALL',
+    ticker,
+    legs: [{ action: 'SELL', contract, contracts: numContracts }],
+    maxRisk:  currentPrice * numContracts * 100,
+    maxProfit,
+    breakeven: currentPrice - credit,
+    probabilityOfProfit: Math.round((1 - Math.abs(contract.delta ?? 0.30)) * 100),
+    ivRank,
+    netDebit: -credit,
+    rewardRiskRatio: credit / currentPrice,
+    reasoning: [
+      `Sell $${contract.strike} covered call — collect $${credit.toFixed(2)}/share premium`,
+      `IV Rank ${ivRank}/100 — high IV makes this premium attractive`,
+      `Capped upside at $${contract.strike}, breakeven at $${(currentPrice - credit).toFixed(2)}`,
+    ],
+    warnings: [
+      'Requires 100 shares per contract (stock ownership required)',
+      `Upside capped at $${contract.strike} — forfeited if stock rallies above that`,
+    ],
+    fetchedAt: new Date(),
+  };
+}
+
 export async function getRecommendation(
   thesis: FullThesisResult,
   accountEquity: number,
   maxRiskDollars: number,
+  forPremiumSelling = false,
 ): Promise<OptionsRecommendation | null> {
   const ticker = thesis.ticker;
   const bias = thesis.thesis.bias;
@@ -327,7 +440,7 @@ export async function getRecommendation(
   if (!chain || chain.calls.length === 0) return null;
 
   const ivR = ivRank?.rank ?? 50;
-  const strategy = await selectStrategy(bias, conviction, ivR, holdWindow);
+  const strategy = await selectStrategy(bias, conviction, ivR, holdWindow, forPremiumSelling);
   if (strategy === 'NONE') return null;
 
   switch (strategy) {
@@ -341,6 +454,10 @@ export async function getRecommendation(
       return buildBearPutSpread(ticker, chain.puts, currentPrice, ivR, maxRiskDollars, thesis);
     case 'CASH_SECURED_PUT':
       return buildCashSecuredPut(ticker, chain.puts, currentPrice, ivR, maxRiskDollars, thesis);
+    case 'IRON_CONDOR':
+      return buildIronCondor(ticker, chain.calls, chain.puts, currentPrice, ivR, maxRiskDollars, thesis);
+    case 'COVERED_CALL':
+      return buildCoveredCall(ticker, chain.calls, currentPrice, ivR, maxRiskDollars, thesis);
     default:
       return null;
   }

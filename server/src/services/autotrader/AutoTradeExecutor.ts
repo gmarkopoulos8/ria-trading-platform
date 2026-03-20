@@ -9,6 +9,7 @@ import { HL_CONFIG, isKillswitchActive as isHLStopped, isPauseActive as isHLPaus
 import { getConfig, checkSessionActive } from './ExchangeAutoConfigService';
 import { detectRegime } from '../market/RegimeDetector';
 import { getRecommendation } from '../options/OptionsAnalyzer';
+import { getCachedAdaptive } from './UniversalAdaptiveEngine';
 
 export type AutoTradeExchange = 'TOS' | 'HYPERLIQUID' | 'PAPER';
 
@@ -162,6 +163,24 @@ export async function executeAutoTrade(
     regimePositionSizeMultiplier = regime.autoTraderAdjustments.positionSizeMultiplier;
   } catch {
     // regime check non-fatal
+  }
+
+  // ─── AI Adaptive Decision Gate ───────────────────────────────────────────
+  {
+    const settings = await prisma.userSettings.findUnique({ where: { id: userSettingsId } }).catch(() => null);
+    if (settings?.userId) {
+      const adaptiveParams = getCachedAdaptive(settings.userId, exchange as any);
+      if (adaptiveParams) {
+        if (signal.convictionScore < adaptiveParams.minConvictionScore) {
+          return {
+            success: false, status: 'REJECTED', symbol: signal.symbol, exchange,
+            reason: `AI_GATE: conviction ${signal.convictionScore} < AI-adjusted threshold ${adaptiveParams.minConvictionScore} (regime: ${adaptiveParams.regime})`,
+          };
+        }
+        const aiSizeMult = Math.min(Math.max(regimePositionSizeMultiplier * adaptiveParams.positionSizeMultiplier, 0.1), 2.0);
+        regimePositionSizeMultiplier = aiSizeMult;
+      }
+    }
   }
 
   // ─── Per-Exchange Config Enforcement ─────────────────────────────────────
@@ -386,17 +405,19 @@ export async function executeAutoTrade(
     perScanTradeCount.set(exchange, (perScanTradeCount.get(exchange) ?? 0) + 1);
   }
 
-  // ─── Phase 9: Options evaluation path (TOS only) ────────────────────────
+  // ─── Phase 9: Options execution path (TOS only) ─────────────────────────
   if (exchange === 'TOS' && exchangeKey) {
     try {
       const settings = await prisma.userSettings.findUnique({ where: { id: userSettingsId } });
       if (settings?.userId) {
         const exCfg = await getConfig(settings.userId, 'tos');
         if (exCfg.optionsEnabled) {
+          const forPremiumSelling = signal.bias !== 'BULLISH' || signal.convictionScore < 72;
           const optionsRec = await getRecommendation(
             { ticker: signal.symbol, thesis: { bias: signal.bias, convictionScore: signal.convictionScore, suggestedHoldWindow: '2-4 WEEKS', invalidationZone: { level: signal.stopLoss ?? 0, description: '' } } } as any,
             portfolioState.totalEquity,
             portfolioState.totalEquity * (exCfg.maxOptionsRiskPct / 100),
+            forPremiumSelling,
           ).catch(() => null);
 
           if (optionsRec && optionsRec.strategy !== 'NONE' && exCfg.allowedOptionStrategies.includes(optionsRec.strategy)) {
@@ -404,9 +425,43 @@ export async function executeAutoTrade(
               where: { id: log.id },
               data: {
                 metadata: JSON.parse(JSON.stringify({ signal, sized, optionsRecommendation: optionsRec })),
-                reason: `OPTIONS_AVAILABLE: ${optionsRec.strategy} — ${optionsRec.reasoning[0] ?? ''}`,
+                reason: `OPTIONS_EXECUTING: ${optionsRec.strategy} — ${optionsRec.reasoning[0] ?? ''}`,
               },
             });
+
+            if (!config.dryRun) {
+              try {
+                const { placeTOSOptionsOrder } = await import('../tos/tosExchangeService');
+                const legResults = await Promise.allSettled(
+                  optionsRec.legs.map(leg =>
+                    placeTOSOptionsOrder({
+                      symbol: leg.contract.symbol,
+                      action: leg.action === 'BUY' ? 'BUY_TO_OPEN' : 'SELL_TO_OPEN',
+                      quantity: leg.contracts,
+                      orderType: 'NET_CREDIT',
+                      price: Math.abs(optionsRec.netDebit ?? 0),
+                      duration: 'DAY',
+                    }),
+                  ),
+                );
+                const anyFilled = legResults.some(r => r.status === 'fulfilled');
+                if (anyFilled) {
+                  await prisma.autoTradeLog.update({
+                    where: { id: log.id },
+                    data: { status: 'FILLED', reason: `TOS OPTIONS FILLED: ${optionsRec.strategy}` },
+                  });
+                  return { success: true, status: 'FILLED', symbol: signal.symbol, exchange, logId: log.id, quantity: optionsRec.legs[0]?.contracts ?? 1, entryPrice, dollarAmount: optionsRec.maxRisk };
+                }
+              } catch (tosOptErr: any) {
+                console.warn('[Phase9] TOS options execution error:', tosOptErr?.message);
+              }
+            } else {
+              await prisma.autoTradeLog.update({
+                where: { id: log.id },
+                data: { status: 'DRY_RUN', reason: `DRY_RUN TOS OPTIONS: ${optionsRec.strategy} — ${optionsRec.reasoning[0] ?? ''}` },
+              });
+              return { success: true, status: 'DRY_RUN', symbol: signal.symbol, exchange, logId: log.id, quantity: optionsRec.legs[0]?.contracts ?? 1, entryPrice, dollarAmount: optionsRec.maxRisk };
+            }
           }
         }
       }

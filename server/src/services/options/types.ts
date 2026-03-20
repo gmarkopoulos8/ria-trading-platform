@@ -40,6 +40,8 @@ export type OptionsStrategy =
   | 'BULL_CALL_SPREAD'
   | 'BEAR_PUT_SPREAD'
   | 'CASH_SECURED_PUT'
+  | 'COVERED_CALL'
+  | 'IRON_CONDOR'
   | 'NONE';
 
 export interface OptionsLeg {

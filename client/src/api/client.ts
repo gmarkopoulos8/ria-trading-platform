@@ -229,6 +229,7 @@ export const api = {
     disable: () => post('/autotrader/disable'),
     updateConfig: (body: unknown) => put('/autotrader/config', body),
     runCycle: () => post('/autotrader/run-cycle'),
+    adaptiveStatus: () => get('/autotrader/adaptive-status'),
     logs: (params?: Record<string, unknown>) => get('/autotrader/logs', params),
     signalsPreview: () => get('/autotrader/signals/preview'),
     exchangeConfig: {

@@ -29,6 +29,7 @@ import { loadDefaultCredentials } from './services/credentials/CredentialLoader'
 import { startLatencyMonitor } from './services/alpaca/LatencyMonitor';
 import { startDrawdownMonitor } from './services/alpaca/alpacaKillswitchService';
 import { startAdaptiveLoop } from './services/alpaca/AdaptiveParameterEngine';
+import { startUniversalAdaptiveLoop } from './services/autotrader/UniversalAdaptiveEngine';
 import { getPositions } from './services/alpaca/alpacaInfoService';
 import { closePosition } from './services/alpaca/alpacaExchangeService';
 import { hasAlpacaCredentials, isPauseActive, isKillswitchActive } from './services/alpaca/alpacaConfig';
@@ -158,6 +159,7 @@ app.listen(PORT, async () => {
   startLatencyMonitor(5_000);
   startDrawdownMonitor(60_000);
   startAdaptiveLoop();
+  startUniversalAdaptiveLoop();
   startAlpacaAutoMonitor();
 
   setInterval(() => {

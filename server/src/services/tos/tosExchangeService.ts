@@ -282,6 +282,29 @@ export async function closePosition(pos: PositionToClose, userId?: string): Prom
   });
 }
 
+// ─── Options order entry ──────────────────────────────────────────
+
+export interface TosOptionsOrderRequest {
+  symbol:    string;
+  action:    'BUY_TO_OPEN' | 'SELL_TO_OPEN' | 'BUY_TO_CLOSE' | 'SELL_TO_CLOSE';
+  quantity:  number;
+  orderType: 'MARKET' | 'LIMIT' | 'NET_CREDIT' | 'NET_DEBIT';
+  price?:    number;
+  duration?: TosDuration;
+}
+
+export async function placeTOSOptionsOrder(req: TosOptionsOrderRequest): Promise<TosOrderResult> {
+  return placeOrder({
+    symbol:    req.symbol,
+    instruction: req.action as TosInstruction,
+    quantity:  req.quantity,
+    orderType: req.orderType === 'NET_CREDIT' || req.orderType === 'NET_DEBIT' ? 'LIMIT' : req.orderType,
+    price:     req.price,
+    duration:  req.duration ?? 'DAY',
+    assetType: 'OPTION',
+  });
+}
+
 // ─── Order history ────────────────────────────────────────────────
 
 export async function getOrderHistory(userId: string, limit = 50) {
