@@ -4,6 +4,7 @@ import { checkSessionActive, pauseSession } from './ExchangeAutoConfigService';
 import { isKillswitchActive as isHLStopped } from '../hyperliquid/hyperliquidConfig';
 import { isKillswitchActive as isTOSStopped } from '../tos/tosConfig';
 import { scanIntradaySignals, scanFastSignals } from './IntradaySignalEngine';
+import { runAutonomousCycle } from './AutonomousExecutor';
 import { filterSignalsWithAI } from './IntradayAIFilter';
 import { executeIntradayTrade, monitorIntradayPositions, getOpenIntradayPositions, clearClosedPositions } from './IntradayTradeManager';
 
@@ -99,6 +100,15 @@ async function monitorOpenAutoTrades(userSettingsId: string, config: AutoTradeCo
         });
 
         console.log(`[AutoTrader] ${exitReason} for ${log.symbol} @ ${currentPrice} | PnL: $${pnl.toFixed(2)}`);
+
+        const nyHourNow = getNYHour();
+        if (nyHourNow >= 9 && nyHourNow < 15) {
+          setTimeout(() => {
+            runAutonomousCycle('REENTRY').catch((err) => {
+              console.warn('[Monitor] Re-entry cycle error:', err?.message);
+            });
+          }, 30_000);
+        }
       }
     } catch (err) {
       console.error(`[AutoTrader] Monitor error for ${log.symbol}:`, err instanceof Error ? err.message : err);

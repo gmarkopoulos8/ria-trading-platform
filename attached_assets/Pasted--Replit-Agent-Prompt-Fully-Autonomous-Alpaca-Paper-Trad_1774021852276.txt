@@ -1,0 +1,785 @@
+# Replit Agent Prompt — Fully Autonomous Alpaca Paper Trading Bot
+
+This wires the existing scan scheduler, signal pipeline, and Alpaca execution together into a completely hands-off autonomous loop. After this is applied, the bot will run every weekday with zero manual intervention required.
+
+Only touch the files listed. Do not rebuild anything that already exists.
+
+---
+
+## WHAT ALREADY EXISTS — DO NOT REBUILD
+
+- `dailyScanScheduler.ts` → fires `runDailyScan()` at 9:30 AM ET ✅
+- `runDailyScan()` → scans universe, persists results, returns `scanRunId` ✅
+- `buildSignalsFromLatestScan()` → pulls top signals from DB ✅
+- `runTradingCycle()` → executes trades for a user ✅
+- `IntradayMonitorLoop` → monitors positions every 5 min ✅
+- `closeAllPositions()` → closes all Alpaca paper positions at once ✅
+- `sendDailySummary()` → sends Telegram end-of-day report ✅
+- `UniversalAdaptiveEngine` → adapts parameters per exchange ✅
+- `hasAlpacaCredentials()` → checks if Alpaca is connected ✅
+
+**The only missing piece:** nothing calls `runTradingCycle()` after `runDailyScan()` completes. Everything else is already wired. This prompt adds that connection plus 3 other lifecycle hooks.
+
+---
+
+## PHASE 1 — Add Autonomous Mode Fields to Schema
+
+**File**: `server/prisma/schema.prisma`
+
+In the `UserSettings` model, find the `autoTradeEnabled` field and add these fields immediately after it:
+
+```prisma
+autonomousMode          Boolean  @default(false)
+autonomousMinConviction Int      @default(75)
+autonomousMaxPositions  Int      @default(3)
+autonomousCapitalPct    Float    @default(5.0)
+lastAutonomousRun       DateTime?
+```
+
+After editing the schema, run:
+```
+npx prisma migrate dev --name add_autonomous_mode
+```
+
+---
+
+## PHASE 2 — Autonomous Executor Service
+
+This is the single function called by all four triggers. It finds the active user, checks Alpaca is connected, runs adaptive parameters, fetches signals, and executes trades. It is idempotent — safe to call multiple times and will not double-trade.
+
+**File**: `server/src/services/autotrader/AutonomousExecutor.ts` (NEW FILE)
+
+```typescript
+import { prisma } from '../../lib/prisma';
+import { buildSignalsFromLatestScan } from '../scans/dynamicUniverseService';
+import { runTradingCycle, type AutoTradeConfig, DEFAULT_AUTO_TRADE_CONFIG } from './AutoTradeExecutor';
+import { computeAdaptive, getCachedAdaptive, registerForAdaptation, DEFAULT_BOUNDS } from './UniversalAdaptiveEngine';
+import { hasAlpacaCredentials, getAlpacaCredentials } from '../alpaca/alpacaConfig';
+import telegramService from '../notifications/TelegramService';
+
+export interface AutonomousRunResult {
+  userId:          string;
+  scanRunId?:      string;
+  signalsFound:    number;
+  tradesPlaced:    number;
+  tradesRejected:  number;
+  dryRun:          boolean;
+  adaptiveRegime:  string;
+  effectiveConviction: number;
+  errors:          string[];
+  ranAt:           Date;
+}
+
+export async function runAutonomousCycle(
+  trigger: 'MARKET_OPEN' | 'SCAN_COMPLETE' | 'REENTRY' | 'MANUAL',
+  scanRunId?: string,
+): Promise<AutonomousRunResult[]> {
+  const results: AutonomousRunResult[] = [];
+
+  // Find all users with autonomous mode enabled
+  const users = await prisma.userSettings.findMany({
+    where: { autonomousMode: true, autoTradeEnabled: true },
+  });
+
+  if (users.length === 0) {
+    console.info('[Autonomous] No users with autonomous mode enabled — skipping');
+    return results;
+  }
+
+  for (const settings of users) {
+    const result: AutonomousRunResult = {
+      userId:             settings.userId,
+      scanRunId,
+      signalsFound:       0,
+      tradesPlaced:       0,
+      tradesRejected:     0,
+      dryRun:             true,
+      adaptiveRegime:     'UNKNOWN',
+      effectiveConviction: settings.autonomousMinConviction ?? 75,
+      errors:             [],
+      ranAt:              new Date(),
+    };
+
+    try {
+      // Check Alpaca is connected
+      if (!hasAlpacaCredentials()) {
+        result.errors.push('Alpaca not connected — skipping autonomous cycle');
+        results.push(result);
+        continue;
+      }
+
+      const creds = getAlpacaCredentials();
+      result.dryRun = creds?.dryRun ?? true;
+
+      // Parse user config
+      const rawConfig = typeof settings.autoTradeConfig === 'object' && settings.autoTradeConfig !== null
+        ? (settings.autoTradeConfig as Partial<AutoTradeConfig>)
+        : {};
+
+      const baseConfig: AutoTradeConfig = {
+        ...DEFAULT_AUTO_TRADE_CONFIG,
+        ...rawConfig,
+        enabled:           true,
+        exchange:          'PAPER',
+        dryRun:            result.dryRun,
+        maxOpenPositions:  settings.autonomousMaxPositions ?? 3,
+        maxPositionPct:    settings.autonomousCapitalPct ?? 5.0,
+        minConvictionScore: settings.autonomousMinConviction ?? 75,
+      };
+
+      // Get adaptive parameters
+      let adaptiveParams = getCachedAdaptive(settings.userId, 'PAPER');
+      if (!adaptiveParams) {
+        adaptiveParams = await computeAdaptive(
+          settings.userId,
+          'PAPER',
+          {
+            stopLossPct:        baseConfig.stopLossPct,
+            takeProfitPct:      baseConfig.takeProfitPct,
+            minConvictionScore: baseConfig.minConvictionScore,
+          },
+          DEFAULT_BOUNDS['PAPER'],
+        ).catch(() => null);
+
+        if (adaptiveParams) {
+          registerForAdaptation(settings.userId, 'PAPER', {
+            stopLossPct:        baseConfig.stopLossPct,
+            takeProfitPct:      baseConfig.takeProfitPct,
+            minConvictionScore: baseConfig.minConvictionScore,
+          });
+        }
+      }
+
+      result.adaptiveRegime = adaptiveParams?.regime ?? 'UNKNOWN';
+
+      // Apply adaptive overrides
+      const effectiveConviction = adaptiveParams
+        ? Math.max(baseConfig.minConvictionScore, adaptiveParams.minConvictionScore)
+        : baseConfig.minConvictionScore;
+
+      result.effectiveConviction = effectiveConviction;
+
+      if (adaptiveParams) {
+        if (adaptiveParams.stopLossPct < baseConfig.stopLossPct) {
+          baseConfig.stopLossPct = adaptiveParams.stopLossPct;
+        }
+        if (adaptiveParams.takeProfitPct > baseConfig.takeProfitPct) {
+          baseConfig.takeProfitPct = adaptiveParams.takeProfitPct;
+        }
+      }
+
+      // Fetch signals from latest completed scan
+      const rawSignals = await buildSignalsFromLatestScan({
+        minConvictionScore: effectiveConviction,
+        minConfidenceScore: 60,
+        allowedBiases:      ['BULLISH'],
+        maxSymbols:         (settings.autonomousMaxPositions ?? 3) * 5,
+      });
+
+      // Re-rank by quality score
+      const signals = [...rawSignals]
+        .sort((a: any, b: any) => {
+          const aScore = (a.thesisHealthScore ?? 0) * 0.4 + (a.convictionScore ?? 0) * 0.4 + (a.confidenceScore ?? 0) * 0.2;
+          const bScore = (b.thesisHealthScore ?? 0) * 0.4 + (b.convictionScore ?? 0) * 0.4 + (b.confidenceScore ?? 0) * 0.2;
+          return bScore - aScore;
+        })
+        .slice(0, settings.autonomousMaxPositions ?? 3)
+        .map((s: any) => ({ ...s, exchange: 'PAPER' as const }));
+
+      result.signalsFound = signals.length;
+
+      if (signals.length === 0) {
+        console.info(`[Autonomous] No qualifying signals for ${settings.userId} (conviction >= ${effectiveConviction}, regime: ${result.adaptiveRegime})`);
+        results.push(result);
+        continue;
+      }
+
+      // Execute trading cycle
+      const cycleResults = await runTradingCycle(settings.id, baseConfig, signals);
+
+      result.tradesPlaced   = cycleResults.filter(r => ['FILLED', 'DRY_RUN'].includes(r.status)).length;
+      result.tradesRejected = cycleResults.filter(r => !['FILLED', 'DRY_RUN'].includes(r.status)).length;
+
+      // Update last run timestamp
+      await prisma.userSettings.update({
+        where: { id: settings.id },
+        data:  { lastAutonomousRun: new Date() },
+      });
+
+      // Send Telegram notification if trades were placed
+      if (result.tradesPlaced > 0) {
+        const placed = cycleResults.filter(r => ['FILLED', 'DRY_RUN'].includes(r.status));
+        const topTrade = placed[0];
+        await telegramService.notify({
+          type:     'TRADE_PLACED',
+          exchange: 'hyperliquid', // reuse existing type, shows as PAPER in message
+          ticker:   topTrade?.symbol,
+          data: {
+            ticker:     placed.map(r => r.symbol).join(', '),
+            side:       'LONG',
+            quantity:   placed.length,
+            entryPrice: topTrade?.entryPrice?.toFixed(2) ?? '?',
+            stop:       'adaptive',
+            target:     'adaptive',
+            conviction: result.effectiveConviction,
+            rr:         (baseConfig.takeProfitPct / baseConfig.stopLossPct).toFixed(1),
+            dryRun:     result.dryRun,
+            regime:     result.adaptiveRegime,
+            trigger,
+          },
+        }).catch(() => { /* Telegram non-fatal */ });
+      }
+
+      console.info(`[Autonomous] ${trigger} cycle complete for ${settings.userId}: ${result.tradesPlaced} placed, ${result.tradesRejected} rejected, regime: ${result.adaptiveRegime}`);
+
+    } catch (err: any) {
+      result.errors.push(err?.message ?? 'Unknown error');
+      console.error('[Autonomous] Cycle error:', err?.message);
+    }
+
+    results.push(result);
+  }
+
+  return results;
+}
+```
+
+---
+
+## PHASE 3 — Wire All Four Triggers
+
+### Trigger 1: 9:30 AM Market Open (scan + execute)
+
+**File**: `server/src/services/scans/dailyScanScheduler.ts`
+
+Add import at top:
+```typescript
+import { runAutonomousCycle } from '../autotrader/AutonomousExecutor';
+```
+
+Find the market open scan block:
+```typescript
+if (isMarketOpenTime(nyTime)) {
+  // ...
+  await runDailyScan({ ... });
+}
+```
+
+Replace the `await runDailyScan(...)` call with:
+```typescript
+const scanId = await runDailyScan({
+  runType:       'SCHEDULED',
+  marketSession: 'MARKET_OPEN',
+  scheduledFor:  nyTime,
+  fullUniverse:  enableFullUniverse,
+});
+
+// After scan completes, immediately execute autonomous trades
+console.log(`[Scheduler] Scan ${scanId} complete — triggering autonomous cycle`);
+runAutonomousCycle('MARKET_OPEN', scanId).catch((err) => {
+  console.error('[Scheduler] Autonomous cycle failed after market open scan:', err?.message);
+});
+```
+
+### Trigger 2: Every Time Any Scan Completes (manual or scheduled)
+
+**File**: `server/src/services/scans/dailyScanOrchestrator.ts`
+
+Add import at top:
+```typescript
+import { runAutonomousCycle } from '../autotrader/AutonomousExecutor';
+```
+
+Find the `return scanRun.id;` lines at the end of both the full universe and static universe branches. Before each one, add the autonomous cycle trigger:
+
+```typescript
+// Trigger autonomous trading after scan completes (non-blocking)
+runAutonomousCycle('SCAN_COMPLETE', scanRun.id).catch((err) => {
+  console.warn('[DailyScan] Post-scan autonomous cycle error:', err?.message);
+});
+
+return scanRun.id;
+```
+
+This covers both code paths (full universe scan and static universe scan).
+
+### Trigger 3: Re-entry After a Position Closes
+
+**File**: `server/src/services/autotrader/IntradayMonitorLoop.ts`
+
+Add import at top:
+```typescript
+import { runAutonomousCycle } from './AutonomousExecutor';
+```
+
+In `monitorOpenAutoTrades()`, find where a position is closed (where `TAKE_PROFIT` or `STOP_LOSS` log is created). After the `autoTradeLog.update` call that marks the entry as `CLOSED`, add:
+
+```typescript
+// When a position closes, check if we should re-enter a new one
+// Only re-enter during market hours and if we're below max positions
+const nyHourNow = getNYHour();
+if (nyHourNow >= 9 && nyHourNow < 15) { // not in last 60 min to avoid end-of-day entries
+  // Small delay so the closed position is fully settled before re-scanning
+  setTimeout(() => {
+    runAutonomousCycle('REENTRY').catch((err) => {
+      console.warn('[Monitor] Re-entry cycle error:', err?.message);
+    });
+  }, 30_000); // 30 second delay after close before looking for new entry
+}
+```
+
+### Trigger 4: End-of-Day Close All + Summary (3:45 PM)
+
+**File**: `server/src/services/scans/dailyScanScheduler.ts`
+
+Add these imports at the top:
+```typescript
+import { closeAllPositions } from '../alpaca/alpacaExchangeService';
+import { hasAlpacaCredentials } from '../alpaca/alpacaConfig';
+import telegramService from '../notifications/TelegramService';
+import { prisma } from '../../lib/prisma';
+```
+
+Add this helper function before `schedulerTick()`:
+
+```typescript
+function isEndOfDayTime(date: Date): boolean {
+  // 3:45 PM ET — close all positions and send summary
+  return date.getHours() === 15 && date.getMinutes() === 45;
+}
+
+async function runEndOfDay(): Promise<void> {
+  console.log('[Scheduler] End-of-day routine starting');
+
+  // Close all open Alpaca paper positions
+  if (hasAlpacaCredentials()) {
+    try {
+      const { closed, errors } = await closeAllPositions();
+      console.log(`[Scheduler] EOD: closed ${closed} positions, ${errors.length} errors`);
+      if (errors.length > 0) {
+        console.warn('[Scheduler] EOD close errors:', errors);
+      }
+    } catch (err: any) {
+      console.error('[Scheduler] EOD close all failed:', err?.message);
+    }
+  }
+
+  // Write any open FILLED autoTradeLog entries as CLOSED with EOD reason
+  try {
+    const today = new Date();
+    today.setHours(0, 0, 0, 0);
+    await prisma.autoTradeLog.updateMany({
+      where: {
+        exchange: 'PAPER',
+        status:   'FILLED',
+        phase:    'ENTRY',
+        executedAt: { gte: today },
+      },
+      data: {
+        status:    'CLOSED',
+        exitPrice: 0,  // will be overwritten by actual price on next monitor cycle
+        reason:    'EOD_FORCED_CLOSE',
+      },
+    });
+  } catch (err: any) {
+    console.warn('[Scheduler] EOD log cleanup error:', err?.message);
+  }
+
+  // Send Telegram daily summary
+  await telegramService.sendDailySummary().catch(() => {});
+
+  console.log('[Scheduler] End-of-day routine complete');
+}
+```
+
+In `schedulerTick()`, add the end-of-day check after the premarket check:
+
+```typescript
+if (isEndOfDayTime(nyTime)) {
+  const runKey = `eod:${dateKey}`;
+  if (lastScheduledDate === runKey) return;
+  lastScheduledDate = runKey;
+  console.log(`[Scheduler] End-of-day triggered at ${nyTime.toISOString()}`);
+  runEndOfDay().catch((err) => {
+    console.error('[Scheduler] End-of-day routine failed:', err?.message);
+  });
+}
+```
+
+---
+
+## PHASE 4 — API Route for Autonomous Mode
+
+**File**: `server/src/routes/autotrader.ts`
+
+Add import:
+```typescript
+import { runAutonomousCycle } from '../services/autotrader/AutonomousExecutor';
+```
+
+Add these two routes after the existing `/disable` route:
+
+```typescript
+// Enable/configure autonomous mode
+router.post('/autonomous/enable', async (req: Request, res: Response) => {
+  try {
+    const userId = req.session!.userId as string;
+    const {
+      minConviction = 75,
+      maxPositions  = 3,
+      capitalPct    = 5.0,
+    } = req.body;
+
+    const settings = await getUserSettings(userId);
+    await prisma.userSettings.update({
+      where: { id: settings.id },
+      data: {
+        autonomousMode:          true,
+        autoTradeEnabled:        true,
+        autonomousMinConviction: minConviction,
+        autonomousMaxPositions:  maxPositions,
+        autonomousCapitalPct:    capitalPct,
+      },
+    });
+
+    res.json({ success: true, data: { autonomousMode: true, minConviction, maxPositions, capitalPct } });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err instanceof Error ? err.message : 'Enable failed' });
+  }
+});
+
+router.post('/autonomous/disable', async (req: Request, res: Response) => {
+  try {
+    const userId   = req.session!.userId as string;
+    const settings = await getUserSettings(userId);
+    await prisma.userSettings.update({
+      where: { id: settings.id },
+      data:  { autonomousMode: false },
+    });
+    res.json({ success: true, data: { autonomousMode: false } });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err instanceof Error ? err.message : 'Disable failed' });
+  }
+});
+
+// Manually trigger one autonomous cycle right now
+router.post('/autonomous/run', requireAuth, async (req: Request, res: Response) => {
+  try {
+    const results = await runAutonomousCycle('MANUAL');
+    res.json({ success: true, data: { results, cyclesRun: results.length } });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err instanceof Error ? err.message : 'Manual run failed' });
+  }
+});
+
+// Get autonomous mode status
+router.get('/autonomous/status', requireAuth, async (req: Request, res: Response) => {
+  try {
+    const userId   = req.session!.userId as string;
+    const settings = await getUserSettings(userId);
+    res.json({
+      success: true,
+      data: {
+        autonomousMode:          (settings as any).autonomousMode          ?? false,
+        autonomousMinConviction: (settings as any).autonomousMinConviction ?? 75,
+        autonomousMaxPositions:  (settings as any).autonomousMaxPositions  ?? 3,
+        autonomousCapitalPct:    (settings as any).autonomousCapitalPct    ?? 5.0,
+        lastAutonomousRun:       (settings as any).lastAutonomousRun       ?? null,
+        alpacaConnected:         hasAlpacaCredentials(),
+        alpacaDryRun:            getAlpacaCredentials()?.dryRun ?? true,
+      },
+    });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err instanceof Error ? err.message : 'Status failed' });
+  }
+});
+```
+
+Add missing imports at the top of the route file:
+```typescript
+import { hasAlpacaCredentials, getAlpacaCredentials } from '../services/alpaca/alpacaConfig';
+```
+
+---
+
+## PHASE 5 — API Client Methods
+
+**File**: `client/src/api/client.ts`
+
+In the `autotrader` section, add:
+```typescript
+autonomousEnable:  (params: { minConviction?: number; maxPositions?: number; capitalPct?: number }) =>
+  post('/autotrader/autonomous/enable', params),
+autonomousDisable: () => post('/autotrader/autonomous/disable', {}),
+autonomousRun:     () => post('/autotrader/autonomous/run', {}),
+autonomousStatus:  () => get('/autotrader/autonomous/status'),
+```
+
+---
+
+## PHASE 6 — Autonomous Mode Panel on AutoTrader Page
+
+**File**: `client/src/pages/AutoTrader.tsx`
+
+Add this query near the top of the main component:
+```typescript
+const { data: autonomousStatus, refetch: refetchAutonomous } = useQuery({
+  queryKey: ['autonomous-status'],
+  queryFn:  () => api.autotrader.autonomousStatus().then((r: any) => r.data),
+  refetchInterval: 30_000,
+});
+
+const autonomousEnableMut = useMutation({
+  mutationFn: () => api.autotrader.autonomousEnable({
+    minConviction: autonomousConviction,
+    maxPositions:  autonomousPositions,
+    capitalPct:    autonomousCapital,
+  }),
+  onSuccess: () => {
+    toast.success('Autonomous mode enabled — bot will trade every weekday automatically');
+    refetchAutonomous();
+    qc.invalidateQueries({ queryKey: ['autotrader-status'] });
+  },
+  onError: (e: any) => toast.error(e?.response?.data?.error ?? 'Enable failed'),
+});
+
+const autonomousDisableMut = useMutation({
+  mutationFn: () => api.autotrader.autonomousDisable(),
+  onSuccess: () => { toast.info('Autonomous mode disabled'); refetchAutonomous(); },
+  onError: (e: any) => toast.error(e?.response?.data?.error ?? 'Disable failed'),
+});
+
+const autonomousRunMut = useMutation({
+  mutationFn: () => api.autotrader.autonomousRun(),
+  onSuccess: (d: any) => {
+    const r = (d as any).data?.results?.[0];
+    if (r) {
+      toast.success(`Manual cycle: ${r.tradesPlaced} placed, regime: ${r.adaptiveRegime}`);
+    }
+    qc.invalidateQueries({ queryKey: ['autotrader-logs', 'alpaca-positions', 'alpaca-status'] });
+  },
+  onError: (e: any) => toast.error(e?.response?.data?.error ?? 'Run failed'),
+});
+```
+
+Add state for the configuration sliders:
+```typescript
+const [autonomousConviction, setAutonomousConviction] = useState(autonomousStatus?.autonomousMinConviction ?? 75);
+const [autonomousPositions,  setAutonomousPositions]  = useState(autonomousStatus?.autonomousMaxPositions  ?? 3);
+const [autonomousCapital,    setAutonomousCapital]    = useState(autonomousStatus?.autonomousCapitalPct    ?? 5.0);
+```
+
+Add this card at the very top of the page, before the stats row — it should be the first thing visible:
+
+```tsx
+{/* ── Autonomous Mode Card ── */}
+<Card className={cn(
+  'p-5 border-2 transition-all',
+  autonomousStatus?.autonomousMode
+    ? 'border-emerald-500/40 bg-emerald-950/20'
+    : 'border-surface-border bg-surface-2'
+)}>
+  <div className="flex items-start justify-between gap-4">
+    <div className="flex items-center gap-3">
+      <div className={cn(
+        'w-10 h-10 rounded-xl flex items-center justify-center border',
+        autonomousStatus?.autonomousMode
+          ? 'bg-emerald-500/20 border-emerald-500/30'
+          : 'bg-surface-3 border-surface-border'
+      )}>
+        <Bot className={cn('h-5 w-5', autonomousStatus?.autonomousMode ? 'text-emerald-400' : 'text-slate-500')} />
+      </div>
+      <div>
+        <div className="flex items-center gap-2">
+          <h2 className="text-base font-bold text-white">Fully Autonomous Mode</h2>
+          {autonomousStatus?.autonomousMode && (
+            <span className="flex items-center gap-1 text-[10px] font-bold px-2 py-0.5 rounded-full bg-emerald-500/20 text-emerald-400 border border-emerald-500/30">
+              <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse" />
+              LIVE
+            </span>
+          )}
+          {autonomousStatus?.alpacaDryRun && (
+            <span className="text-[10px] px-2 py-0.5 rounded-full bg-violet-500/20 text-violet-400 border border-violet-500/30">
+              DRY RUN
+            </span>
+          )}
+        </div>
+        <p className="text-xs text-slate-400 mt-0.5">
+          {autonomousStatus?.autonomousMode
+            ? 'Bot trades every weekday: 9:30 AM scan → execute → monitor → 3:45 PM close → 4 PM report'
+            : 'Enable to trade hands-free every weekday on Alpaca Paper'}
+        </p>
+      </div>
+    </div>
+
+    <div className="flex items-center gap-2 flex-shrink-0">
+      {autonomousStatus?.autonomousMode && (
+        <button
+          onClick={() => autonomousRunMut.mutate()}
+          disabled={autonomousRunMut.isPending}
+          className="flex items-center gap-1.5 px-3 py-2 bg-surface-3 border border-surface-border text-slate-300 text-xs rounded-lg hover:border-slate-500 disabled:opacity-40 transition-colors"
+        >
+          {autonomousRunMut.isPending ? <RefreshCw className="h-3.5 w-3.5 animate-spin" /> : <PlayCircle className="h-3.5 w-3.5" />}
+          Run Now
+        </button>
+      )}
+      {autonomousStatus?.autonomousMode ? (
+        <button
+          onClick={() => autonomousDisableMut.mutate()}
+          disabled={autonomousDisableMut.isPending}
+          className="flex items-center gap-1.5 px-4 py-2 bg-red-500/10 border border-red-500/30 text-red-400 text-sm font-semibold rounded-lg hover:bg-red-500/20 disabled:opacity-50 transition-colors"
+        >
+          {autonomousDisableMut.isPending ? <RefreshCw className="h-4 w-4 animate-spin" /> : <PowerOff className="h-4 w-4" />}
+          Disable
+        </button>
+      ) : (
+        <button
+          onClick={() => autonomousEnableMut.mutate()}
+          disabled={autonomousEnableMut.isPending || !autonomousStatus?.alpacaConnected}
+          title={!autonomousStatus?.alpacaConnected ? 'Connect Alpaca first' : undefined}
+          className="flex items-center gap-1.5 px-4 py-2 bg-emerald-500/10 border border-emerald-500/30 text-emerald-400 text-sm font-semibold rounded-lg hover:bg-emerald-500/20 disabled:opacity-50 transition-colors"
+        >
+          {autonomousEnableMut.isPending ? <RefreshCw className="h-4 w-4 animate-spin" /> : <Power className="h-4 w-4" />}
+          Enable
+        </button>
+      )}
+    </div>
+  </div>
+
+  {/* Last run + Alpaca status */}
+  {autonomousStatus && (
+    <div className="flex items-center gap-4 mt-3 text-xs text-slate-500">
+      <span className={cn('flex items-center gap-1', autonomousStatus.alpacaConnected ? 'text-emerald-400' : 'text-red-400')}>
+        <span className={cn('w-1.5 h-1.5 rounded-full', autonomousStatus.alpacaConnected ? 'bg-emerald-400' : 'bg-red-400')} />
+        Alpaca {autonomousStatus.alpacaConnected ? 'connected' : 'not connected'}
+      </span>
+      {autonomousStatus.lastAutonomousRun && (
+        <span>Last run: {new Date(autonomousStatus.lastAutonomousRun).toLocaleString('en-US', { timeZone: 'America/New_York', month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' })} ET</span>
+      )}
+    </div>
+  )}
+
+  {/* Configuration — only shown when enabling or already enabled */}
+  {(!autonomousStatus?.autonomousMode) && (
+    <div className="mt-4 pt-4 border-t border-surface-border space-y-3">
+      <p className="text-xs text-slate-500 font-medium uppercase tracking-wider">Configure before enabling</p>
+
+      {[
+        { label: 'Min Conviction Score', value: autonomousConviction, set: setAutonomousConviction, min: 60, max: 92, step: 1, fmt: (v: number) => `${v}/100`, color: 'accent-violet-500' },
+        { label: 'Max Simultaneous Positions', value: autonomousPositions, set: setAutonomousPositions, min: 1, max: 10, step: 1, fmt: (v: number) => `${v}`, color: 'accent-blue-500' },
+        { label: 'Capital Per Trade (%)', value: autonomousCapital, set: setAutonomousCapital, min: 1, max: 20, step: 0.5, fmt: (v: number) => `${v}%`, color: 'accent-emerald-500' },
+      ].map(({ label, value, set, min, max, step, fmt, color }) => (
+        <div key={label}>
+          <div className="flex justify-between mb-1">
+            <label className="text-xs text-slate-400">{label}</label>
+            <span className="text-xs font-mono text-white">{fmt(value)}</span>
+          </div>
+          <input type="range" min={min} max={max} step={step} value={value}
+            onChange={e => set(Number(e.target.value))}
+            className={`w-full ${color}`} />
+        </div>
+      ))}
+
+      <div className="flex items-start gap-2 p-2.5 bg-amber-500/10 border border-amber-500/20 rounded-lg mt-2">
+        <AlertTriangle className="h-3.5 w-3.5 text-amber-400 flex-shrink-0 mt-0.5" />
+        <p className="text-[11px] text-amber-400">
+          Autonomous mode will trade every weekday without manual confirmation.
+          {autonomousStatus?.alpacaDryRun
+            ? ' Dry Run is ON — orders are simulated, no real paper trades.'
+            : ' Dry Run is OFF — real paper trades will execute on Alpaca.'}
+          {' '}You can disable at any time or use the Emergency Exit button.
+        </p>
+      </div>
+    </div>
+  )}
+
+  {/* Active mode: show daily schedule */}
+  {autonomousStatus?.autonomousMode && (
+    <div className="mt-3 pt-3 border-t border-emerald-500/20">
+      <div className="grid grid-cols-2 md:grid-cols-4 gap-2 text-xs">
+        {[
+          { time: '9:00 AM', label: 'Pre-market scan',    color: 'text-slate-400' },
+          { time: '9:30 AM', label: 'Scan + execute',     color: 'text-emerald-400' },
+          { time: 'All day', label: 'Monitor + re-entry', color: 'text-blue-400' },
+          { time: '3:45 PM', label: 'Close all + report', color: 'text-amber-400' },
+        ].map(({ time, label, color }) => (
+          <div key={time} className="bg-surface-2 rounded-lg p-2 text-center border border-surface-border">
+            <p className={cn('font-mono font-bold text-sm', color)}>{time}</p>
+            <p className="text-slate-500 text-[10px] mt-0.5">{label}</p>
+          </div>
+        ))}
+      </div>
+      <div className="flex items-center gap-4 mt-2 text-xs text-slate-500">
+        <span>Conviction: <strong className="text-white">{autonomousStatus.autonomousMinConviction}</strong></span>
+        <span>Max positions: <strong className="text-white">{autonomousStatus.autonomousMaxPositions}</strong></span>
+        <span>Capital/trade: <strong className="text-white">{autonomousStatus.autonomousCapitalPct}%</strong></span>
+      </div>
+    </div>
+  )}
+</Card>
+```
+
+---
+
+## PHASE 7 — Required Replit Secret
+
+In Replit Secrets, make sure this is set:
+```
+ENABLE_DAILY_SCANS=true
+```
+
+Without this, the scheduler won't fire and the bot won't run automatically. The default value in the scheduler is `true` unless explicitly set to `false`, but setting it explicitly ensures it doesn't accidentally get disabled.
+
+Optionally also set:
+```
+PREMARKET_SCAN_ENABLED=true
+```
+This triggers a lighter pre-market scan at 9:00 AM so signals are ready before the 9:30 AM execution cycle.
+
+---
+
+## SUMMARY
+
+### New File
+```
+server/src/services/autotrader/AutonomousExecutor.ts   — core autonomous cycle function
+```
+
+### Modified Files
+```
+server/prisma/schema.prisma                  → 5 new fields on UserSettings
+server/src/services/scans/dailyScanScheduler.ts  → Trigger 1 (9:30 AM), Trigger 4 (3:45 PM EOD)
+server/src/services/scans/dailyScanOrchestrator.ts → Trigger 2 (every scan completion)
+server/src/services/autotrader/IntradayMonitorLoop.ts → Trigger 3 (re-entry after close)
+server/src/routes/autotrader.ts              → /autonomous/enable, /disable, /run, /status
+client/src/api/client.ts                    → 4 new API methods
+client/src/pages/AutoTrader.tsx             → Autonomous Mode card at top of page
+```
+
+### The Full Daily Lifecycle Once Enabled
+
+```
+8:00 AM   Server starts / already running
+9:00 AM   Pre-market scan (optional, if PREMARKET_SCAN_ENABLED=true)
+9:30 AM   Market opens → scheduler fires → daily scan runs (5-30 min)
+          → scan completes → AutonomousExecutor picks top signals
+          → adaptive engine adjusts parameters for current regime
+          → trades execute on Alpaca paper
+          → Telegram: "2 trades placed: NVDA, AAPL — Bull Trend, conviction 82"
+
+All day   IntradayMonitorLoop runs every 5 min
+          → checks stop/target on open positions
+          → when position closes → 30s delay → re-entry scan
+          → intraday signal engine scans for fast momentum setups
+
+3:45 PM   End-of-day routine runs
+          → closeAllPositions() wipes everything on Alpaca
+          → autoTradeLog entries marked CLOSED
+          → Telegram: daily summary with P&L, trades placed, closed
+
+Next day  Repeats
+```
+
+### Nothing to do after enabling
+
+Once you click **Enable** on the AutoTrader page and set your 3 parameters, the bot runs on its own every weekday. You can monitor it via the AutoTrader logs, the Alpaca tab (live positions/equity), and Telegram notifications. The **Run Now** button lets you manually trigger a cycle any time for testing.

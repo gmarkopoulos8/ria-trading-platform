@@ -1,4 +1,5 @@
 import { buildUniverse, type AssetScope, type RiskMode } from './scanUniverseService';
+import { runAutonomousCycle } from '../autotrader/AutonomousExecutor';
 import { rankCandidates } from './dailyRankingService';
 import { generateDailyReport } from './dailyMarketReportService';
 import {
@@ -91,6 +92,9 @@ export async function runDailyScan(opts: RunScanOptions = {}): Promise<string> {
       });
 
       console.log(`[DailyScan] ✅ Full universe scan run ${scanRun.id} completed. Top: ${topSymbol}`);
+      runAutonomousCycle('SCAN_COMPLETE', scanRun.id).catch((err) => {
+        console.warn('[DailyScan] Post-scan autonomous cycle error:', err?.message);
+      });
       return scanRun.id;
 
     } else {
@@ -132,6 +136,9 @@ export async function runDailyScan(opts: RunScanOptions = {}): Promise<string> {
       });
 
       console.log(`[DailyScan] ✅ Scan run ${scanRun.id} completed. Top: ${topSymbol}`);
+      runAutonomousCycle('SCAN_COMPLETE', scanRun.id).catch((err) => {
+        console.warn('[DailyScan] Post-scan autonomous cycle error:', err?.message);
+      });
       return scanRun.id;
     }
 

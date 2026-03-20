@@ -14,6 +14,8 @@ import {
   pauseSession,
 } from '../services/autotrader/ExchangeAutoConfigService';
 import { computeAdaptive, getCachedAdaptive, DEFAULT_BOUNDS, type AdaptiveExchange } from '../services/autotrader/UniversalAdaptiveEngine';
+import { runAutonomousCycle } from '../services/autotrader/AutonomousExecutor';
+import { hasAlpacaCredentials, getAlpacaCredentials } from '../services/alpaca/alpacaConfig';
 import { scanIntradaySignals } from '../services/autotrader/IntradaySignalEngine';
 import { filterSignalsWithAI } from '../services/autotrader/IntradayAIFilter';
 import { getOpenIntradayPositions } from '../services/autotrader/IntradayTradeManager';
@@ -336,6 +338,68 @@ router.post('/exchange-config/:exchange/session/pause', async (req: Request, res
     res.json({ success: true, data: { message: `${exchange} session paused` } });
   } catch (err) {
     res.status(500).json({ success: false, error: err instanceof Error ? err.message : 'Session pause error' });
+  }
+});
+
+router.post('/autonomous/enable', async (req: Request, res: Response) => {
+  try {
+    const userId = (req as any).session?.userId as string;
+    const { minConviction = 75, maxPositions = 3, capitalPct = 5.0 } = req.body;
+    const settings = await getUserSettings(userId);
+    await prisma.userSettings.update({
+      where: { id: settings.id },
+      data: {
+        autonomousMode:          true,
+        autoTradeEnabled:        true,
+        autonomousMinConviction: minConviction,
+        autonomousMaxPositions:  maxPositions,
+        autonomousCapitalPct:    capitalPct,
+      },
+    });
+    res.json({ success: true, data: { autonomousMode: true, minConviction, maxPositions, capitalPct } });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err instanceof Error ? err.message : 'Enable failed' });
+  }
+});
+
+router.post('/autonomous/disable', async (req: Request, res: Response) => {
+  try {
+    const userId   = (req as any).session?.userId as string;
+    const settings = await getUserSettings(userId);
+    await prisma.userSettings.update({ where: { id: settings.id }, data: { autonomousMode: false } });
+    res.json({ success: true, data: { autonomousMode: false } });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err instanceof Error ? err.message : 'Disable failed' });
+  }
+});
+
+router.post('/autonomous/run', async (req: Request, res: Response) => {
+  try {
+    const results = await runAutonomousCycle('MANUAL');
+    res.json({ success: true, data: { results, cyclesRun: results.length } });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err instanceof Error ? err.message : 'Manual run failed' });
+  }
+});
+
+router.get('/autonomous/status', async (req: Request, res: Response) => {
+  try {
+    const userId   = (req as any).session?.userId as string;
+    const settings = await getUserSettings(userId);
+    res.json({
+      success: true,
+      data: {
+        autonomousMode:          (settings as any).autonomousMode          ?? false,
+        autonomousMinConviction: (settings as any).autonomousMinConviction ?? 75,
+        autonomousMaxPositions:  (settings as any).autonomousMaxPositions  ?? 3,
+        autonomousCapitalPct:    (settings as any).autonomousCapitalPct    ?? 5.0,
+        lastAutonomousRun:       (settings as any).lastAutonomousRun       ?? null,
+        alpacaConnected:         hasAlpacaCredentials(),
+        alpacaDryRun:            getAlpacaCredentials()?.dryRun ?? true,
+      },
+    });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err instanceof Error ? err.message : 'Status failed' });
   }
 });
 

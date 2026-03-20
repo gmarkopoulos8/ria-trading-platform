@@ -721,6 +721,47 @@ export default function AutoTrader() {
   });
   const adaptive = (adaptiveRaw as any)?.data;
 
+  const { data: autonomousRaw, refetch: refetchAutonomous } = useQuery({
+    queryKey: ['autonomous-status'],
+    queryFn:  () => api.autotrader.autonomousStatus().then((r: any) => r.data),
+    refetchInterval: 30_000,
+  });
+  const autonomousStatus = autonomousRaw as any;
+
+  const [autonomousConviction, setAutonomousConviction] = useState(75);
+  const [autonomousPositions,  setAutonomousPositions]  = useState(3);
+  const [autonomousCapital,    setAutonomousCapital]    = useState(5.0);
+
+  const autonomousEnableMut = useMutation({
+    mutationFn: () => api.autotrader.autonomousEnable({
+      minConviction: autonomousConviction,
+      maxPositions:  autonomousPositions,
+      capitalPct:    autonomousCapital,
+    }),
+    onSuccess: () => {
+      toast.success('Autonomous mode enabled — bot will trade every weekday automatically');
+      refetchAutonomous();
+      qc.invalidateQueries({ queryKey: ['autotrader-status'] });
+    },
+    onError: (e: any) => toast.error(e?.response?.data?.error ?? 'Enable failed'),
+  });
+
+  const autonomousDisableMut = useMutation({
+    mutationFn: () => api.autotrader.autonomousDisable(),
+    onSuccess: () => { toast.info('Autonomous mode disabled'); refetchAutonomous(); },
+    onError: (e: any) => toast.error(e?.response?.data?.error ?? 'Disable failed'),
+  });
+
+  const autonomousRunMut = useMutation({
+    mutationFn: () => api.autotrader.autonomousRun(),
+    onSuccess: (d: any) => {
+      const r = (d as any).data?.results?.[0];
+      if (r) toast.success(`Manual cycle: ${r.tradesPlaced} placed, regime: ${r.adaptiveRegime}`);
+      qc.invalidateQueries({ queryKey: ['autotrader-logs', 'alpaca-positions', 'alpaca-status'] });
+    },
+    onError: (e: any) => toast.error(e?.response?.data?.error ?? 'Run failed'),
+  });
+
   const [intradayInterval,  setIntradayInterval]  = useState(60);
   const [intradayTimeframe, setIntradayTimeframe] = useState<'1min' | '3min' | '5min'>('1min');
 
@@ -850,6 +891,112 @@ export default function AutoTrader() {
           )}
         </div>
       )}
+
+      {/* ── Autonomous Mode Card ── */}
+      <Card className={cn(
+        'p-5 border-2 transition-all',
+        autonomousStatus?.autonomousMode
+          ? 'border-emerald-500/40 bg-emerald-950/20'
+          : 'border-surface-border bg-surface-2',
+      )}>
+        <div className="flex items-start justify-between gap-4">
+          <div className="flex items-center gap-3">
+            <div className={cn(
+              'w-10 h-10 rounded-xl flex items-center justify-center border',
+              autonomousStatus?.autonomousMode
+                ? 'bg-emerald-500/20 border-emerald-500/30'
+                : 'bg-surface-3 border-surface-border',
+            )}>
+              <Bot className={cn('h-5 w-5', autonomousStatus?.autonomousMode ? 'text-emerald-400' : 'text-slate-500')} />
+            </div>
+            <div>
+              <div className="flex items-center gap-2">
+                <h2 className="text-base font-bold text-white">Fully Autonomous Mode</h2>
+                {autonomousStatus?.autonomousMode && (
+                  <span className="flex items-center gap-1 text-[10px] font-bold px-2 py-0.5 rounded-full bg-emerald-500/20 text-emerald-400 border border-emerald-500/30">
+                    <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse" />
+                    LIVE
+                  </span>
+                )}
+                {autonomousStatus?.alpacaDryRun && (
+                  <span className="text-[10px] px-2 py-0.5 rounded-full bg-violet-500/20 text-violet-400 border border-violet-500/30">DRY RUN</span>
+                )}
+              </div>
+              <p className="text-xs text-slate-400 mt-0.5">
+                {autonomousStatus?.autonomousMode
+                  ? 'Bot trades every weekday: 9:30 AM scan → execute → monitor → 3:45 PM close → summary'
+                  : 'Enable to trade hands-free every weekday on Alpaca Paper'}
+              </p>
+            </div>
+          </div>
+
+          <div className="flex items-center gap-2 flex-shrink-0">
+            {autonomousStatus?.autonomousMode && (
+              <button
+                onClick={() => autonomousRunMut.mutate()}
+                disabled={autonomousRunMut.isPending}
+                className="flex items-center gap-1.5 px-3 py-2 bg-surface-3 border border-surface-border text-slate-300 text-xs rounded-lg hover:border-slate-500 disabled:opacity-40 transition-colors"
+              >
+                {autonomousRunMut.isPending ? <RefreshCw className="h-3.5 w-3.5 animate-spin" /> : <PlayCircle className="h-3.5 w-3.5" />}
+                Run Now
+              </button>
+            )}
+            {autonomousStatus?.autonomousMode ? (
+              <button
+                onClick={() => autonomousDisableMut.mutate()}
+                disabled={autonomousDisableMut.isPending}
+                className="flex items-center gap-1.5 px-4 py-2 bg-red-500/10 border border-red-500/30 text-red-400 text-sm font-semibold rounded-lg hover:bg-red-500/20 disabled:opacity-50 transition-colors"
+              >
+                {autonomousDisableMut.isPending ? <RefreshCw className="h-4 w-4 animate-spin" /> : <PowerOff className="h-4 w-4" />}
+                Disable
+              </button>
+            ) : (
+              <button
+                onClick={() => autonomousEnableMut.mutate()}
+                disabled={autonomousEnableMut.isPending || !autonomousStatus?.alpacaConnected}
+                title={!autonomousStatus?.alpacaConnected ? 'Connect Alpaca first' : undefined}
+                className="flex items-center gap-1.5 px-4 py-2 bg-emerald-500/10 border border-emerald-500/30 text-emerald-400 text-sm font-semibold rounded-lg hover:bg-emerald-500/20 disabled:opacity-50 transition-colors"
+              >
+                {autonomousEnableMut.isPending ? <RefreshCw className="h-4 w-4 animate-spin" /> : <Power className="h-4 w-4" />}
+                Enable
+              </button>
+            )}
+          </div>
+        </div>
+
+        {autonomousStatus && (
+          <div className="flex items-center gap-4 mt-3 text-xs text-slate-500">
+            <span className={cn('flex items-center gap-1', autonomousStatus.alpacaConnected ? 'text-emerald-400' : 'text-red-400')}>
+              <span className={cn('w-1.5 h-1.5 rounded-full', autonomousStatus.alpacaConnected ? 'bg-emerald-400' : 'bg-red-400')} />
+              Alpaca {autonomousStatus.alpacaConnected ? 'connected' : 'not connected'}
+            </span>
+            {autonomousStatus.lastAutonomousRun && (
+              <span>Last run: {new Date(autonomousStatus.lastAutonomousRun).toLocaleString('en-US', { timeZone: 'America/New_York', month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' })} ET</span>
+            )}
+          </div>
+        )}
+
+        {!autonomousStatus?.autonomousMode && (
+          <div className="mt-4 pt-4 border-t border-surface-border space-y-3">
+            <p className="text-xs text-slate-500 font-medium uppercase tracking-wider">Configure before enabling</p>
+            {[
+              { label: 'Min Conviction Score', value: autonomousConviction, set: setAutonomousConviction, min: 60, max: 92, step: 1,   fmt: (v: number) => `${v}/100` },
+              { label: 'Max Simultaneous Positions', value: autonomousPositions, set: setAutonomousPositions, min: 1, max: 10, step: 1, fmt: (v: number) => `${v}` },
+              { label: 'Capital Per Trade (%)', value: autonomousCapital, set: setAutonomousCapital, min: 1, max: 20, step: 0.5,        fmt: (v: number) => `${v}%` },
+            ].map(({ label, value, set, min, max, step, fmt }) => (
+              <div key={label}>
+                <div className="flex justify-between mb-1">
+                  <label className="text-xs text-slate-400">{label}</label>
+                  <span className="text-xs font-mono text-white">{fmt(value)}</span>
+                </div>
+                <input type="range" min={min} max={max} step={step} value={value}
+                  onChange={e => set(Number(e.target.value))}
+                  className="w-full h-1.5 rounded-full appearance-none cursor-pointer bg-surface-border accent-emerald-500" />
+              </div>
+            ))}
+          </div>
+        )}
+      </Card>
 
       <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
         <StatCard

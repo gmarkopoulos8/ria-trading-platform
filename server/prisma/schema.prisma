@@ -47,8 +47,13 @@ model UserSettings {
   cryptoApiKey         String?
   preferences          Json?
   notificationPrefs    Json?
-  autoTradeEnabled     Boolean  @default(false)
-  autoTradeConfig      Json?
+  autoTradeEnabled        Boolean  @default(false)
+  autoTradeConfig         Json?
+  autonomousMode          Boolean  @default(false)
+  autonomousMinConviction Int      @default(75)
+  autonomousMaxPositions  Int      @default(3)
+  autonomousCapitalPct    Float    @default(5.0)
+  lastAutonomousRun       DateTime?
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt

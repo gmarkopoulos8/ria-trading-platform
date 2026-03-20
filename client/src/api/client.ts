@@ -232,6 +232,11 @@ export const api = {
     adaptiveStatus: () => get('/autotrader/adaptive-status'),
     logs: (params?: Record<string, unknown>) => get('/autotrader/logs', params),
     signalsPreview: () => get('/autotrader/signals/preview'),
+    autonomousEnable:  (params: { minConviction?: number; maxPositions?: number; capitalPct?: number }) =>
+      post('/autotrader/autonomous/enable', params),
+    autonomousDisable: () => post('/autotrader/autonomous/disable', {}),
+    autonomousRun:     () => post('/autotrader/autonomous/run', {}),
+    autonomousStatus:  () => get('/autotrader/autonomous/status'),
     intradaySignals: (withAI = true) => get(`/autotrader/intraday/signals?ai=${withAI}`),
     intradayPositions: () => get('/autotrader/intraday/positions'),
     intradayRun: (params?: { maxSignals?: number; dryRun?: boolean }) => post('/autotrader/intraday/run', params ?? {}),

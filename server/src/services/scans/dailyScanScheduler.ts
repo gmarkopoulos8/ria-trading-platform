@@ -1,4 +1,9 @@
 import { runDailyScan } from './dailyScanOrchestrator';
+import { runAutonomousCycle } from '../autotrader/AutonomousExecutor';
+import { closeAllPositions } from '../alpaca/alpacaExchangeService';
+import { hasAlpacaCredentials } from '../alpaca/alpacaConfig';
+import telegramService from '../notifications/TelegramService';
+import { prisma } from '../../lib/prisma';
 
 const ENABLE_DAILY_SCANS = process.env.ENABLE_DAILY_SCANS !== 'false';
 const MARKET_TIMEZONE = process.env.MARKET_TIMEZONE ?? 'America/New_York';
@@ -38,6 +43,38 @@ function isPremarketTime(date: Date): boolean {
   return date.getHours() === adjustedHour && date.getMinutes() === adjustedMin;
 }
 
+function isEndOfDayTime(date: Date): boolean {
+  return date.getHours() === 15 && date.getMinutes() === 45;
+}
+
+async function runEndOfDay(): Promise<void> {
+  console.log('[Scheduler] End-of-day routine starting');
+
+  if (hasAlpacaCredentials()) {
+    try {
+      const { closed, errors } = await closeAllPositions();
+      console.log(`[Scheduler] EOD: closed ${closed} positions, ${errors.length} errors`);
+      if (errors.length > 0) console.warn('[Scheduler] EOD close errors:', errors);
+    } catch (err: any) {
+      console.error('[Scheduler] EOD close all failed:', err?.message);
+    }
+  }
+
+  try {
+    const today = new Date();
+    today.setHours(0, 0, 0, 0);
+    await prisma.autoTradeLog.updateMany({
+      where: { exchange: 'PAPER', status: 'FILLED', phase: 'ENTRY', executedAt: { gte: today } },
+      data:  { status: 'CLOSED', exitPrice: 0, reason: 'EOD_FORCED_CLOSE' },
+    });
+  } catch (err: any) {
+    console.warn('[Scheduler] EOD log cleanup error:', err?.message);
+  }
+
+  await telegramService.sendDailySummary().catch(() => {});
+  console.log('[Scheduler] End-of-day routine complete');
+}
+
 async function schedulerTick() {
   if (!enabled) return;
 
@@ -54,15 +91,29 @@ async function schedulerTick() {
     lastScheduledDate = runKey;
     console.log(`[Scheduler] Triggering market open scan at ${nyTime.toISOString()} (fullUniverse=${enableFullUniverse})`);
     try {
-      await runDailyScan({
-        runType: 'SCHEDULED',
+      const scanId = await runDailyScan({
+        runType:       'SCHEDULED',
         marketSession: 'MARKET_OPEN',
-        scheduledFor: nyTime,
-        fullUniverse: enableFullUniverse,
+        scheduledFor:  nyTime,
+        fullUniverse:  enableFullUniverse,
+      });
+      console.log(`[Scheduler] Scan ${scanId} complete — triggering autonomous cycle`);
+      runAutonomousCycle('MARKET_OPEN', scanId).catch((err) => {
+        console.error('[Scheduler] Autonomous cycle failed after market open scan:', err?.message);
       });
     } catch (err) {
       console.error('[Scheduler] Market open scan failed:', err instanceof Error ? err.message : err);
     }
+  }
+
+  if (isEndOfDayTime(nyTime)) {
+    const runKey = `eod:${dateKey}`;
+    if (lastScheduledDate === runKey) return;
+    lastScheduledDate = runKey;
+    console.log(`[Scheduler] End-of-day triggered at ${nyTime.toISOString()}`);
+    runEndOfDay().catch((err) => {
+      console.error('[Scheduler] End-of-day routine failed:', err?.message);
+    });
   }
 
   if (isPremarketTime(nyTime)) {
