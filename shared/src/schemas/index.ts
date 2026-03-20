@@ -53,8 +53,8 @@ export const PaginationSchema = z.object({
 
 export type LoginInput = z.infer<typeof LoginSchema>;
 export type RegisterInput = z.infer<typeof RegisterSchema>;
-export type OpenPositionInput = z.infer<typeof OpenPositionSchema>;
-export type ClosePositionInput = z.infer<typeof ClosePositionSchema>;
-export type CreateAlertInput = z.infer<typeof CreateAlertSchema>;
+export type OpenPositionSchemaInput = z.infer<typeof OpenPositionSchema>;
+export type ClosePositionSchemaInput = z.infer<typeof ClosePositionSchema>;
+export type CreateAlertSchemaInput = z.infer<typeof CreateAlertSchema>;
 export type SymbolQueryInput = z.infer<typeof SymbolQuerySchema>;
 export type PaginationInput = z.infer<typeof PaginationSchema>;

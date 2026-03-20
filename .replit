@@ -11,8 +11,9 @@ language = "python3"
 requiredFiles = [".replit", "replit.nix"]
 
 [deployment]
-run = ["python3", "main.py"]
-deploymentTarget = "cloudrun"
+run = ["bash", "-c", "NODE_ENV=production tsx server/src/index.ts"]
+deploymentTarget = "vm"
+build = ["bash", "-c", "npm run build --workspace=shared && cd client && npx vite build"]
 
 [agent]
 expertMode = true
@@ -56,3 +57,9 @@ externalPort = 3002
 [[ports]]
 localPort = 5002
 externalPort = 3000
+
+[userenv]
+
+[userenv.production]
+NODE_ENV = "production"
+PORT = "5000"

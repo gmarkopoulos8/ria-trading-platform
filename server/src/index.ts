@@ -1,4 +1,5 @@
 import 'dotenv/config';
+import path from 'path';
 import express from 'express';
 import cors from 'cors';
 import helmet from 'helmet';
@@ -129,6 +130,16 @@ app.use('/api/alpaca', alpacaRouter);
 app.use('/api/options', optionsRouter);
 
 app.use('/api/*', notFoundHandler);
+
+// In production: serve the built React app and handle client-side routing
+if (isProd) {
+  const clientDist = path.join(__dirname, '../../client/dist');
+  app.use(express.static(clientDist));
+  app.get('*', (_req, res) => {
+    res.sendFile(path.join(clientDist, 'index.html'));
+  });
+}
+
 app.use(errorHandler);
 
 const MONITOR_INTERVAL_MS = 5 * 60 * 1000;
