@@ -135,12 +135,16 @@ export function computeDrawdownPct(account: AlpacaAccount): number {
 export async function getLatestQuote(symbol: string): Promise<number | null> {
   try {
     const headers = authHeaders();
-    const url = `https://data.alpaca.markets/v2/stocks/${symbol}/quotes/latest`;
+    const url = `https://data.alpaca.markets/v2/stocks/${encodeURIComponent(symbol)}/quotes/latest`;
     const { data } = await axios.get(url, { headers, timeout: 5000 });
     const bid = parseFloat(data?.quote?.bp ?? '0');
     const ask = parseFloat(data?.quote?.ap ?? '0');
     if (bid > 0 && ask > 0) return (bid + ask) / 2;
-    return null;
+    // Fallback to last trade price
+    const tradeUrl = `https://data.alpaca.markets/v2/stocks/${encodeURIComponent(symbol)}/trades/latest`;
+    const { data: tradeData } = await axios.get(tradeUrl, { headers, timeout: 5000 });
+    const last = parseFloat(tradeData?.trade?.p ?? '0');
+    return last > 0 ? last : null;
   } catch {
     return null;
   }

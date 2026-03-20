@@ -366,8 +366,12 @@ router.post('/auto/start', requireAuth, requireAlpacaCredentials, async (req: Re
     }
 
     const sortedSignals = [...rawSignals].sort((a: any, b: any) => {
-      const aScore = (a.compositeScore ?? 0) * 0.6 + (a.convictionScore ?? 0) * 0.4;
-      const bScore = (b.compositeScore ?? 0) * 0.6 + (b.convictionScore ?? 0) * 0.4;
+      const aScore = (a.thesisHealthScore ?? 0) * 0.4
+                   + (a.convictionScore   ?? 0) * 0.4
+                   + (a.confidenceScore   ?? 0) * 0.2;
+      const bScore = (b.thesisHealthScore ?? 0) * 0.4
+                   + (b.convictionScore   ?? 0) * 0.4
+                   + (b.confidenceScore   ?? 0) * 0.2;
       return bScore - aScore;
     });
 

@@ -34,7 +34,7 @@ export async function buildSignalsFromLatestScan(
       confidenceScore: { gte: minConfidenceScore },
     },
     orderBy: [
-      { compositeScore: 'desc' },
+      { rank: 'asc' },              // rank 1 = best overall setup, computed by scanner
       { convictionScore: 'desc' },
       { confidenceScore: 'desc' },
     ],
@@ -43,22 +43,23 @@ export async function buildSignalsFromLatestScan(
 
   const signals: AutoTradeSignal[] = results.map((r) => {
     const entryZone = r.entryZoneJson as { low?: number; high?: number } | null;
-    const tp1 = r.takeProfit1Json as { price?: number } | null;
-    const inv = r.invalidationZoneJson as { price?: number } | null;
+    const tp1       = r.takeProfit1Json as { price?: number } | null;
+    const inv       = r.invalidationZoneJson as { price?: number } | null;
 
     return {
-      symbol: r.symbol,
-      assetClass: r.assetClass,
-      bias: r.bias as 'BULLISH' | 'BEARISH' | 'NEUTRAL',
-      convictionScore: r.convictionScore,
-      confidenceScore: r.confidenceScore,
-      riskScore: r.riskScore,
-      entryPrice: entryZone?.low ?? entryZone?.high ?? undefined,
-      stopLoss: inv?.price ?? undefined,
-      takeProfit: tp1?.price ?? undefined,
-      setupType: r.setupType ?? undefined,
-      reason: r.catalystSummary ?? r.patternSummary ?? undefined,
-      scanRunId: latestRun.id,
+      symbol:            r.symbol,
+      assetClass:        r.assetClass,
+      bias:              r.bias as 'BULLISH' | 'BEARISH' | 'NEUTRAL',
+      convictionScore:   r.convictionScore,
+      confidenceScore:   r.confidenceScore,
+      riskScore:         r.riskScore,
+      thesisHealthScore: r.thesisHealthScore,
+      entryPrice:        entryZone?.low ?? entryZone?.high ?? undefined,
+      stopLoss:          inv?.price ?? undefined,
+      takeProfit:        tp1?.price ?? undefined,
+      setupType:         r.setupType ?? undefined,
+      reason:            r.catalystSummary ?? r.patternSummary ?? undefined,
+      scanRunId:         latestRun.id,
     };
   });
 

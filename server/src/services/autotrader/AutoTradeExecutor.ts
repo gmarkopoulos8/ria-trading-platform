@@ -28,6 +28,7 @@ export interface AutoTradeSignal {
   exchange?: AutoTradeExchange;
   intradayConfirmation?: string;
   atrPercent?: number;
+  thesisHealthScore?: number;
   fixedDollarAmount?: number;
 }
 
