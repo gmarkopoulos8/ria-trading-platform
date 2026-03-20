@@ -1,0 +1,1047 @@
+# Replit Agent Prompt — Intraday AI Signal Engine + Fast Trade Execution
+
+This adds a completely new signal pipeline that runs every 5 minutes during market hours, analyzes 5-minute bars for high-momentum setups, and executes trades with tight intraday stops and targets — holding positions for minutes to hours. It runs alongside the existing daily scan system and shares the same exchange infrastructure. Only touch the files listed below.
+
+---
+
+## OVERVIEW OF WHAT THIS BUILDS
+
+1. **`IntradaySignalEngine`** — scans a watchlist every 5 minutes using 5-min bar data, computes momentum signals (VWAP deviation, 5-min RSI, volume surge, price breakout), and scores them 0–100
+2. **`IntradayAIFilter`** — Claude AI call that receives the top momentum signals and decides which ones to actually trade, returning a conviction score and reasoning for each
+3. **`IntradayAutoTrader`** — executes approved signals on the appropriate exchange with intraday-specific sizing and tight stops (0.5–2% stops, 1–4% targets, exit within the same session)
+4. **Wires into the existing intraday monitor loop** which already fires every 5 minutes — adds entry scanning to what is currently exit-only monitoring
+5. **Intraday tab** on the AutoTrader page showing live signals, AI decisions, and open intraday positions
+
+---
+
+## PHASE 1 — Intraday Signal Engine
+
+**File**: `server/src/services/autotrader/IntradaySignalEngine.ts` (NEW FILE)
+
+```typescript
+import { marketService } from '../market/MarketService';
+import { livePriceManager } from '../market/LivePriceManager';
+import { getAllMids } from '../hyperliquid/hyperliquidInfoService';
+import type { OHLCVBar } from '../technical/types';
+
+export interface IntradaySignal {
+  symbol:          string;
+  assetClass:      'stock' | 'crypto';
+  exchange:        'TOS' | 'HYPERLIQUID' | 'PAPER';
+  currentPrice:    number;
+  momentumScore:   number;    // 0–100: how strong the intraday momentum signal is
+  direction:       'LONG' | 'SHORT';
+  triggerType:     'VWAP_RECLAIM' | 'VOLUME_SURGE_BREAKOUT' | 'RSI_MOMENTUM' | 'PRICE_BREAKOUT' | 'CRYPTO_SURGE';
+  suggestedEntry:  number;
+  suggestedStop:   number;    // tight — 0.5–2%
+  suggestedTarget: number;    // 1–4%
+  riskRewardRatio: number;
+  reasoning:       string;
+  detectedAt:      Date;
+  barsAnalyzed:    number;
+}
+
+// Stocks to watch for intraday setups — high volume, liquid, with active options
+const INTRADAY_STOCK_WATCHLIST = [
+  'SPY', 'QQQ', 'AAPL', 'NVDA', 'TSLA', 'MSFT', 'META', 'AMZN',
+  'AMD', 'GOOGL', 'NFLX', 'CRM', 'COIN', 'MSTR', 'PLTR', 'SMCI',
+];
+
+// Crypto assets for Hyperliquid intraday (24/7, high volatility)
+const INTRADAY_CRYPTO_WATCHLIST = ['BTC', 'ETH', 'SOL', 'AVAX', 'LINK', 'DOGE'];
+
+function computeVWAP(bars: OHLCVBar[]): number {
+  let cumTPV = 0;
+  let cumVol  = 0;
+  for (const bar of bars) {
+    const tp  = (bar.high + bar.low + bar.close) / 3;
+    cumTPV   += tp * bar.volume;
+    cumVol   += bar.volume;
+  }
+  return cumVol > 0 ? cumTPV / cumVol : bars[bars.length - 1].close;
+}
+
+function computeRSI(closes: number[], period = 14): number | null {
+  if (closes.length < period + 1) return null;
+  const deltas = closes.slice(1).map((c, i) => c - closes[i]);
+  let avgGain = 0, avgLoss = 0;
+  for (let i = 0; i < period; i++) {
+    if (deltas[i] > 0) avgGain += deltas[i]; else avgLoss += Math.abs(deltas[i]);
+  }
+  avgGain /= period; avgLoss /= period;
+  for (let i = period; i < deltas.length; i++) {
+    const g = deltas[i] > 0 ? deltas[i] : 0;
+    const l = deltas[i] < 0 ? Math.abs(deltas[i]) : 0;
+    avgGain = (avgGain * (period - 1) + g) / period;
+    avgLoss = (avgLoss * (period - 1) + l) / period;
+  }
+  if (avgLoss === 0) return 100;
+  return 100 - 100 / (1 + avgGain / avgLoss);
+}
+
+function computeVolumeSurge(bars: OHLCVBar[]): number {
+  if (bars.length < 10) return 1;
+  const avg = bars.slice(-10, -1).reduce((s, b) => s + b.volume, 0) / 9;
+  const cur  = bars[bars.length - 1].volume;
+  return avg > 0 ? cur / avg : 1;
+}
+
+function computeATRPct(bars: OHLCVBar[], period = 10): number {
+  if (bars.length < 2) return 1;
+  const trs = bars.slice(-period).map((b, i, arr) => {
+    if (i === 0) return b.high - b.low;
+    const prev = arr[i - 1];
+    return Math.max(b.high - b.low, Math.abs(b.high - prev.close), Math.abs(b.low - prev.close));
+  });
+  const atr  = trs.reduce((s, t) => s + t, 0) / trs.length;
+  const price = bars[bars.length - 1].close;
+  return (atr / price) * 100;
+}
+
+function scoreStockSignal(bars: OHLCVBar[], symbol: string): IntradaySignal | null {
+  if (bars.length < 20) return null;
+
+  const price     = bars[bars.length - 1].close;
+  const vwap      = computeVWAP(bars);
+  const closes    = bars.map(b => b.close);
+  const rsi5      = computeRSI(closes.slice(-20), 7);   // fast RSI for intraday
+  const volSurge  = computeVolumeSurge(bars);
+  const atrPct    = computeATRPct(bars);
+
+  // Recent high/low for breakout detection
+  const recentHigh = Math.max(...bars.slice(-20, -1).map(b => b.high));
+  const recentLow  = Math.min(...bars.slice(-20, -1).map(b => b.low));
+
+  // Price momentum in last 3 bars
+  const last3Change = (price - bars[bars.length - 4].close) / bars[bars.length - 4].close * 100;
+
+  let score       = 0;
+  let direction: 'LONG' | 'SHORT' = 'LONG';
+  let trigger: IntradaySignal['triggerType'] = 'RSI_MOMENTUM';
+  let reasoning   = '';
+
+  // ── VWAP Reclaim (bullish) ──────────────────────────────────────────────
+  // Price was below VWAP and just crossed above with volume
+  const prevPrice = bars[bars.length - 2].close;
+  if (prevPrice < vwap && price > vwap && volSurge >= 1.5) {
+    score     = 72 + Math.min(18, volSurge * 5);
+    direction = 'LONG';
+    trigger   = 'VWAP_RECLAIM';
+    reasoning = `VWAP reclaim at $${vwap.toFixed(2)} with ${volSurge.toFixed(1)}× volume surge`;
+  }
+  // VWAP breakdown (bearish)
+  else if (prevPrice > vwap && price < vwap && volSurge >= 1.5) {
+    score     = 68 + Math.min(15, volSurge * 4);
+    direction = 'SHORT';
+    trigger   = 'VWAP_RECLAIM';
+    reasoning = `VWAP breakdown below $${vwap.toFixed(2)} with ${volSurge.toFixed(1)}× volume`;
+  }
+  // ── Volume Surge + Breakout ─────────────────────────────────────────────
+  else if (volSurge >= 2.5 && price > recentHigh * 1.002) {
+    score     = 75 + Math.min(15, (volSurge - 2.5) * 8);
+    direction = 'LONG';
+    trigger   = 'VOLUME_SURGE_BREAKOUT';
+    reasoning = `Volume surge ${volSurge.toFixed(1)}× breaking above ${recentHigh.toFixed(2)} resistance`;
+  }
+  else if (volSurge >= 2.5 && price < recentLow * 0.998) {
+    score     = 70 + Math.min(15, (volSurge - 2.5) * 6);
+    direction = 'SHORT';
+    trigger   = 'VOLUME_SURGE_BREAKOUT';
+    reasoning = `Volume surge ${volSurge.toFixed(1)}× breaking below ${recentLow.toFixed(2)} support`;
+  }
+  // ── RSI Momentum ────────────────────────────────────────────────────────
+  else if (rsi5 !== null && rsi5 >= 65 && last3Change > 0.3 && volSurge >= 1.3) {
+    score     = 60 + Math.min(20, rsi5 - 60);
+    direction = 'LONG';
+    trigger   = 'RSI_MOMENTUM';
+    reasoning = `RSI momentum ${rsi5.toFixed(0)} with ${last3Change.toFixed(2)}% 3-bar move`;
+  }
+  else if (rsi5 !== null && rsi5 <= 35 && last3Change < -0.3 && volSurge >= 1.3) {
+    score     = 60 + Math.min(20, 35 - rsi5);
+    direction = 'SHORT';
+    trigger   = 'RSI_MOMENTUM';
+    reasoning = `RSI breakdown ${rsi5.toFixed(0)} with ${Math.abs(last3Change).toFixed(2)}% 3-bar decline`;
+  }
+  // ── Price Breakout ──────────────────────────────────────────────────────
+  else if (price > recentHigh * 1.005 && volSurge >= 1.2) {
+    score     = 62;
+    direction = 'LONG';
+    trigger   = 'PRICE_BREAKOUT';
+    reasoning = `Price breakout above ${recentHigh.toFixed(2)} resistance`;
+  }
+
+  if (score < 60) return null; // Not strong enough
+
+  // Sizing: use ATR for stop, 2:1 minimum R:R
+  const stopPct   = Math.max(0.5, Math.min(2.0, atrPct * 1.5));
+  const targetPct = Math.max(stopPct * 2, Math.min(4.0, stopPct * 2.5));
+  const stop      = direction === 'LONG' ? price * (1 - stopPct / 100) : price * (1 + stopPct / 100);
+  const target    = direction === 'LONG' ? price * (1 + targetPct / 100) : price * (1 - targetPct / 100);
+
+  return {
+    symbol, assetClass: 'stock', exchange: 'PAPER',
+    currentPrice: price, momentumScore: Math.round(score), direction, triggerType: trigger,
+    suggestedEntry: price, suggestedStop: stop, suggestedTarget: target,
+    riskRewardRatio: Math.round((targetPct / stopPct) * 10) / 10,
+    reasoning, detectedAt: new Date(), barsAnalyzed: bars.length,
+  };
+}
+
+function scoreCryptoSignal(symbol: string, currentPrice: number, recentPrices: number[]): IntradaySignal | null {
+  if (recentPrices.length < 10) return null;
+
+  const rsi         = computeRSI(recentPrices, 7);
+  const priceChange = (currentPrice - recentPrices[0]) / recentPrices[0] * 100;
+  const shortChange = (currentPrice - recentPrices[recentPrices.length - 3]) / recentPrices[recentPrices.length - 3] * 100;
+
+  let score     = 0;
+  let direction: 'LONG' | 'SHORT' = 'LONG';
+  let trigger: IntradaySignal['triggerType'] = 'CRYPTO_SURGE';
+  let reasoning = '';
+
+  // Strong momentum in right direction
+  if (priceChange > 1.5 && shortChange > 0.5 && rsi !== null && rsi > 55) {
+    score     = 65 + Math.min(20, priceChange * 5);
+    direction = 'LONG';
+    reasoning = `Crypto surge: +${priceChange.toFixed(2)}% with RSI ${rsi.toFixed(0)}`;
+  } else if (priceChange < -1.5 && shortChange < -0.5 && rsi !== null && rsi < 45) {
+    score     = 65 + Math.min(20, Math.abs(priceChange) * 5);
+    direction = 'SHORT';
+    reasoning = `Crypto decline: ${priceChange.toFixed(2)}% with RSI ${rsi.toFixed(0)}`;
+  }
+
+  if (score < 62) return null;
+
+  const stopPct   = 1.0;
+  const targetPct = 2.5;
+  const stop      = direction === 'LONG' ? currentPrice * 0.99 : currentPrice * 1.01;
+  const target    = direction === 'LONG' ? currentPrice * 1.025 : currentPrice * 0.975;
+
+  return {
+    symbol, assetClass: 'crypto', exchange: 'HYPERLIQUID',
+    currentPrice, momentumScore: Math.round(score), direction, triggerType: trigger,
+    suggestedEntry: currentPrice, suggestedStop: stop, suggestedTarget: target,
+    riskRewardRatio: targetPct / stopPct,
+    reasoning, detectedAt: new Date(), barsAnalyzed: recentPrices.length,
+  };
+}
+
+// Cache 5-min bars to avoid re-fetching within the same minute
+const _barCache = new Map<string, { bars: OHLCVBar[]; ts: number }>();
+const BAR_CACHE_TTL = 4 * 60_000; // 4 minutes
+
+export async function scanIntradaySignals(
+  enabledExchanges: { stocks: boolean; crypto: boolean } = { stocks: true, crypto: true }
+): Promise<IntradaySignal[]> {
+  const signals: IntradaySignal[] = [];
+
+  // ── Stock signals ──────────────────────────────────────────────────────
+  if (enabledExchanges.stocks) {
+    for (const symbol of INTRADAY_STOCK_WATCHLIST) {
+      try {
+        const cached = _barCache.get(symbol);
+        let bars: OHLCVBar[];
+
+        if (cached && Date.now() - cached.ts < BAR_CACHE_TTL) {
+          bars = cached.bars;
+        } else {
+          // '1D' returns 5-minute bars from Yahoo Finance
+          bars = await marketService.history(symbol, '1D', 'stock');
+          _barCache.set(symbol, { bars, ts: Date.now() });
+        }
+
+        // Try live price first, fall back to last bar close
+        const livePrice = livePriceManager.getLastPrice(symbol);
+        if (livePrice && bars.length > 0) {
+          bars = [...bars.slice(0, -1), { ...bars[bars.length - 1], close: livePrice }];
+        }
+
+        const signal = scoreStockSignal(bars, symbol);
+        if (signal) {
+          // Subscribe to live price updates for this symbol
+          livePriceManager.subscribe(symbol, () => {});
+          signals.push(signal);
+        }
+      } catch { /* non-fatal — skip this symbol */ }
+
+      // Small delay between fetches to avoid rate limiting
+      await new Promise(r => setTimeout(r, 150));
+    }
+  }
+
+  // ── Crypto signals ─────────────────────────────────────────────────────
+  if (enabledExchanges.crypto) {
+    try {
+      const mids = await getAllMids();
+      for (const symbol of INTRADAY_CRYPTO_WATCHLIST) {
+        const currentPrice = mids[symbol] ? parseFloat(mids[symbol]) : null;
+        if (!currentPrice) continue;
+
+        // Build price history from bar cache for RSI computation
+        const cached = _barCache.get(`crypto:${symbol}`);
+        let priceHistory: number[] = [];
+
+        if (cached && Date.now() - cached.ts < BAR_CACHE_TTL) {
+          priceHistory = cached.bars.map(b => b.close);
+        } else {
+          const bars = await marketService.history(symbol, '1D', 'crypto').catch(() => [] as OHLCVBar[]);
+          _barCache.set(`crypto:${symbol}`, { bars, ts: Date.now() });
+          priceHistory = bars.map(b => b.close);
+        }
+
+        priceHistory.push(currentPrice); // append live price
+
+        const signal = scoreCryptoSignal(symbol, currentPrice, priceHistory);
+        if (signal) signals.push(signal);
+      }
+    } catch { /* HL not connected — skip crypto */ }
+  }
+
+  // Sort by momentum score descending
+  return signals.sort((a, b) => b.momentumScore - a.momentumScore);
+}
+```
+
+---
+
+## PHASE 2 — AI Filter Using Claude API
+
+**File**: `server/src/services/autotrader/IntradayAIFilter.ts` (NEW FILE)
+
+This calls the Claude API to make the final go/no-go decision on intraday signals. Claude receives the signals and current market context and returns a filtered list with reasoning.
+
+```typescript
+import axios from 'axios';
+import type { IntradaySignal } from './IntradaySignalEngine';
+import { detectRegime } from '../market/RegimeDetector';
+
+export interface AIFilteredSignal extends IntradaySignal {
+  aiApproved:    boolean;
+  aiConviction:  number;    // 0–100 AI conviction score
+  aiReasoning:   string;
+  aiRiskWarning: string | null;
+  aiHoldMinutes: number;    // how long AI thinks to hold (5–240 mins)
+}
+
+export async function filterSignalsWithAI(
+  signals: IntradaySignal[],
+  maxSignals = 3,
+): Promise<AIFilteredSignal[]> {
+  if (signals.length === 0) return [];
+  if (!process.env.ANTHROPIC_API_KEY) {
+    // Fallback: approve top signals by score without AI
+    return signals.slice(0, maxSignals).map(s => ({
+      ...s,
+      aiApproved:    s.momentumScore >= 70,
+      aiConviction:  s.momentumScore,
+      aiReasoning:   `Auto-approved: momentum score ${s.momentumScore}/100`,
+      aiRiskWarning: null,
+      aiHoldMinutes: s.assetClass === 'crypto' ? 30 : 60,
+    }));
+  }
+
+  let regime = 'UNKNOWN';
+  let vix: number | null = null;
+  try {
+    const r = await detectRegime();
+    regime = r.regime;
+    vix    = r.vix;
+  } catch { /* non-fatal */ }
+
+  const prompt = `You are an expert intraday trader and risk manager. Evaluate these momentum signals and decide which ones to trade.
+
+Market context:
+- Current market regime: ${regime}
+- VIX: ${vix?.toFixed(1) ?? 'unknown'}
+- Time: ${new Date().toLocaleTimeString('en-US', { timeZone: 'America/New_York' })} ET
+
+Signals detected (sorted by momentum score):
+${signals.slice(0, 8).map((s, i) => `
+${i + 1}. ${s.symbol} (${s.assetClass}) — ${s.direction}
+   Score: ${s.momentumScore}/100 | Trigger: ${s.triggerType}
+   Price: $${s.currentPrice.toFixed(2)} | Stop: $${s.suggestedStop.toFixed(2)} | Target: $${s.suggestedTarget.toFixed(2)}
+   R:R: ${s.riskRewardRatio}:1 | Reasoning: ${s.reasoning}
+`).join('')}
+
+For each signal, evaluate:
+1. Does this fit the current market regime? (BULL_TREND favors longs, CHOPPY needs higher quality, ELEVATED_VOLATILITY widens stops)
+2. Is the R:R ratio acceptable for intraday (minimum 1.5:1)?
+3. Are there any risk factors (earnings, news, correlated positions)?
+4. How long should this be held (minutes to hours)?
+
+Respond ONLY with a JSON array, no other text:
+[
+  {
+    "symbol": "AAPL",
+    "approved": true,
+    "conviction": 82,
+    "reasoning": "Clean VWAP reclaim on above-average volume. Bull regime supports long entries. Target achievable within session.",
+    "riskWarning": null,
+    "holdMinutes": 45
+  }
+]
+
+Approve maximum ${maxSignals} signals. Reject anything with R:R below 1.5, anything in a sector with recent bad news, or anything that looks like a false breakout.`;
+
+  try {
+    const response = await axios.post(
+      'https://api.anthropic.com/v1/messages',
+      {
+        model: 'claude-sonnet-4-20250514',
+        max_tokens: 1000,
+        messages: [{ role: 'user', content: prompt }],
+      },
+      {
+        headers: {
+          'x-api-key':         process.env.ANTHROPIC_API_KEY,
+          'anthropic-version': '2023-06-01',
+          'content-type':      'application/json',
+        },
+        timeout: 15_000,
+      },
+    );
+
+    const text = response.data?.content?.[0]?.text ?? '';
+    const clean = text.replace(/```json|```/g, '').trim();
+    const decisions: Array<{
+      symbol:      string;
+      approved:    boolean;
+      conviction:  number;
+      reasoning:   string;
+      riskWarning: string | null;
+      holdMinutes: number;
+    }> = JSON.parse(clean);
+
+    // Map AI decisions back to signals
+    return signals.map(signal => {
+      const decision = decisions.find(d => d.symbol === signal.symbol);
+      return {
+        ...signal,
+        aiApproved:    decision?.approved ?? false,
+        aiConviction:  decision?.conviction ?? 0,
+        aiReasoning:   decision?.reasoning ?? 'Not evaluated',
+        aiRiskWarning: decision?.riskWarning ?? null,
+        aiHoldMinutes: decision?.holdMinutes ?? 60,
+      };
+    });
+  } catch (err: any) {
+    console.warn('[IntradayAI] AI filter failed, falling back to score-based approval:', err?.message);
+    // Fallback: approve top signals by score
+    return signals.slice(0, maxSignals).map(s => ({
+      ...s,
+      aiApproved:    s.momentumScore >= 72,
+      aiConviction:  s.momentumScore,
+      aiReasoning:   `Fallback approval: momentum ${s.momentumScore}/100`,
+      aiRiskWarning: null,
+      aiHoldMinutes: s.assetClass === 'crypto' ? 30 : 60,
+    }));
+  }
+}
+```
+
+---
+
+## PHASE 3 — Intraday Trade Manager
+
+**File**: `server/src/services/autotrader/IntradayTradeManager.ts` (NEW FILE)
+
+Executes AI-approved intraday signals and manages them — time-based exits, trailing stops, and session-end forced exits.
+
+```typescript
+import { prisma } from '../../lib/prisma';
+import { livePriceManager } from '../market/LivePriceManager';
+import { getAllMids } from '../hyperliquid/hyperliquidInfoService';
+import type { AIFilteredSignal } from './IntradayAIFilter';
+
+export interface IntradayPosition {
+  id:            string;
+  symbol:        string;
+  assetClass:    'stock' | 'crypto';
+  exchange:      string;
+  direction:     'LONG' | 'SHORT';
+  entryPrice:    number;
+  currentPrice:  number;
+  stopLoss:      number;
+  target:        number;
+  quantity:      number;
+  dollarSize:    number;
+  entryTime:     Date;
+  maxHoldUntil:  Date;     // forced exit time
+  pnlPct:        number;
+  pnlDollars:    number;
+  status:        'OPEN' | 'CLOSED' | 'PENDING';
+  closeReason?:  string;
+  aiConviction:  number;
+  aiHoldMinutes: number;
+  triggerType:   string;
+}
+
+// In-memory tracker of open intraday positions
+const _openPositions = new Map<string, IntradayPosition>();
+
+export function getOpenIntradayPositions(): IntradayPosition[] {
+  return Array.from(_openPositions.values()).filter(p => p.status === 'OPEN');
+}
+
+export async function executeIntradayTrade(
+  signal: AIFilteredSignal,
+  userSettingsId: string,
+  dollarSizePerTrade: number,
+  dryRun = false,
+): Promise<{ success: boolean; positionId: string; reason?: string }> {
+
+  // Don't double-enter the same symbol
+  const existing = Array.from(_openPositions.values()).find(
+    p => p.symbol === signal.symbol && p.status === 'OPEN'
+  );
+  if (existing) return { success: false, positionId: '', reason: 'Already in position' };
+
+  const entryPrice = signal.currentPrice;
+  const quantity   = Math.floor((dollarSizePerTrade / entryPrice) * 100) / 100;
+  if (quantity <= 0) return { success: false, positionId: '', reason: 'Size too small' };
+
+  const positionId  = `intraday_${signal.symbol}_${Date.now()}`;
+  const maxHoldUntil = new Date(Date.now() + signal.aiHoldMinutes * 60_000);
+
+  // Log to AutoTradeLog
+  const log = await prisma.autoTradeLog.create({
+    data: {
+      userSettingsId,
+      sessionId:       positionId,
+      phase:           'ENTRY',
+      exchange:        signal.exchange,
+      symbol:          signal.symbol,
+      assetClass:      signal.assetClass,
+      action:          signal.direction === 'LONG' ? 'BUY' : 'SELL_SHORT',
+      status:          dryRun ? 'DRY_RUN' : 'FILLED',
+      dryRun,
+      quantity,
+      entryPrice,
+      stopLoss:        signal.suggestedStop,
+      takeProfit:      signal.suggestedTarget,
+      dollarAmount:    dollarSizePerTrade,
+      convictionScore: signal.aiConviction,
+      reason:          `INTRADAY [${signal.triggerType}] AI:${signal.aiConviction} — ${signal.aiReasoning}`,
+      metadata:        JSON.parse(JSON.stringify({ signal, maxHoldUntil: maxHoldUntil.toISOString() })),
+    },
+  });
+
+  // Execute on exchange (if not dry run)
+  if (!dryRun) {
+    if (signal.exchange === 'PAPER') {
+      try {
+        const { placeOrder: alpacaPlace } = await import('../alpaca/alpacaExchangeService');
+        const { hasAlpacaCredentials } = await import('../alpaca/alpacaConfig');
+        if (hasAlpacaCredentials()) {
+          await alpacaPlace({
+            symbol:         signal.symbol.toUpperCase(),
+            notional:       dollarSizePerTrade,
+            side:           signal.direction === 'LONG' ? 'buy' : 'sell',
+            type:           'market',
+            timeInForce:    'day',
+            userId:         userSettingsId,
+            submittedPrice: entryPrice,
+          });
+        }
+      } catch (err: any) {
+        console.warn(`[IntradayTrader] Alpaca order failed for ${signal.symbol}:`, err?.message);
+      }
+    } else if (signal.exchange === 'HYPERLIQUID') {
+      try {
+        const { placeOrder: hlPlace } = await import('../hyperliquid/hyperliquidExchangeService');
+        await hlPlace({
+          asset:     signal.symbol,
+          isBuy:     signal.direction === 'LONG',
+          size:      quantity,
+          price:     entryPrice * (signal.direction === 'LONG' ? 1.002 : 0.998), // slight slippage buffer
+          orderType: 'limit',
+          tif:       'Ioc', // immediate-or-cancel for intraday entries
+          reduceOnly: false,
+        });
+      } catch (err: any) {
+        console.warn(`[IntradayTrader] HL order failed for ${signal.symbol}:`, err?.message);
+      }
+    }
+  }
+
+  const position: IntradayPosition = {
+    id:            positionId,
+    symbol:        signal.symbol,
+    assetClass:    signal.assetClass,
+    exchange:      signal.exchange,
+    direction:     signal.direction,
+    entryPrice,
+    currentPrice:  entryPrice,
+    stopLoss:      signal.suggestedStop,
+    target:        signal.suggestedTarget,
+    quantity,
+    dollarSize:    dollarSizePerTrade,
+    entryTime:     new Date(),
+    maxHoldUntil,
+    pnlPct:        0,
+    pnlDollars:    0,
+    status:        'OPEN',
+    aiConviction:  signal.aiConviction,
+    aiHoldMinutes: signal.aiHoldMinutes,
+    triggerType:   signal.triggerType,
+  };
+
+  _openPositions.set(positionId, position);
+  console.info(`[IntradayTrader] Opened ${signal.direction} ${signal.symbol} @ $${entryPrice.toFixed(2)} | AI conviction: ${signal.aiConviction} | Max hold: ${signal.aiHoldMinutes}min`);
+
+  return { success: true, positionId: log.id };
+}
+
+export async function monitorIntradayPositions(userSettingsId: string, dryRun = false): Promise<void> {
+  const openPositions = getOpenIntradayPositions();
+  if (openPositions.length === 0) return;
+
+  // Get current prices
+  let hlMids: Record<string, string> = {};
+  try { hlMids = await getAllMids(); } catch { /* HL offline */ }
+
+  for (const pos of openPositions) {
+    try {
+      // Get current price
+      let currentPrice: number;
+      if (pos.assetClass === 'crypto') {
+        currentPrice = hlMids[pos.symbol] ? parseFloat(hlMids[pos.symbol]) : pos.currentPrice;
+      } else {
+        currentPrice = livePriceManager.getLastPrice(pos.symbol) ?? pos.currentPrice;
+      }
+
+      // Update P&L
+      const pnlPct    = pos.direction === 'LONG'
+        ? (currentPrice - pos.entryPrice) / pos.entryPrice * 100
+        : (pos.entryPrice - currentPrice) / pos.entryPrice * 100;
+      const pnlDollars = pnlPct / 100 * pos.dollarSize;
+
+      _openPositions.set(pos.id, { ...pos, currentPrice, pnlPct, pnlDollars });
+
+      const now         = new Date();
+      const isExpired   = now >= pos.maxHoldUntil;
+      const hitStop     = pos.direction === 'LONG' ? currentPrice <= pos.stopLoss : currentPrice >= pos.stopLoss;
+      const hitTarget   = pos.direction === 'LONG' ? currentPrice >= pos.target   : currentPrice <= pos.target;
+
+      // Trailing stop: once position is up 1.5%, move stop to breakeven
+      let updatedStop = pos.stopLoss;
+      if (pnlPct >= 1.5 && pos.direction === 'LONG' && pos.entryPrice > pos.stopLoss) {
+        updatedStop = Math.max(pos.stopLoss, pos.entryPrice * 1.001); // trail to just above breakeven
+        if (updatedStop !== pos.stopLoss) {
+          _openPositions.set(pos.id, { ...pos, stopLoss: updatedStop, currentPrice, pnlPct, pnlDollars });
+          console.info(`[IntradayTrader] Trailed stop for ${pos.symbol} to $${updatedStop.toFixed(2)} (breakeven+)`);
+        }
+      }
+
+      let closeReason: string | null = null;
+      if (hitStop)   closeReason = `STOP_LOSS @ $${currentPrice.toFixed(2)} (${pnlPct.toFixed(2)}%)`;
+      else if (hitTarget) closeReason = `TARGET_HIT @ $${currentPrice.toFixed(2)} (+${pnlPct.toFixed(2)}%)`;
+      else if (isExpired)  closeReason = `TIME_EXIT: ${pos.aiHoldMinutes}min hold expired (${pnlPct.toFixed(2)}%)`;
+
+      if (closeReason) {
+        await closeIntradayPosition(pos, currentPrice, closeReason, userSettingsId, dryRun);
+      }
+    } catch (err: any) {
+      console.warn(`[IntradayTrader] Monitor error for ${pos.symbol}:`, err?.message);
+    }
+  }
+
+  // Force close all intraday positions 15 min before market close (3:45 PM ET)
+  const nyHour = parseInt(new Date().toLocaleString('en-US', { timeZone: 'America/New_York', hour: 'numeric', hour12: false }), 10);
+  const nyMin  = new Date().toLocaleString('en-US', { timeZone: 'America/New_York', minute: 'numeric' });
+  if (nyHour === 15 && parseInt(nyMin) >= 45) {
+    for (const pos of getOpenIntradayPositions()) {
+      if (pos.assetClass === 'stock') {
+        const livePrice = livePriceManager.getLastPrice(pos.symbol) ?? pos.currentPrice;
+        await closeIntradayPosition(pos, livePrice, 'SESSION_END: forced close before market close', userSettingsId, dryRun);
+      }
+    }
+  }
+}
+
+async function closeIntradayPosition(
+  pos: IntradayPosition,
+  exitPrice: number,
+  reason: string,
+  userSettingsId: string,
+  dryRun: boolean,
+): Promise<void> {
+  const pnlPct    = pos.direction === 'LONG'
+    ? (exitPrice - pos.entryPrice) / pos.entryPrice * 100
+    : (pos.entryPrice - exitPrice) / pos.entryPrice * 100;
+  const pnlDollars = pnlPct / 100 * pos.dollarSize;
+
+  _openPositions.set(pos.id, { ...pos, status: 'CLOSED', currentPrice: exitPrice, pnlPct, pnlDollars, closeReason: reason });
+
+  await prisma.autoTradeLog.create({
+    data: {
+      userSettingsId,
+      sessionId:    pos.id,
+      phase:        'EXIT',
+      exchange:     pos.exchange,
+      symbol:       pos.symbol,
+      assetClass:   pos.assetClass,
+      action:       pos.direction === 'LONG' ? 'SELL' : 'BUY_TO_COVER',
+      status:       dryRun ? 'DRY_RUN' : 'FILLED',
+      dryRun,
+      quantity:     pos.quantity,
+      entryPrice:   pos.entryPrice,
+      exitPrice,
+      pnl:          pnlDollars,
+      dollarAmount: pos.dollarSize,
+      reason,
+      metadata:     JSON.parse(JSON.stringify({ entryTime: pos.entryTime, holdMinutes: Math.round((Date.now() - pos.entryTime.getTime()) / 60_000) })),
+    },
+  });
+
+  console.info(`[IntradayTrader] CLOSED ${pos.symbol} | ${reason} | PnL: ${pnlPct.toFixed(2)}% ($${pnlDollars.toFixed(2)})`);
+}
+
+export function clearClosedPositions(): void {
+  for (const [id, pos] of _openPositions) {
+    if (pos.status === 'CLOSED') _openPositions.delete(id);
+  }
+}
+```
+
+---
+
+## PHASE 4 — Wire Into Existing Intraday Monitor Loop
+
+**File**: `server/src/services/autotrader/IntradayMonitorLoop.ts`
+
+Add these imports at the top:
+```typescript
+import { scanIntradaySignals } from './IntradaySignalEngine';
+import { filterSignalsWithAI } from './IntradayAIFilter';
+import { executeIntradayTrade, monitorIntradayPositions, getOpenIntradayPositions, clearClosedPositions } from './IntradayTradeManager';
+```
+
+In the existing `runIntradayMonitor()` function, add the signal scan and execution at the end, after the existing position monitoring and session lifecycle checks:
+
+```typescript
+// ── Intraday Signal Scan + AI Execution ────────────────────────────────────
+// Only run signal scan when market is open (not pre/post market)
+// and when auto-trading is enabled for at least one exchange
+const nyHour2 = getNYHour();
+if (nyHour2 >= 9 && nyHour2 < 16) {
+  try {
+    // Monitor existing intraday positions first (exits, trailing stops, time exits)
+    for (const settings of allSettings) {
+      const config: AutoTradeConfig = {
+        ...DEFAULT_AUTO_TRADE_CONFIG,
+        ...(typeof settings.autoTradeConfig === 'object' && settings.autoTradeConfig !== null
+          ? (settings.autoTradeConfig as Partial<AutoTradeConfig>)
+          : {}),
+        enabled: settings.autoTradeEnabled,
+      };
+      await monitorIntradayPositions(settings.id, config.dryRun);
+    }
+
+    // Clean up closed positions from memory
+    clearClosedPositions();
+
+    // Only proceed if we don't already have too many open intraday positions
+    const openCount = getOpenIntradayPositions().length;
+    const MAX_INTRADAY_POSITIONS = 2; // conservative — intraday is higher risk
+    if (openCount >= MAX_INTRADAY_POSITIONS) return;
+
+    // Scan for new signals
+    const rawSignals = await scanIntradaySignals({
+      stocks: true,
+      crypto: allSettings.some(s => {
+        const cfg = s.autoTradeConfig as any;
+        return cfg?.exchange === 'HYPERLIQUID';
+      }),
+    });
+
+    if (rawSignals.length === 0) return;
+
+    // AI filter — Claude decides which signals to approve
+    const filteredSignals = await filterSignalsWithAI(rawSignals, MAX_INTRADAY_POSITIONS - openCount);
+    const approvedSignals  = filteredSignals.filter(s => s.aiApproved);
+
+    if (approvedSignals.length === 0) return;
+
+    // Execute approved signals for each user with auto-trading enabled
+    for (const settings of allSettings) {
+      const config: AutoTradeConfig = {
+        ...DEFAULT_AUTO_TRADE_CONFIG,
+        ...(typeof settings.autoTradeConfig === 'object' && settings.autoTradeConfig !== null
+          ? (settings.autoTradeConfig as Partial<AutoTradeConfig>)
+          : {}),
+        enabled: settings.autoTradeEnabled,
+      };
+
+      if (!config.enabled) continue;
+
+      // Per-trade dollar size for intraday: use 25% of the normal position size
+      // Intraday is smaller because of higher frequency and faster P&L swings
+      const intradayDollarSize = Math.max(25, (config.maxPositionPct / 100) * 1000 * 0.25);
+
+      for (const signal of approvedSignals) {
+        // Only trade on exchanges matching user's config
+        if (signal.exchange === 'HYPERLIQUID' && config.exchange !== 'HYPERLIQUID') continue;
+        if (signal.exchange === 'PAPER' && config.exchange === 'HYPERLIQUID') continue;
+
+        await executeIntradayTrade(signal, settings.id, intradayDollarSize, config.dryRun);
+      }
+    }
+  } catch (err: any) {
+    console.warn('[IntradayMonitor] Signal scan error:', err?.message);
+  }
+}
+```
+
+---
+
+## PHASE 5 — API Routes
+
+**File**: `server/src/routes/autotrader.ts`
+
+Add imports:
+```typescript
+import { scanIntradaySignals } from '../services/autotrader/IntradaySignalEngine';
+import { filterSignalsWithAI } from '../services/autotrader/IntradayAIFilter';
+import { getOpenIntradayPositions } from '../services/autotrader/IntradayTradeManager';
+```
+
+Add these three routes after the existing `/adaptive-status` route:
+
+```typescript
+// GET live intraday signals (with optional AI filter)
+router.get('/intraday/signals', async (req: Request, res: Response) => {
+  try {
+    const withAI = req.query.ai !== 'false';
+    const raw    = await scanIntradaySignals();
+    if (!withAI) return res.json({ success: true, data: { signals: raw, count: raw.length } });
+    const filtered = await filterSignalsWithAI(raw, 5);
+    return res.json({ success: true, data: { signals: filtered, count: filtered.length, approved: filtered.filter(s => s.aiApproved).length } });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err instanceof Error ? err.message : 'Signal scan error' });
+  }
+});
+
+// GET open intraday positions
+router.get('/intraday/positions', async (req: Request, res: Response) => {
+  try {
+    const positions = getOpenIntradayPositions();
+    res.json({ success: true, data: { positions, count: positions.length } });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err instanceof Error ? err.message : 'Positions error' });
+  }
+});
+
+// POST manually trigger an intraday scan + execute (for testing)
+router.post('/intraday/run', requireAuth, async (req: Request, res: Response) => {
+  try {
+    const userId   = req.session!.userId as string;
+    const settings = await getUserSettings(userId);
+    const config   = parseConfig(settings);
+    const { maxSignals = 2, dryRun } = req.body;
+    const effectiveDryRun = dryRun ?? config.dryRun;
+
+    const raw      = await scanIntradaySignals();
+    const filtered = await filterSignalsWithAI(raw, maxSignals);
+    const approved = filtered.filter(s => s.aiApproved);
+
+    const { executeIntradayTrade: execTrade } = await import('../services/autotrader/IntradayTradeManager');
+    const results = [];
+    const intradayDollarSize = Math.max(25, (config.maxPositionPct / 100) * 1000 * 0.25);
+
+    for (const signal of approved) {
+      const result = await execTrade(signal, settings.id, intradayDollarSize, effectiveDryRun);
+      results.push({ symbol: signal.symbol, direction: signal.direction, aiConviction: signal.aiConviction, aiReasoning: signal.aiReasoning, ...result });
+    }
+
+    res.json({
+      success: true,
+      data: {
+        scanned:  raw.length,
+        approved: approved.length,
+        executed: results,
+        allSignals: filtered,
+      },
+    });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err instanceof Error ? err.message : 'Intraday run error' });
+  }
+});
+```
+
+---
+
+## PHASE 6 — API Client Methods
+
+**File**: `client/src/api/client.ts`
+
+In the `autotrader` section, add:
+```typescript
+intradaySignals: (withAI = true) => get(`/autotrader/intraday/signals?ai=${withAI}`),
+intradayPositions: ()            => get('/autotrader/intraday/positions'),
+intradayRun: (params?: { maxSignals?: number; dryRun?: boolean }) => post('/autotrader/intraday/run', params ?? {}),
+```
+
+---
+
+## PHASE 7 — Intraday Panel on AutoTrader Page
+
+**File**: `client/src/pages/AutoTrader.tsx`
+
+Add these queries to the main component near the existing queries:
+
+```typescript
+const { data: intradayData, refetch: refetchIntraday } = useQuery({
+  queryKey: ['intraday-signals'],
+  queryFn:  () => api.autotrader.intradaySignals(true).then((r: any) => r.data),
+  refetchInterval: 5 * 60_000, // refresh every 5 min
+  enabled: enabled,
+});
+
+const { data: intradayPositions } = useQuery({
+  queryKey: ['intraday-positions'],
+  queryFn:  () => api.autotrader.intradayPositions().then((r: any) => r.data),
+  refetchInterval: 30_000,
+  enabled: enabled,
+});
+
+const intradayRunMut = useMutation({
+  mutationFn: (params: { maxSignals?: number; dryRun?: boolean }) => api.autotrader.intradayRun(params),
+  onSuccess: (d: any) => {
+    const r = (d as any).data;
+    toast.success(`Intraday scan: ${r.approved} approved, ${r.executed?.length ?? 0} executed`);
+    refetchIntraday();
+    qc.invalidateQueries({ queryKey: ['intraday-positions', 'autotrader-logs'] });
+  },
+  onError: (e: any) => toast.error(e?.response?.data?.error ?? 'Intraday run failed'),
+});
+```
+
+Add this card to the main dashboard, after the AI Adaptive Status card:
+
+```tsx
+{/* Intraday Trading Panel */}
+<Card className="p-4 border border-cyan-500/20">
+  <div className="flex items-center gap-2 mb-3">
+    <Zap className="h-4 w-4 text-cyan-400" />
+    <h3 className="text-sm font-bold text-white">Intraday AI Signals</h3>
+    <span className="text-xs text-slate-500">5-min momentum · AI filtered · auto-executes</span>
+    <div className="ml-auto flex items-center gap-2">
+      <button
+        onClick={() => refetchIntraday()}
+        className="p-1 text-slate-500 hover:text-slate-300 transition-colors"
+        title="Refresh signals"
+      >
+        <RefreshCw className="h-3.5 w-3.5" />
+      </button>
+      <button
+        onClick={() => intradayRunMut.mutate({ maxSignals: 2, dryRun: config?.dryRun })}
+        disabled={intradayRunMut.isPending || !enabled}
+        className="flex items-center gap-1.5 px-2.5 py-1.5 bg-cyan-500/20 border border-cyan-500/30 text-cyan-300 text-xs rounded-lg hover:bg-cyan-500/30 disabled:opacity-40 transition-colors"
+      >
+        {intradayRunMut.isPending ? <RefreshCw className="h-3 w-3 animate-spin" /> : <PlayCircle className="h-3 w-3" />}
+        Run Now
+      </button>
+    </div>
+  </div>
+
+  {/* Open intraday positions */}
+  {(intradayPositions?.positions?.length ?? 0) > 0 && (
+    <div className="mb-3 space-y-1.5">
+      <p className="text-[10px] text-slate-500 uppercase tracking-wider mb-1">Open Intraday Positions</p>
+      {intradayPositions.positions.map((p: any) => (
+        <div key={p.id} className={cn('flex items-center gap-3 text-xs rounded-lg px-3 py-2 border',
+          p.pnlPct >= 0 ? 'bg-emerald-500/10 border-emerald-500/20' : 'bg-red-500/10 border-red-500/20')}>
+          <span className={cn('font-mono font-bold', p.direction === 'LONG' ? 'text-emerald-400' : 'text-red-400')}>
+            {p.direction}
+          </span>
+          <span className="font-mono text-white font-bold">{p.symbol}</span>
+          <span className="text-slate-400">@ ${p.entryPrice.toFixed(2)}</span>
+          <span className={cn('font-mono font-bold ml-auto', p.pnlPct >= 0 ? 'text-emerald-400' : 'text-red-400')}>
+            {p.pnlPct >= 0 ? '+' : ''}{p.pnlPct.toFixed(2)}%
+          </span>
+          <span className="text-slate-500 text-[10px]">
+            {Math.round((new Date().getTime() - new Date(p.entryTime).getTime()) / 60_000)}m
+          </span>
+        </div>
+      ))}
+    </div>
+  )}
+
+  {/* Signal list */}
+  {!intradayData ? (
+    <p className="text-xs text-slate-500 text-center py-4">Enable auto-trading to see live signals</p>
+  ) : intradayData.count === 0 ? (
+    <p className="text-xs text-slate-500 text-center py-4">No intraday momentum signals detected — market may be quiet</p>
+  ) : (
+    <div className="space-y-1.5">
+      {(intradayData.signals ?? []).slice(0, 5).map((s: any) => (
+        <div key={s.symbol + s.detectedAt}
+          className={cn('flex items-center gap-2 text-xs rounded-lg px-3 py-2 border',
+            s.aiApproved
+              ? 'bg-cyan-500/10 border-cyan-500/20'
+              : 'bg-surface-2 border-surface-border opacity-50')}>
+          <span className={cn('w-2 h-2 rounded-full flex-shrink-0',
+            s.aiApproved ? 'bg-cyan-400 animate-pulse' : 'bg-slate-600')} />
+          <span className="font-mono font-bold text-white w-14">{s.symbol}</span>
+          <span className={cn('px-1.5 py-0.5 rounded text-[10px] font-bold',
+            s.direction === 'LONG' ? 'bg-emerald-500/20 text-emerald-400' : 'bg-red-500/20 text-red-400')}>
+            {s.direction}
+          </span>
+          <span className="text-slate-400 truncate flex-1">{s.aiReasoning ?? s.reasoning}</span>
+          <span className={cn('font-mono font-bold flex-shrink-0',
+            (s.aiConviction ?? s.momentumScore) >= 75 ? 'text-cyan-400' : 'text-slate-400')}>
+            {s.aiConviction ?? s.momentumScore}
+          </span>
+          {s.aiRiskWarning && (
+            <span className="text-amber-400 text-[10px]" title={s.aiRiskWarning}>⚠</span>
+          )}
+        </div>
+      ))}
+    </div>
+  )}
+
+  <p className="text-[10px] text-slate-600 mt-2">
+    Intraday trades: {config?.dryRun ? 'DRY RUN' : 'LIVE'} · Auto-runs every 5 min · Max hold: AI-decided (5–240 min) · Forced close 3:45 PM ET
+  </p>
+</Card>
+```
+
+---
+
+## SUMMARY
+
+### New Files
+```
+server/src/services/autotrader/IntradaySignalEngine.ts   — 5-min momentum scanner (VWAP, RSI, volume, breakout)
+server/src/services/autotrader/IntradayAIFilter.ts       — Claude AI go/no-go decision per signal
+server/src/services/autotrader/IntradayTradeManager.ts   — executes, monitors, trailing stops, time exits
+```
+
+### Modified Files
+```
+server/src/services/autotrader/IntradayMonitorLoop.ts    — wire in signal scan + AI execution every 5 min
+server/src/routes/autotrader.ts                         — /intraday/signals, /intraday/positions, /intraday/run
+client/src/api/client.ts                                — intradaySignals, intradayPositions, intradayRun
+client/src/pages/AutoTrader.tsx                         — Intraday AI Signals panel with live positions
+```
+
+### How the AI Decides What to Trade Intraday
+
+Every 5 minutes the signal engine scans 22 symbols (16 stocks + 6 crypto) using 5-minute bars. It looks for four patterns: VWAP reclaim/breakdown, volume surge with breakout, fast RSI momentum, and clean price breakouts. Signals below score 60 are discarded immediately.
+
+The top signals (up to 8) then go to Claude via the Anthropic API. Claude receives the signals, current regime, and VIX, then returns a JSON array deciding which ones to approve, with a conviction score, reasoning, risk warning if any, and how many minutes to hold. Claude is specifically prompted to reject anything with R:R below 1.5, anything in bear-crisis regime, and anything that looks like a false breakout.
+
+Approved signals are executed immediately as market orders. The trade manager then monitors every 5 minutes: stops are trailed to breakeven once up 1.5%, positions close at stop/target, and any stock position not closed by 3:45 PM ET is force-closed to avoid overnight gap risk.
+
+### Hold Times
+
+- **Crypto (Hyperliquid):** 15–60 minutes typical. No forced close — crypto trades 24/7.
+- **Stocks (Alpaca Paper / TOS):** 30–240 minutes typical. Force-closed at 3:45 PM ET regardless.
+- **Options:** Not traded intraday (theta decay is too destructive on <1 day trades).
+
+### What This Needs to Work
+
+- `ANTHROPIC_API_KEY` in Replit Secrets — used for the AI filter. Without it, falls back to score-based approval (signals ≥72 auto-approved).
+- `FINNHUB_API_KEY` — for live WebSocket price feeds that sharpen the 5-min bar entries.
+- Alpaca connected with Dry Run OFF for paper execution, or TOS/Hyperliquid credentials for live exchanges.

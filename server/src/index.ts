@@ -30,6 +30,8 @@ import { startLatencyMonitor } from './services/alpaca/LatencyMonitor';
 import { startDrawdownMonitor } from './services/alpaca/alpacaKillswitchService';
 import { startAdaptiveLoop } from './services/alpaca/AdaptiveParameterEngine';
 import { startUniversalAdaptiveLoop } from './services/autotrader/UniversalAdaptiveEngine';
+import { livePriceManager } from './services/market/LivePriceManager';
+import { subscribeWatchlistToTicks } from './services/autotrader/IntradaySignalEngine';
 import { getPositions } from './services/alpaca/alpacaInfoService';
 import { closePosition } from './services/alpaca/alpacaExchangeService';
 import { hasAlpacaCredentials, isPauseActive, isKillswitchActive } from './services/alpaca/alpacaConfig';
@@ -154,6 +156,8 @@ app.listen(PORT, async () => {
     });
   }, 15_000);
 
+  livePriceManager.connect();
+  subscribeWatchlistToTicks();
   startDailyScanScheduler();
   startIntradayMonitor();
   startLatencyMonitor(5_000);

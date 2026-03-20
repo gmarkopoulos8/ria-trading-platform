@@ -1,0 +1,506 @@
+# Replit Agent Prompt — Sub-Minute & 1-Minute Intraday Trading
+
+Builds on the IntradaySignalEngine from the previous prompt. Adds three capabilities:
+1. Hyperliquid 1-minute candle scanning (crypto can go sub-minute right now — no external limits)
+2. Tick-based bar aggregation for stocks using the existing Finnhub WebSocket (already connected, just needs to be started and used)
+3. A configurable scan interval so the engine can run every 60 seconds instead of every 5 minutes
+
+Only touch the files listed.
+
+---
+
+## PHASE 1 — Start Finnhub WebSocket at Server Startup
+
+`livePriceManager.connect()` is never called anywhere. The WebSocket is built but dead. Fix this first — everything else depends on live ticks.
+
+**File**: `server/src/index.ts`
+
+Add import:
+```typescript
+import { livePriceManager } from './services/market/LivePriceManager';
+```
+
+After `startAdaptiveLoop()` and `startUniversalAdaptiveLoop()`, add:
+```typescript
+// Start Finnhub WebSocket for live stock tick data
+// Used by intraday signal engine for sub-5-minute bar aggregation
+livePriceManager.connect();
+console.log('   LivePrices  : Finnhub WebSocket connecting…');
+```
+
+---
+
+## PHASE 2 — Tick-Based 1-Minute Bar Aggregator
+
+This class receives raw ticks from `livePriceManager` and builds 1-minute OHLCV bars in memory. No external API calls needed — ticks come in via WebSocket.
+
+**File**: `server/src/services/market/TickBarAggregator.ts` (NEW FILE)
+
+```typescript
+import { livePriceManager } from './LivePriceManager';
+import type { OHLCVBar } from '../technical/types';
+
+interface TickBar {
+  open:   number;
+  high:   number;
+  low:    number;
+  close:  number;
+  volume: number;   // tick count (Finnhub free doesn't give volume per tick)
+  ts:     number;   // minute timestamp (floored to minute)
+}
+
+class TickBarAggregator {
+  // Store last N completed 1-min bars per symbol
+  private _bars   = new Map<string, TickBar[]>();
+  private _current = new Map<string, TickBar>();
+  private _unsubs  = new Map<string, () => void>();
+  private readonly MAX_BARS = 60; // keep 60 minutes of 1-min bars
+
+  subscribe(symbol: string): void {
+    if (this._unsubs.has(symbol)) return; // already subscribed
+
+    const unsub = livePriceManager.subscribe(symbol, (price: number) => {
+      this._onTick(symbol, price);
+    });
+    this._unsubs.set(symbol, unsub);
+  }
+
+  unsubscribe(symbol: string): void {
+    const unsub = this._unsubs.get(symbol);
+    if (unsub) { unsub(); this._unsubs.delete(symbol); }
+  }
+
+  private _onTick(symbol: string, price: number): void {
+    const now    = Date.now();
+    const minute = Math.floor(now / 60_000) * 60_000; // floor to current minute
+
+    const current = this._current.get(symbol);
+
+    if (!current || current.ts !== minute) {
+      // Close previous bar if it exists
+      if (current) {
+        const bars = this._bars.get(symbol) ?? [];
+        bars.push(current);
+        if (bars.length > this.MAX_BARS) bars.shift();
+        this._bars.set(symbol, bars);
+      }
+      // Start new bar
+      this._current.set(symbol, { open: price, high: price, low: price, close: price, volume: 1, ts: minute });
+    } else {
+      // Update current bar
+      current.high   = Math.max(current.high, price);
+      current.low    = Math.min(current.low, price);
+      current.close  = price;
+      current.volume += 1;
+    }
+  }
+
+  getBars(symbol: string, includeCurrentPartial = true): OHLCVBar[] {
+    const completed = (this._bars.get(symbol) ?? []).map(b => this._tickBarToOHLCV(b));
+    if (!includeCurrentPartial) return completed;
+
+    const current = this._current.get(symbol);
+    if (current) {
+      completed.push(this._tickBarToOHLCV(current));
+    }
+    return completed;
+  }
+
+  hasEnoughBars(symbol: string, minBars = 10): boolean {
+    return (this._bars.get(symbol)?.length ?? 0) >= minBars;
+  }
+
+  getLastPrice(symbol: string): number | null {
+    return this._current.get(symbol)?.close ?? null;
+  }
+
+  private _tickBarToOHLCV(bar: TickBar): OHLCVBar {
+    return {
+      timestamp: new Date(bar.ts),
+      open:      bar.open,
+      high:      bar.high,
+      low:       bar.low,
+      close:     bar.close,
+      volume:    bar.volume,
+    };
+  }
+}
+
+export const tickBarAggregator = new TickBarAggregator();
+```
+
+---
+
+## PHASE 3 — Hyperliquid 1-Minute Candle Fetcher
+
+**File**: `server/src/services/hyperliquid/hyperliquidInfoService.ts`
+
+Add this function after `getCandles()`:
+
+```typescript
+export async function get1MinCandles(asset: string, count = 60): Promise<CandleSnap[]> {
+  // Fetch last `count` 1-minute candles for the given asset
+  const endMs   = Date.now();
+  const startMs = endMs - count * 60_000;
+  try {
+    return await getCandles(asset, '1m', startMs, endMs);
+  } catch {
+    // Fall back to 3-minute candles if 1m fails
+    try { return await getCandles(asset, '3m', startMs - count * 2 * 60_000, endMs); }
+    catch { return []; }
+  }
+}
+
+export function candleSnapToOHLCV(snap: CandleSnap): import('../technical/types').OHLCVBar {
+  return {
+    timestamp: new Date(snap.t),
+    open:      parseFloat(snap.o),
+    high:      parseFloat(snap.h),
+    low:       parseFloat(snap.l),
+    close:     parseFloat(snap.c),
+    volume:    parseFloat(snap.v),
+  };
+}
+```
+
+---
+
+## PHASE 4 — Upgrade IntradaySignalEngine for Multiple Timeframes
+
+**File**: `server/src/services/autotrader/IntradaySignalEngine.ts`
+
+Add these imports at the top:
+```typescript
+import { tickBarAggregator } from '../market/TickBarAggregator';
+import { get1MinCandles, candleSnapToOHLCV } from '../hyperliquid/hyperliquidInfoService';
+```
+
+Add a new `scanFastSignals()` function at the bottom of the file, which runs on 1-minute data:
+
+```typescript
+export type ScanTimeframe = '1min' | '3min' | '5min';
+
+// Subscribe all watchlist stocks to the tick aggregator
+// Call this once at startup so bars start accumulating immediately
+export function subscribeWatchlistToTicks(): void {
+  for (const symbol of INTRADAY_STOCK_WATCHLIST) {
+    tickBarAggregator.subscribe(symbol);
+    livePriceManager.subscribe(symbol, () => {}); // also ensure live price is tracked
+  }
+  console.info('[IntradayEngine] Subscribed to tick data for', INTRADAY_STOCK_WATCHLIST.length, 'symbols');
+}
+
+export async function scanFastSignals(
+  timeframe: ScanTimeframe = '1min',
+): Promise<IntradaySignal[]> {
+  const signals: IntradaySignal[] = [];
+
+  // ── Crypto: 1-minute candles from Hyperliquid ───────────────────────────
+  for (const symbol of INTRADAY_CRYPTO_WATCHLIST) {
+    try {
+      const rawCandles = await get1MinCandles(symbol, timeframe === '1min' ? 30 : 20);
+      if (rawCandles.length < 10) continue;
+
+      const bars        = rawCandles.map(candleSnapToOHLCV);
+      const currentPrice = bars[bars.length - 1].close;
+      const closes      = bars.map(b => b.close);
+
+      // Fast RSI on 1-min bars (period 7 for sensitivity)
+      const rsi = computeRSI(closes, 7);
+      const vwap = computeVWAP(bars);
+      const volSurge = computeVolumeSurge(bars);
+
+      // Price change over last 3 bars (3 minutes for 1min timeframe)
+      const shortChange = bars.length >= 4
+        ? (currentPrice - bars[bars.length - 4].close) / bars[bars.length - 4].close * 100
+        : 0;
+
+      let score     = 0;
+      let direction: 'LONG' | 'SHORT' = 'LONG';
+      let trigger: IntradaySignal['triggerType'] = 'CRYPTO_SURGE';
+      let reasoning = '';
+
+      // Scalp signal: strong 1-min momentum
+      if (rsi !== null && rsi > 68 && shortChange > 0.8 && volSurge >= 1.4) {
+        score     = 70 + Math.min(20, rsi - 65);
+        direction = 'LONG';
+        reasoning = `1-min scalp: RSI ${rsi.toFixed(0)}, +${shortChange.toFixed(2)}% in 3 bars, ${volSurge.toFixed(1)}× vol`;
+      } else if (rsi !== null && rsi < 32 && shortChange < -0.8 && volSurge >= 1.4) {
+        score     = 70 + Math.min(20, 32 - rsi);
+        direction = 'SHORT';
+        reasoning = `1-min scalp short: RSI ${rsi.toFixed(0)}, ${shortChange.toFixed(2)}% drop in 3 bars`;
+      }
+      // VWAP signal on 1-min
+      else if (currentPrice > vwap * 1.003 && bars[bars.length - 2].close < vwap && volSurge >= 1.5) {
+        score     = 68;
+        direction = 'LONG';
+        trigger   = 'VWAP_RECLAIM';
+        reasoning = `1-min VWAP reclaim at $${vwap.toFixed(2)}`;
+      }
+
+      if (score < 65) continue;
+
+      // Tighter stops for 1-min scalps
+      const stopPct   = 0.4;  // 0.4% stop — tight for scalp
+      const targetPct = 1.0;  // 1% target — 2.5:1 R:R
+      const stop   = direction === 'LONG' ? currentPrice * (1 - stopPct / 100) : currentPrice * (1 + stopPct / 100);
+      const target = direction === 'LONG' ? currentPrice * (1 + targetPct / 100) : currentPrice * (1 - targetPct / 100);
+
+      signals.push({
+        symbol, assetClass: 'crypto', exchange: 'HYPERLIQUID',
+        currentPrice, momentumScore: Math.round(score), direction, triggerType: trigger,
+        suggestedEntry: currentPrice, suggestedStop: stop, suggestedTarget: target,
+        riskRewardRatio: targetPct / stopPct,
+        reasoning: `[${timeframe}] ${reasoning}`,
+        detectedAt: new Date(), barsAnalyzed: bars.length,
+      });
+    } catch { /* skip this symbol */ }
+
+    await new Promise(r => setTimeout(r, 100)); // small delay between HL calls
+  }
+
+  // ── Stocks: tick-aggregated 1-min bars ──────────────────────────────────
+  // Only works if subscribeWatchlistToTicks() was called at startup
+  for (const symbol of INTRADAY_STOCK_WATCHLIST) {
+    try {
+      if (!tickBarAggregator.hasEnoughBars(symbol, 10)) continue;
+
+      const bars         = tickBarAggregator.getBars(symbol, true);
+      if (bars.length < 10) continue;
+
+      const currentPrice = tickBarAggregator.getLastPrice(symbol) ?? bars[bars.length - 1].close;
+      const closes       = bars.map(b => b.close);
+      const vwap         = computeVWAP(bars);
+      const rsi          = computeRSI(closes, 7);
+      const volSurge     = computeVolumeSurge(bars);
+
+      const shortChange = bars.length >= 4
+        ? (currentPrice - bars[bars.length - 4].close) / bars[bars.length - 4].close * 100
+        : 0;
+
+      let score     = 0;
+      let direction: 'LONG' | 'SHORT' = 'LONG';
+      let trigger: IntradaySignal['triggerType'] = 'RSI_MOMENTUM';
+      let reasoning = '';
+
+      if (rsi !== null && rsi > 70 && shortChange > 0.3 && volSurge >= 1.8) {
+        score     = 68 + Math.min(17, rsi - 68);
+        direction = 'LONG';
+        reasoning = `1-min tick: RSI ${rsi.toFixed(0)}, +${shortChange.toFixed(2)}% move, ${volSurge.toFixed(1)}× ticks`;
+      } else if (rsi !== null && rsi < 30 && shortChange < -0.3 && volSurge >= 1.8) {
+        score     = 68 + Math.min(17, 30 - rsi);
+        direction = 'SHORT';
+        reasoning = `1-min tick short: RSI ${rsi.toFixed(0)}, ${shortChange.toFixed(2)}% drop`;
+      } else if (currentPrice > vwap * 1.002 && bars[bars.length - 2].close < vwap && volSurge >= 2.0) {
+        score     = 72;
+        direction = 'LONG';
+        trigger   = 'VWAP_RECLAIM';
+        reasoning = `1-min VWAP reclaim (tick bars) at $${vwap.toFixed(2)}`;
+      }
+
+      if (score < 65) continue;
+
+      const stopPct   = 0.25; // tighter for liquid stocks
+      const targetPct = 0.60; // 2.4:1 R:R
+      const stop   = direction === 'LONG' ? currentPrice * (1 - stopPct / 100) : currentPrice * (1 + stopPct / 100);
+      const target = direction === 'LONG' ? currentPrice * (1 + targetPct / 100) : currentPrice * (1 - targetPct / 100);
+
+      signals.push({
+        symbol, assetClass: 'stock', exchange: 'PAPER',
+        currentPrice, momentumScore: Math.round(score), direction, triggerType: trigger,
+        suggestedEntry: currentPrice, suggestedStop: stop, suggestedTarget: target,
+        riskRewardRatio: Math.round(targetPct / stopPct * 10) / 10,
+        reasoning: `[${timeframe}] ${reasoning}`,
+        detectedAt: new Date(), barsAnalyzed: bars.length,
+      });
+    } catch { /* skip */ }
+  }
+
+  return signals.sort((a, b) => b.momentumScore - a.momentumScore);
+}
+```
+
+---
+
+## PHASE 5 — Configurable Scan Interval in IntradayMonitorLoop
+
+**File**: `server/src/services/autotrader/IntradayMonitorLoop.ts`
+
+Add import:
+```typescript
+import { scanFastSignals, subscribeWatchlistToTicks, ScanTimeframe } from './IntradaySignalEngine';
+```
+
+Replace the existing `startIntradayMonitor()` function:
+
+```typescript
+// Configurable scan interval — 60s for fast mode, 300s for standard
+let _scanIntervalMs = 5 * 60_000; // default 5 minutes
+let _scanTimeframe: ScanTimeframe = '5min';
+
+export function setIntradayScanInterval(intervalSeconds: number, timeframe: ScanTimeframe = '5min'): void {
+  _scanIntervalMs = intervalSeconds * 1_000;
+  _scanTimeframe  = timeframe;
+  console.info(`[IntradayMonitor] Scan interval set to ${intervalSeconds}s (${timeframe})`);
+}
+
+export function startIntradayMonitor(): void {
+  if (monitorInterval) return;
+
+  // Subscribe watchlist to tick aggregator for 1-min stock bars
+  subscribeWatchlistToTicks();
+
+  console.log(`[AutoTrader] Starting intraday monitor (${_scanIntervalMs / 1000}s interval, ${_scanTimeframe} timeframe)`);
+  monitorInterval = setInterval(() => {
+    runIntradayMonitor().catch((err) => {
+      console.warn('[AutoTrader] Monitor tick error:', err?.message);
+    });
+  }, _scanIntervalMs);
+}
+```
+
+In the signal scan section inside `runIntradayMonitor()`, update the scan call to use the configured timeframe:
+
+Find the existing `scanIntradaySignals()` call and replace it with:
+
+```typescript
+// Use fast scan for 1-min/3-min timeframes, standard for 5-min
+const rawSignals = _scanTimeframe === '5min'
+  ? await scanIntradaySignals({ stocks: true, crypto: cryptoEnabled })
+  : await scanFastSignals(_scanTimeframe);
+```
+
+---
+
+## PHASE 6 — Expose Scan Interval Control via API
+
+**File**: `server/src/routes/autotrader.ts`
+
+Add import:
+```typescript
+import { setIntradayScanInterval, type ScanTimeframe } from '../services/autotrader/IntradayMonitorLoop';
+```
+
+Add this route after the existing `/intraday/run` route:
+
+```typescript
+router.post('/intraday/config', requireAuth, async (req: Request, res: Response) => {
+  try {
+    const { intervalSeconds, timeframe } = req.body as { intervalSeconds: number; timeframe: ScanTimeframe };
+
+    // Bounds: minimum 30 seconds, maximum 10 minutes
+    const safeInterval  = Math.min(600, Math.max(30, intervalSeconds ?? 60));
+    const safeTimeframe: ScanTimeframe = ['1min', '3min', '5min'].includes(timeframe) ? timeframe : '1min';
+
+    setIntradayScanInterval(safeInterval, safeTimeframe);
+    res.json({ success: true, data: { intervalSeconds: safeInterval, timeframe: safeTimeframe } });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err instanceof Error ? err.message : 'Config error' });
+  }
+});
+```
+
+**File**: `client/src/api/client.ts`
+
+In the `autotrader` section, add:
+```typescript
+intradayConfig: (params: { intervalSeconds: number; timeframe: '1min' | '3min' | '5min' }) =>
+  post('/autotrader/intraday/config', params),
+```
+
+---
+
+## PHASE 7 — Speed Control in AutoTrader UI
+
+**File**: `client/src/pages/AutoTrader.tsx`
+
+Add state inside the main component:
+```typescript
+const [intradayInterval,  setIntradayInterval]  = useState(60);   // seconds
+const [intradayTimeframe, setIntradayTimeframe] = useState<'1min' | '3min' | '5min'>('1min');
+```
+
+Add mutation:
+```typescript
+const intradayConfigMut = useMutation({
+  mutationFn: () => api.autotrader.intradayConfig({ intervalSeconds: intradayInterval, timeframe: intradayTimeframe }),
+  onSuccess:  () => toast.success(`Intraday: scanning every ${intradayInterval}s on ${intradayTimeframe} bars`),
+  onError:    (e: any) => toast.error(e?.response?.data?.error ?? 'Config failed'),
+});
+```
+
+Inside the Intraday AI Signals card, add this speed control panel after the header row:
+
+```tsx
+{/* Speed Controls */}
+<div className="flex items-center gap-3 mb-3 p-2.5 bg-surface-2 rounded-lg border border-surface-border">
+  <div className="flex-1">
+    <p className="text-[10px] text-slate-500 uppercase tracking-wider mb-1">Bar Size</p>
+    <div className="flex gap-1">
+      {(['1min', '3min', '5min'] as const).map(tf => (
+        <button key={tf} onClick={() => setIntradayTimeframe(tf)}
+          className={cn('px-2 py-1 rounded text-[11px] font-mono font-medium transition-colors',
+            intradayTimeframe === tf ? 'bg-cyan-500/30 text-cyan-300 border border-cyan-500/40' : 'bg-surface-3 text-slate-500 hover:text-slate-300')}>
+          {tf}
+        </button>
+      ))}
+    </div>
+  </div>
+  <div className="flex-1">
+    <p className="text-[10px] text-slate-500 uppercase tracking-wider mb-1">Scan Every</p>
+    <div className="flex gap-1">
+      {[30, 60, 120, 300].map(s => (
+        <button key={s} onClick={() => setIntradayInterval(s)}
+          className={cn('px-2 py-1 rounded text-[11px] font-mono font-medium transition-colors',
+            intradayInterval === s ? 'bg-cyan-500/30 text-cyan-300 border border-cyan-500/40' : 'bg-surface-3 text-slate-500 hover:text-slate-300')}>
+          {s < 60 ? `${s}s` : `${s/60}m`}
+        </button>
+      ))}
+    </div>
+  </div>
+  <button
+    onClick={() => intradayConfigMut.mutate()}
+    disabled={intradayConfigMut.isPending}
+    className="px-3 py-2 bg-cyan-500/20 border border-cyan-500/30 text-cyan-300 text-xs rounded-lg hover:bg-cyan-500/30 disabled:opacity-40 transition-colors flex-shrink-0"
+  >
+    {intradayConfigMut.isPending ? <RefreshCw className="h-3 w-3 animate-spin" /> : 'Apply'}
+  </button>
+</div>
+```
+
+---
+
+## SUMMARY
+
+### New Files
+```
+server/src/services/market/TickBarAggregator.ts   — aggregates Finnhub WebSocket ticks into 1-min OHLCV bars
+```
+
+### Modified Files
+```
+server/src/index.ts                                      → start livePriceManager.connect() at startup
+server/src/services/hyperliquid/hyperliquidInfoService.ts → add get1MinCandles(), candleSnapToOHLCV()
+server/src/services/autotrader/IntradaySignalEngine.ts   → add scanFastSignals(), subscribeWatchlistToTicks()
+server/src/services/autotrader/IntradayMonitorLoop.ts    → configurable scan interval, use fast scan for 1min/3min
+server/src/routes/autotrader.ts                         → POST /intraday/config
+client/src/api/client.ts                                → intradayConfig()
+client/src/pages/AutoTrader.tsx                         → speed controls (bar size + scan interval)
+```
+
+### The honest speed limits by venue
+
+| Venue | Minimum bar size | Minimum scan interval | Practical limit |
+|-------|-----------------|----------------------|----------------|
+| Hyperliquid (crypto) | 1 minute | 30 seconds | **30–60s is ideal** |
+| Stocks via tick aggregator | ~1 minute (depends on tick volume) | 30 seconds | **60s after 10min warmup** |
+| Stocks via Yahoo Finance | 5 minutes | 5 minutes | Not changed |
+
+**Why 30 seconds is the practical minimum for stocks:**
+The tick aggregator needs to have completed at least one full minute bar before it has enough data for RSI. At market open you need about 10–15 minutes of warmup before 1-min signals are reliable. Before that, `hasEnoughBars()` returns false and the symbol is skipped silently.
+
+**Why crypto can go faster:**
+Hyperliquid's candle API has no rate limits on public endpoints and the 1-minute candle data is rock solid. The scan hits 6 crypto symbols with a 100ms delay between each — total scan time under 2 seconds. You can run this every 30 seconds without any issues.
+
+**The 30-second floor:**
+The route enforces a minimum of 30 seconds. Going faster than that would mean making API calls faster than they resolve, the AI filter wouldn't have time to complete, and you'd get overlapping scan cycles queuing up. 30–60 seconds is the sweet spot.

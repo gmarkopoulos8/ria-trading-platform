@@ -721,6 +721,42 @@ export default function AutoTrader() {
   });
   const adaptive = (adaptiveRaw as any)?.data;
 
+  const [intradayInterval,  setIntradayInterval]  = useState(60);
+  const [intradayTimeframe, setIntradayTimeframe] = useState<'1min' | '3min' | '5min'>('1min');
+
+  const { data: intradayRaw, refetch: refetchIntraday } = useQuery({
+    queryKey: ['intraday-signals'],
+    queryFn:  () => api.autotrader.intradaySignals(true).then((r: any) => r.data),
+    refetchInterval: 5 * 60_000,
+    enabled: true,
+  });
+  const intradayData = intradayRaw as any;
+
+  const { data: intradayPosRaw } = useQuery({
+    queryKey: ['intraday-positions'],
+    queryFn:  () => api.autotrader.intradayPositions().then((r: any) => r.data),
+    refetchInterval: 30_000,
+    enabled: true,
+  });
+  const intradayPositions = intradayPosRaw as any;
+
+  const intradayRunMut = useMutation({
+    mutationFn: (params: { maxSignals?: number; dryRun?: boolean }) => api.autotrader.intradayRun(params),
+    onSuccess: (d: any) => {
+      const r = (d as any).data;
+      toast.success(`Intraday scan: ${r.approved} approved, ${r.executed?.length ?? 0} executed`);
+      refetchIntraday();
+      qc.invalidateQueries({ queryKey: ['intraday-positions', 'autotrader-logs'] });
+    },
+    onError: (e: any) => toast.error(e?.response?.data?.error ?? 'Intraday run failed'),
+  });
+
+  const intradayConfigMut = useMutation({
+    mutationFn: () => api.autotrader.intradayConfig({ intervalSeconds: intradayInterval, timeframe: intradayTimeframe }),
+    onSuccess:  () => toast.success(`Intraday: scanning every ${intradayInterval}s on ${intradayTimeframe} bars`),
+    onError:    (e: any) => toast.error(e?.response?.data?.error ?? 'Config failed'),
+  });
+
   const cycleMut = useMutation({
     mutationFn: () => api.autotrader.runCycle(),
     onSuccess: (data) => {
@@ -885,6 +921,119 @@ export default function AutoTrader() {
           )}
         </Card>
       )}
+
+      {/* Intraday AI Signals Panel */}
+      <Card className="p-4 border border-cyan-500/20">
+        <div className="flex items-center gap-2 mb-3">
+          <Zap className="h-4 w-4 text-cyan-400" />
+          <h3 className="text-sm font-bold text-white">Intraday AI Signals</h3>
+          <span className="text-xs text-slate-500">5-min momentum · AI filtered · auto-executes</span>
+          <div className="ml-auto flex items-center gap-2">
+            <button onClick={() => refetchIntraday()} className="p-1 text-slate-500 hover:text-slate-300 transition-colors" title="Refresh signals">
+              <RefreshCw className="h-3.5 w-3.5" />
+            </button>
+            <button
+              onClick={() => intradayRunMut.mutate({ maxSignals: 2, dryRun: config?.dryRun })}
+              disabled={intradayRunMut.isPending}
+              className="flex items-center gap-1.5 px-2.5 py-1.5 bg-cyan-500/20 border border-cyan-500/30 text-cyan-300 text-xs rounded-lg hover:bg-cyan-500/30 disabled:opacity-40 transition-colors"
+            >
+              {intradayRunMut.isPending ? <RefreshCw className="h-3 w-3 animate-spin" /> : <PlayCircle className="h-3 w-3" />}
+              Run Now
+            </button>
+          </div>
+        </div>
+
+        {/* Speed Controls */}
+        <div className="flex items-center gap-3 mb-3 p-2.5 bg-surface-2 rounded-lg border border-surface-border">
+          <div className="flex-1">
+            <p className="text-[10px] text-slate-500 uppercase tracking-wider mb-1">Bar Size</p>
+            <div className="flex gap-1">
+              {(['1min', '3min', '5min'] as const).map(tf => (
+                <button key={tf} onClick={() => setIntradayTimeframe(tf)}
+                  className={cn('px-2 py-1 rounded text-[11px] font-mono font-medium transition-colors',
+                    intradayTimeframe === tf ? 'bg-cyan-500/30 text-cyan-300 border border-cyan-500/40' : 'bg-surface-3 text-slate-500 hover:text-slate-300')}>
+                  {tf}
+                </button>
+              ))}
+            </div>
+          </div>
+          <div className="flex-1">
+            <p className="text-[10px] text-slate-500 uppercase tracking-wider mb-1">Scan Every</p>
+            <div className="flex gap-1">
+              {[30, 60, 120, 300].map(s => (
+                <button key={s} onClick={() => setIntradayInterval(s)}
+                  className={cn('px-2 py-1 rounded text-[11px] font-mono font-medium transition-colors',
+                    intradayInterval === s ? 'bg-cyan-500/30 text-cyan-300 border border-cyan-500/40' : 'bg-surface-3 text-slate-500 hover:text-slate-300')}>
+                  {s < 60 ? `${s}s` : `${s / 60}m`}
+                </button>
+              ))}
+            </div>
+          </div>
+          <button
+            onClick={() => intradayConfigMut.mutate()}
+            disabled={intradayConfigMut.isPending}
+            className="px-3 py-2 bg-cyan-500/20 border border-cyan-500/30 text-cyan-300 text-xs rounded-lg hover:bg-cyan-500/30 disabled:opacity-40 transition-colors flex-shrink-0"
+          >
+            {intradayConfigMut.isPending ? <RefreshCw className="h-3 w-3 animate-spin" /> : 'Apply'}
+          </button>
+        </div>
+
+        {/* Open intraday positions */}
+        {(intradayPositions?.positions?.length ?? 0) > 0 && (
+          <div className="mb-3 space-y-1.5">
+            <p className="text-[10px] text-slate-500 uppercase tracking-wider mb-1">Open Intraday Positions</p>
+            {intradayPositions.positions.map((p: any) => (
+              <div key={p.id} className={cn('flex items-center gap-3 text-xs rounded-lg px-3 py-2 border',
+                p.pnlPct >= 0 ? 'bg-emerald-500/10 border-emerald-500/20' : 'bg-red-500/10 border-red-500/20')}>
+                <span className={cn('font-mono font-bold', p.direction === 'LONG' ? 'text-emerald-400' : 'text-red-400')}>{p.direction}</span>
+                <span className="font-mono text-white font-bold">{p.symbol}</span>
+                <span className="text-slate-400">@ ${p.entryPrice.toFixed(2)}</span>
+                <span className={cn('font-mono font-bold ml-auto', p.pnlPct >= 0 ? 'text-emerald-400' : 'text-red-400')}>
+                  {p.pnlPct >= 0 ? '+' : ''}{p.pnlPct.toFixed(2)}%
+                </span>
+                <span className="text-slate-500 text-[10px]">
+                  {Math.round((Date.now() - new Date(p.entryTime).getTime()) / 60_000)}m
+                </span>
+              </div>
+            ))}
+          </div>
+        )}
+
+        {/* Signal list */}
+        {!intradayData ? (
+          <p className="text-xs text-slate-500 text-center py-4">Loading signals…</p>
+        ) : intradayData.count === 0 ? (
+          <p className="text-xs text-slate-500 text-center py-4">No intraday momentum signals detected — market may be quiet</p>
+        ) : (
+          <div className="space-y-1.5">
+            {(intradayData.signals ?? []).slice(0, 5).map((s: any) => (
+              <div key={s.symbol + s.detectedAt}
+                className={cn('flex items-center gap-2 text-xs rounded-lg px-3 py-2 border',
+                  s.aiApproved
+                    ? 'bg-cyan-500/10 border-cyan-500/20'
+                    : 'bg-surface-2 border-surface-border opacity-50')}>
+                <span className={cn('w-2 h-2 rounded-full flex-shrink-0', s.aiApproved ? 'bg-cyan-400 animate-pulse' : 'bg-slate-600')} />
+                <span className="font-mono font-bold text-white w-14">{s.symbol}</span>
+                <span className={cn('px-1.5 py-0.5 rounded text-[10px] font-bold',
+                  s.direction === 'LONG' ? 'bg-emerald-500/20 text-emerald-400' : 'bg-red-500/20 text-red-400')}>
+                  {s.direction}
+                </span>
+                <span className="text-slate-400 truncate flex-1">{s.aiReasoning ?? s.reasoning}</span>
+                <span className={cn('font-mono font-bold flex-shrink-0', (s.aiConviction ?? s.momentumScore) >= 75 ? 'text-cyan-400' : 'text-slate-400')}>
+                  {s.aiConviction ?? s.momentumScore}
+                </span>
+                {s.aiRiskWarning && (
+                  <span className="text-amber-400 text-[10px]" title={s.aiRiskWarning}>⚠</span>
+                )}
+              </div>
+            ))}
+          </div>
+        )}
+
+        <p className="text-[10px] text-slate-600 mt-2">
+          Intraday trades: {config?.dryRun ? 'DRY RUN' : 'LIVE'} · Scans every {intradayInterval < 60 ? `${intradayInterval}s` : `${intradayInterval / 60}m`} on {intradayTimeframe} bars · Force close 3:45 PM ET
+        </p>
+      </Card>
 
       <Card className="p-4">
         <div className="flex items-center gap-2 mb-4">

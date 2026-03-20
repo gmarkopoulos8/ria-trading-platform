@@ -57,6 +57,28 @@ export async function getCandles(asset: string, interval = '1h', startMs?: numbe
   }
 }
 
+export async function get1MinCandles(asset: string, count = 60): Promise<CandleSnap[]> {
+  const endMs   = Date.now();
+  const startMs = endMs - count * 60_000;
+  try {
+    return await getCandles(asset, '1m', startMs, endMs);
+  } catch {
+    try { return await getCandles(asset, '3m', startMs - count * 2 * 60_000, endMs); }
+    catch { return []; }
+  }
+}
+
+export function candleSnapToOHLCV(snap: CandleSnap): import('../technical/types').OHLCVBar {
+  return {
+    timestamp: new Date(snap.t),
+    open:      parseFloat(snap.o),
+    high:      parseFloat(snap.h),
+    low:       parseFloat(snap.l),
+    close:     parseFloat(snap.c),
+    volume:    parseFloat(snap.v),
+  };
+}
+
 // ─── User State (requires wallet address) ────────────────────────
 
 export interface Position {

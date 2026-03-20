@@ -3,8 +3,26 @@ import { DEFAULT_AUTO_TRADE_CONFIG, type AutoTradeConfig } from './AutoTradeExec
 import { checkSessionActive, pauseSession } from './ExchangeAutoConfigService';
 import { isKillswitchActive as isHLStopped } from '../hyperliquid/hyperliquidConfig';
 import { isKillswitchActive as isTOSStopped } from '../tos/tosConfig';
+import { scanIntradaySignals, scanFastSignals } from './IntradaySignalEngine';
+import { filterSignalsWithAI } from './IntradayAIFilter';
+import { executeIntradayTrade, monitorIntradayPositions, getOpenIntradayPositions, clearClosedPositions } from './IntradayTradeManager';
+
+export type ScanTimeframe = '1min' | '3min' | '5min';
 
 let monitorInterval: NodeJS.Timeout | null = null;
+let _scanIntervalMs = 5 * 60_000;
+let _scanTimeframe: ScanTimeframe = '5min';
+
+export function setIntradayScanInterval(intervalSeconds: number, timeframe: ScanTimeframe): void {
+  _scanIntervalMs = intervalSeconds * 1000;
+  _scanTimeframe  = timeframe;
+  console.info(`[IntradayMonitor] Scan interval set to ${intervalSeconds}s (${timeframe})`);
+  if (monitorInterval) {
+    clearInterval(monitorInterval);
+    monitorInterval = null;
+    startIntradayMonitor();
+  }
+}
 
 function getNYHour(): number {
   const now = new Date();
@@ -189,6 +207,64 @@ export async function runIntradayMonitor(): Promise<void> {
         await runSessionLifecycleChecks(settings.userId);
       }
     }
+    // ── Intraday Signal Scan + AI Execution ──────────────────────────────────
+    const nyHour2 = getNYHour();
+    if (nyHour2 >= 9 && nyHour2 < 16) {
+      try {
+        for (const settings of allSettings) {
+          const cfg: AutoTradeConfig = {
+            ...DEFAULT_AUTO_TRADE_CONFIG,
+            ...(typeof settings.autoTradeConfig === 'object' && settings.autoTradeConfig !== null
+              ? (settings.autoTradeConfig as Partial<AutoTradeConfig>)
+              : {}),
+            enabled: settings.autoTradeEnabled,
+          };
+          await monitorIntradayPositions(settings.id, cfg.dryRun);
+        }
+
+        clearClosedPositions();
+
+        const MAX_INTRADAY_POSITIONS = 2;
+        const openCount = getOpenIntradayPositions().length;
+        if (openCount >= MAX_INTRADAY_POSITIONS) return;
+
+        const cryptoEnabled = allSettings.some(s => {
+          const cfg = s.autoTradeConfig as any;
+          return cfg?.exchange === 'HYPERLIQUID';
+        });
+
+        const rawSignals = _scanTimeframe === '5min'
+          ? await scanIntradaySignals({ stocks: true, crypto: cryptoEnabled })
+          : await scanFastSignals(_scanTimeframe);
+
+        if (rawSignals.length === 0) return;
+
+        const filteredSignals = await filterSignalsWithAI(rawSignals, MAX_INTRADAY_POSITIONS - openCount);
+        const approvedSignals  = filteredSignals.filter(s => s.aiApproved);
+        if (approvedSignals.length === 0) return;
+
+        for (const settings of allSettings) {
+          const cfg: AutoTradeConfig = {
+            ...DEFAULT_AUTO_TRADE_CONFIG,
+            ...(typeof settings.autoTradeConfig === 'object' && settings.autoTradeConfig !== null
+              ? (settings.autoTradeConfig as Partial<AutoTradeConfig>)
+              : {}),
+            enabled: settings.autoTradeEnabled,
+          };
+          if (!cfg.enabled) continue;
+
+          const intradayDollarSize = Math.max(25, (cfg.maxPositionPct / 100) * 1000 * 0.25);
+
+          for (const signal of approvedSignals) {
+            if (signal.exchange === 'HYPERLIQUID' && (cfg as any).exchange !== 'HYPERLIQUID') continue;
+            if (signal.exchange === 'PAPER' && (cfg as any).exchange === 'HYPERLIQUID') continue;
+            await executeIntradayTrade(signal, settings.id, intradayDollarSize, cfg.dryRun);
+          }
+        }
+      } catch (err: any) {
+        console.warn('[IntradayMonitor] Signal scan error:', err?.message);
+      }
+    }
   } catch (err) {
     console.error('[AutoTrader] Intraday monitor cycle error:', err instanceof Error ? err.message : err);
   }
@@ -196,12 +272,12 @@ export async function runIntradayMonitor(): Promise<void> {
 
 export function startIntradayMonitor(): void {
   if (monitorInterval) return;
-  console.log('[AutoTrader] Starting intraday monitor loop (5-min interval)');
+  console.log(`[AutoTrader] Starting intraday monitor (${_scanIntervalMs / 1000}s interval, ${_scanTimeframe} timeframe)`);
   monitorInterval = setInterval(() => {
     runIntradayMonitor().catch((err) => {
       console.warn('[AutoTrader] Monitor tick error:', err?.message);
     });
-  }, 5 * 60 * 1000);
+  }, _scanIntervalMs);
 }
 
 export function stopIntradayMonitor(): void {

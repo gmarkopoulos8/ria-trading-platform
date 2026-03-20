@@ -14,6 +14,10 @@ import {
   pauseSession,
 } from '../services/autotrader/ExchangeAutoConfigService';
 import { computeAdaptive, getCachedAdaptive, DEFAULT_BOUNDS, type AdaptiveExchange } from '../services/autotrader/UniversalAdaptiveEngine';
+import { scanIntradaySignals } from '../services/autotrader/IntradaySignalEngine';
+import { filterSignalsWithAI } from '../services/autotrader/IntradayAIFilter';
+import { getOpenIntradayPositions } from '../services/autotrader/IntradayTradeManager';
+import { setIntradayScanInterval, type ScanTimeframe } from '../services/autotrader/IntradayMonitorLoop';
 
 const router = Router();
 router.use(requireAuth);
@@ -332,6 +336,74 @@ router.post('/exchange-config/:exchange/session/pause', async (req: Request, res
     res.json({ success: true, data: { message: `${exchange} session paused` } });
   } catch (err) {
     res.status(500).json({ success: false, error: err instanceof Error ? err.message : 'Session pause error' });
+  }
+});
+
+router.get('/intraday/signals', async (req: Request, res: Response) => {
+  try {
+    const withAI = req.query.ai !== 'false';
+    const raw    = await scanIntradaySignals();
+    if (!withAI) return res.json({ success: true, data: { signals: raw, count: raw.length } });
+    const filtered = await filterSignalsWithAI(raw, 5);
+    return res.json({ success: true, data: { signals: filtered, count: filtered.length, approved: filtered.filter((s: any) => s.aiApproved).length } });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err instanceof Error ? err.message : 'Signal scan error' });
+  }
+});
+
+router.get('/intraday/positions', async (req: Request, res: Response) => {
+  try {
+    const positions = getOpenIntradayPositions();
+    res.json({ success: true, data: { positions, count: positions.length } });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err instanceof Error ? err.message : 'Positions error' });
+  }
+});
+
+router.post('/intraday/run', async (req: Request, res: Response) => {
+  try {
+    const userId   = (req as any).session?.userId as string;
+    const settings = await getUserSettings(userId);
+    const config   = parseConfig(settings);
+    const { maxSignals = 2, dryRun } = req.body;
+    const effectiveDryRun = dryRun ?? config.dryRun;
+
+    const raw      = await scanIntradaySignals();
+    const filtered = await filterSignalsWithAI(raw, maxSignals);
+    const approved = filtered.filter((s: any) => s.aiApproved);
+
+    const { executeIntradayTrade: execTrade } = await import('../services/autotrader/IntradayTradeManager');
+    const results: any[] = [];
+    const intradayDollarSize = Math.max(25, (config.maxPositionPct / 100) * 1000 * 0.25);
+
+    for (const signal of approved) {
+      const result = await execTrade(signal, settings.id, intradayDollarSize, effectiveDryRun);
+      results.push({ symbol: signal.symbol, direction: signal.direction, aiConviction: (signal as any).aiConviction, aiReasoning: (signal as any).aiReasoning, ...result });
+    }
+
+    res.json({
+      success: true,
+      data: {
+        scanned:    raw.length,
+        approved:   approved.length,
+        executed:   results,
+        allSignals: filtered,
+      },
+    });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err instanceof Error ? err.message : 'Intraday run error' });
+  }
+});
+
+router.post('/intraday/config', async (req: Request, res: Response) => {
+  try {
+    const { intervalSeconds, timeframe } = req.body as { intervalSeconds: number; timeframe: ScanTimeframe };
+    const safeInterval  = Math.min(600, Math.max(30, intervalSeconds ?? 60));
+    const safeTimeframe: ScanTimeframe = (['1min', '3min', '5min'] as const).includes(timeframe) ? timeframe : '1min';
+    setIntradayScanInterval(safeInterval, safeTimeframe);
+    res.json({ success: true, data: { intervalSeconds: safeInterval, timeframe: safeTimeframe } });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err instanceof Error ? err.message : 'Config error' });
   }
 });
 
