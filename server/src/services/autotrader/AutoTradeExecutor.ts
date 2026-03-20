@@ -89,10 +89,22 @@ async function resolveEntryPrice(signal: AutoTradeSignal): Promise<number> {
 
     if (exchange === 'PAPER') {
       try {
-        const { getLatestQuote } = await import('../alpaca/alpacaInfoService');
-        const quote = await getLatestQuote(signal.symbol);
-        if (quote && quote > 0) return quote;
+        const { getAlpacaLatestQuote, getAlpacaLatestBar } = await import('../alpaca/alpacaMarketDataService');
+        const { hasAlpacaCredentials } = await import('../alpaca/alpacaConfig');
+        if (hasAlpacaCredentials()) {
+          const quote = await getAlpacaLatestQuote(signal.symbol);
+          if (quote && quote.price > 0) return quote.price;
+          const bar = await getAlpacaLatestBar(signal.symbol);
+          if (bar && bar.close > 0) return bar.close;
+        }
       } catch { /* fall through */ }
+
+      // Fallback: Yahoo Finance (via StocksService)
+      try {
+        const { stocksService } = await import('../market/stocks/StocksService');
+        const q = await stocksService.quote(signal.symbol);
+        if (q?.price && q.price > 0) return q.price;
+      } catch { /* ignore */ }
     }
 
     // For TOS exchange, use TOS quotes

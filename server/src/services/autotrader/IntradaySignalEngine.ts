@@ -231,11 +231,29 @@ export async function scanIntradaySignals(
 // ─── Subscribe all watchlist symbols to tick aggregator ───────────────────────
 
 export function subscribeWatchlistToTicks(): void {
-  for (const symbol of INTRADAY_STOCK_WATCHLIST) {
-    tickBarAggregator.subscribe(symbol);
-    livePriceManager.subscribe(symbol, () => {});
-  }
-  console.info('[IntradayEngine] Subscribed to tick data for', INTRADAY_STOCK_WATCHLIST.length, 'symbols');
+  // Prefer Alpaca stream (authenticated, gives full 1-min OHLCV with VWAP)
+  void (async () => {
+    try {
+      const { hasAlpacaCredentials } = await import('../alpaca/alpacaConfig');
+      const { alpacaMarketStream }   = await import('../alpaca/alpacaMarketDataService');
+      if (hasAlpacaCredentials()) {
+        for (const symbol of INTRADAY_STOCK_WATCHLIST) {
+          alpacaMarketStream.subscribeBars(symbol, (sym, bar) => {
+            tickBarAggregator.ingestBar(sym, bar);
+          });
+        }
+        console.info('[IntradayEngine] Subscribed to Alpaca bar stream for', INTRADAY_STOCK_WATCHLIST.length, 'symbols');
+        return;
+      }
+    } catch { /* fall through */ }
+
+    // Fall back to Finnhub WebSocket ticks
+    for (const symbol of INTRADAY_STOCK_WATCHLIST) {
+      tickBarAggregator.subscribe(symbol);
+      livePriceManager.subscribe(symbol, () => {});
+    }
+    console.info('[IntradayEngine] Subscribed to tick data for', INTRADAY_STOCK_WATCHLIST.length, 'symbols');
+  })();
 }
 
 // ─── Fast scan using 1-min bars ───────────────────────────────────────────────

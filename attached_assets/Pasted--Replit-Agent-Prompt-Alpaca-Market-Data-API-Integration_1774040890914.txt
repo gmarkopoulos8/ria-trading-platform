@@ -1,0 +1,599 @@
+# Replit Agent Prompt — Alpaca Market Data API Integration
+
+Replace Yahoo Finance with Alpaca's Market Data API for stock bars and real-time prices. This gives faster, more reliable data with VWAP on every bar, sub-minute granularity, and an authenticated WebSocket stream — all using the Alpaca API keys that are already connected.
+
+Only touch the files listed.
+
+---
+
+## WHY THIS MATTERS
+
+Currently RIA BOT fetches stock bars from Yahoo Finance — an unofficial, unauthenticated API with 5-minute minimum granularity that can break at any time. Alpaca's Market Data API is:
+
+- **Free** with your existing paper trading API keys (uses IEX feed)
+- **1-minute bars** via REST and WebSocket stream
+- **VWAP included** on every bar (`vw` field) — no manual calculation needed
+- **Real-time WebSocket** pushes completed minute bars automatically — no polling
+- **Same credentials** already stored in `_runtimeCreds`
+- **Data URL** `https://data.alpaca.markets` is already defined in `alpacaConfig.ts` but unused
+
+---
+
+## PHASE 1 — Alpaca Market Data Service
+
+**File**: `server/src/services/alpaca/alpacaMarketDataService.ts` (NEW FILE)
+
+```typescript
+import axios from 'axios';
+import WebSocket from 'ws';
+import { ALPACA_DATA_URL, getAlpacaCredentials } from './alpacaConfig';
+import type { OHLCVBar } from '../technical/types';
+
+// ── REST: Historical Bars ─────────────────────────────────────────────────────
+
+type AlpacaTimeframe = '1Min' | '5Min' | '15Min' | '30Min' | '1Hour' | '1Day' | '1Week';
+
+interface AlpacaBar {
+  t: string;   // ISO timestamp
+  o: number;   // open
+  h: number;   // high
+  l: number;   // low
+  c: number;   // close
+  v: number;   // volume
+  vw: number;  // VWAP
+  n: number;   // trade count
+}
+
+interface AlpacaBarsResponse {
+  bars: AlpacaBar[];
+  symbol: string;
+  next_page_token?: string;
+}
+
+function alpacaBarToOHLCV(bar: AlpacaBar): OHLCVBar {
+  return {
+    timestamp: new Date(bar.t),
+    open:      bar.o,
+    high:      bar.h,
+    low:       bar.l,
+    close:     bar.c,
+    volume:    bar.v,
+    vwap:      bar.vw,   // bonus field — used by intraday signal engine
+  };
+}
+
+function authHeaders(): Record<string, string> {
+  const creds = getAlpacaCredentials();
+  if (!creds) return {};
+  return {
+    'APCA-API-KEY-ID':     creds.apiKeyId,
+    'APCA-API-SECRET-KEY': creds.secretKey,
+  };
+}
+
+// Cache to avoid hammering the API during scans
+const _barCache = new Map<string, { bars: OHLCVBar[]; ts: number }>();
+const BAR_CACHE_TTL_MS = 3 * 60_000; // 3 minutes
+
+export async function getAlpacaBars(
+  symbol:    string,
+  timeframe: AlpacaTimeframe = '1Day',
+  limit      = 100,
+  useCache   = true,
+): Promise<OHLCVBar[]> {
+  const cacheKey = `${symbol}:${timeframe}:${limit}`;
+  if (useCache) {
+    const cached = _barCache.get(cacheKey);
+    if (cached && Date.now() - cached.ts < BAR_CACHE_TTL_MS) return cached.bars;
+  }
+
+  const creds = getAlpacaCredentials();
+  if (!creds) {
+    console.warn('[AlpacaData] No credentials — cannot fetch bars');
+    return [];
+  }
+
+  try {
+    const { data } = await axios.get<AlpacaBarsResponse>(
+      `${ALPACA_DATA_URL}/v2/stocks/${symbol.toUpperCase()}/bars`,
+      {
+        headers: authHeaders(),
+        params: {
+          timeframe,
+          limit,
+          feed:   'iex',    // free feed — works with all paper accounts
+          sort:   'asc',
+        },
+        timeout: 10_000,
+      },
+    );
+
+    const bars = (data.bars ?? []).map(alpacaBarToOHLCV);
+    _barCache.set(cacheKey, { bars, ts: Date.now() });
+    return bars;
+  } catch (err: any) {
+    console.warn(`[AlpacaData] Failed to fetch bars for ${symbol}:`, err?.response?.data?.message ?? err?.message);
+    return [];
+  }
+}
+
+export async function getAlpacaLatestQuote(symbol: string): Promise<{ price: number; bid: number; ask: number } | null> {
+  const creds = getAlpacaCredentials();
+  if (!creds) return null;
+
+  try {
+    const { data } = await axios.get(
+      `${ALPACA_DATA_URL}/v2/stocks/${symbol.toUpperCase()}/quotes/latest`,
+      {
+        headers: authHeaders(),
+        params:  { feed: 'iex' },
+        timeout: 8_000,
+      },
+    );
+    const q = data?.quote;
+    if (!q) return null;
+    const mid = (q.ap + q.bp) / 2;
+    return { price: mid, bid: q.bp, ask: q.ap };
+  } catch {
+    return null;
+  }
+}
+
+export async function getAlpacaLatestBar(symbol: string): Promise<OHLCVBar | null> {
+  const creds = getAlpacaCredentials();
+  if (!creds) return null;
+
+  try {
+    const { data } = await axios.get(
+      `${ALPACA_DATA_URL}/v2/stocks/${symbol.toUpperCase()}/bars/latest`,
+      {
+        headers: authHeaders(),
+        params:  { feed: 'iex' },
+        timeout: 8_000,
+      },
+    );
+    if (!data?.bar) return null;
+    return alpacaBarToOHLCV(data.bar);
+  } catch {
+    return null;
+  }
+}
+
+// Batch latest quotes for multiple symbols in one request
+export async function getAlpacaMultiLatestBars(symbols: string[]): Promise<Record<string, OHLCVBar>> {
+  const creds = getAlpacaCredentials();
+  if (!creds || symbols.length === 0) return {};
+
+  try {
+    const { data } = await axios.get(
+      `${ALPACA_DATA_URL}/v2/stocks/bars/latest`,
+      {
+        headers: authHeaders(),
+        params:  { symbols: symbols.join(','), feed: 'iex' },
+        timeout: 12_000,
+      },
+    );
+
+    const result: Record<string, OHLCVBar> = {};
+    for (const [sym, bar] of Object.entries(data?.bars ?? {})) {
+      result[sym] = alpacaBarToOHLCV(bar as AlpacaBar);
+    }
+    return result;
+  } catch (err: any) {
+    console.warn('[AlpacaData] Multi-bar fetch failed:', err?.message);
+    return {};
+  }
+}
+
+// ── WebSocket: Real-time minute bars ─────────────────────────────────────────
+
+type BarCallback = (symbol: string, bar: OHLCVBar) => void;
+type TradeCallback = (symbol: string, price: number, size: number) => void;
+
+class AlpacaMarketStream {
+  private ws:          WebSocket | null = null;
+  private barCbs:      Map<string, Set<BarCallback>>  = new Map();
+  private tradeCbs:    Map<string, Set<TradeCallback>> = new Map();
+  private subscribed:  Set<string> = new Set();
+  private connected    = false;
+  private reconnectMs  = 2_000;
+
+  connect(): void {
+    const creds = getAlpacaCredentials();
+    if (!creds) return;
+
+    // IEX feed — free with all accounts
+    this.ws = new WebSocket('wss://stream.data.alpaca.markets/v2/iex');
+
+    this.ws.on('open', () => {
+      // Authenticate
+      this.ws!.send(JSON.stringify({ action: 'auth', key: creds.apiKeyId, secret: creds.secretKey }));
+    });
+
+    this.ws.on('message', (raw: Buffer) => {
+      try {
+        const msgs = JSON.parse(raw.toString()) as Array<Record<string, unknown>>;
+        for (const msg of msgs) {
+          if (msg.T === 'success' && msg.msg === 'authenticated') {
+            this.connected = true;
+            this.reconnectMs = 2_000;
+            console.info('[AlpacaStream] Authenticated — resubscribing');
+            this._resubscribe();
+          }
+          // Minute bar
+          else if (msg.T === 'b') {
+            const sym = msg.S as string;
+            const bar = alpacaBarToOHLCV({
+              t: msg.t as string, o: msg.o as number, h: msg.h as number,
+              l: msg.l as number, c: msg.c as number, v: msg.v as number,
+              vw: msg.vw as number, n: msg.n as number,
+            });
+            this.barCbs.get(sym)?.forEach(cb => { try { cb(sym, bar); } catch { } });
+            this.barCbs.get('*')?.forEach(cb => { try { cb(sym, bar); } catch { } });
+          }
+          // Trade tick
+          else if (msg.T === 't') {
+            const sym = msg.S as string;
+            this.tradeCbs.get(sym)?.forEach(cb => { try { cb(sym, msg.p as number, msg.s as number); } catch { } });
+          }
+        }
+      } catch { /* ignore parse errors */ }
+    });
+
+    this.ws.on('close', () => {
+      this.connected = false;
+      setTimeout(() => this.connect(), Math.min(this.reconnectMs *= 2, 30_000));
+    });
+
+    this.ws.on('error', () => {
+      this.connected = false;
+    });
+  }
+
+  private _resubscribe(): void {
+    if (!this.connected || this.subscribed.size === 0) return;
+    const syms  = Array.from(this.subscribed);
+    const hasBars   = syms.filter(s => this.barCbs.has(s) || this.barCbs.has('*'));
+    const hasTrades = syms.filter(s => this.tradeCbs.has(s));
+    this.ws!.send(JSON.stringify({
+      action: 'subscribe',
+      bars:   hasBars.length   > 0 ? hasBars   : undefined,
+      trades: hasTrades.length > 0 ? hasTrades : undefined,
+    }));
+  }
+
+  subscribeBars(symbol: string, cb: BarCallback): () => void {
+    const sym = symbol === '*' ? '*' : symbol.toUpperCase();
+    if (!this.barCbs.has(sym)) this.barCbs.set(sym, new Set());
+    this.barCbs.get(sym)!.add(cb);
+    this.subscribed.add(sym);
+    if (this.connected) {
+      this.ws!.send(JSON.stringify({ action: 'subscribe', bars: [sym] }));
+    }
+    return () => { this.barCbs.get(sym)?.delete(cb); };
+  }
+
+  subscribeTrades(symbol: string, cb: TradeCallback): () => void {
+    const sym = symbol.toUpperCase();
+    if (!this.tradeCbs.has(sym)) this.tradeCbs.set(sym, new Set());
+    this.tradeCbs.get(sym)!.add(cb);
+    this.subscribed.add(sym);
+    if (this.connected) {
+      this.ws!.send(JSON.stringify({ action: 'subscribe', trades: [sym] }));
+    }
+    return () => { this.tradeCbs.get(sym)?.delete(cb); };
+  }
+
+  getLastBarCache(): Map<string, OHLCVBar> { return this._lastBars; }
+  private _lastBars = new Map<string, OHLCVBar>();
+}
+
+export const alpacaMarketStream = new AlpacaMarketStream();
+```
+
+---
+
+## PHASE 2 — Add vwap to OHLCVBar type
+
+**File**: `server/src/services/technical/types.ts`
+
+Find the `OHLCVBar` interface and add the optional `vwap` field:
+
+```typescript
+export interface OHLCVBar {
+  timestamp: Date;
+  open:      number;
+  high:      number;
+  low:       number;
+  close:     number;
+  volume:    number;
+  vwap?:     number;   // ADD — provided by Alpaca, not Yahoo Finance
+}
+```
+
+---
+
+## PHASE 3 — Upgrade Yahoo Finance Provider to Fall Back to Alpaca
+
+**File**: `server/src/services/market/stocks/YahooFinanceProvider.ts`
+
+At the top of the file add import:
+```typescript
+import { getAlpacaBars, getAlpacaLatestQuote } from '../../alpaca/alpacaMarketDataService';
+import { hasAlpacaCredentials } from '../../alpaca/alpacaConfig';
+```
+
+Replace the `quote()` method:
+
+```typescript
+async quote(symbol: string): Promise<NormalizedQuote | null> {
+  // Try Alpaca first (authenticated, more reliable)
+  if (hasAlpacaCredentials()) {
+    try {
+      const q = await getAlpacaLatestQuote(symbol);
+      if (q && q.price > 0) {
+        return {
+          symbol:  symbol.toUpperCase(),
+          price:   q.price,
+          bid:     q.bid,
+          ask:     q.ask,
+          change:  0,
+          changePercent: 0,
+          volume:  0,
+          marketCap: undefined,
+        };
+      }
+    } catch { /* fall through to Yahoo */ }
+  }
+
+  // Fall back to Yahoo Finance
+  console.log(`[YahooFinance] Fetching quote: ${symbol}`);
+  try {
+    const { meta } = await fetchChart(symbol, '2d', '1d');
+    return {
+      symbol:       symbol.toUpperCase(),
+      price:        meta.regularMarketPrice ?? meta.chartPreviousClose ?? 0,
+      change:       meta.regularMarketPrice - meta.chartPreviousClose,
+      changePercent:((meta.regularMarketPrice - meta.chartPreviousClose) / meta.chartPreviousClose) * 100,
+      volume:       meta.regularMarketVolume ?? 0,
+      marketCap:    undefined,
+      bid:          undefined,
+      ask:          undefined,
+    };
+  } catch {
+    return null;
+  }
+}
+```
+
+Replace the `history()` method:
+
+```typescript
+async history(symbol: string, timeframe: Timeframe): Promise<OHLCVBar[]> {
+  // Use Alpaca for intraday timeframes when credentials are available
+  if (hasAlpacaCredentials() && (timeframe === '1D' || timeframe === '1W')) {
+    try {
+      const alpacaTf = timeframe === '1D' ? '1Min' : '1Hour';
+      const limit    = timeframe === '1D' ? 390 : 168; // full trading day or week
+      const bars = await getAlpacaBars(symbol, alpacaTf, limit);
+      if (bars.length > 0) return bars;
+    } catch { /* fall through */ }
+  }
+
+  // Yahoo Finance for daily/weekly/monthly
+  console.log(`[YahooFinance] Fetching history: ${symbol} (${timeframe})`);
+  const { range, interval } = TF_MAP[timeframe] ?? TF_MAP['1M'];
+  const { timestamps, ohlcv } = await fetchChart(symbol, range, interval);
+  return timestamps.map((ts, i) => ({
+    timestamp: new Date(ts * 1000),
+    open:      ohlcv.o[i],
+    high:      ohlcv.h[i],
+    low:       ohlcv.l[i],
+    close:     ohlcv.c[i],
+    volume:    ohlcv.v[i],
+  })).filter(b => b.close > 0);
+}
+```
+
+---
+
+## PHASE 4 — Upgrade Entry Price Resolution
+
+**File**: `server/src/services/autotrader/AutoTradeExecutor.ts`
+
+Replace the PAPER path in `resolveEntryPrice`:
+
+```typescript
+// For PAPER: use Alpaca market data directly
+if (exchange === 'PAPER') {
+  try {
+    const { getAlpacaLatestQuote, getAlpacaLatestBar } = await import('../alpaca/alpacaMarketDataService');
+    const { hasAlpacaCredentials } = await import('../alpaca/alpacaConfig');
+    if (hasAlpacaCredentials()) {
+      const quote = await getAlpacaLatestQuote(signal.symbol);
+      if (quote && quote.price > 0) return quote.price;
+      const bar = await getAlpacaLatestBar(signal.symbol);
+      if (bar && bar.close > 0) return bar.close;
+    }
+  } catch { /* fall through */ }
+
+  // Fallback: Yahoo Finance
+  try {
+    const { stocksService } = await import('../market/stocks/StocksService');
+    const q = await stocksService.quote(signal.symbol);
+    if (q?.price && q.price > 0) return q.price;
+  } catch { /* ignore */ }
+}
+```
+
+---
+
+## PHASE 5 — Wire Stream at Startup + Subscribe Watchlist
+
+**File**: `server/src/index.ts`
+
+Add import:
+```typescript
+import { alpacaMarketStream } from './services/alpaca/alpacaMarketDataService';
+```
+
+Inside `app.listen`, after `livePriceManager.connect()`, add:
+```typescript
+// Start Alpaca real-time market data stream for stocks
+// Subscribes to minute bars for the intraday watchlist
+if (process.env.ALPACA_API_KEY_ID || process.env.ALPACA_API_KEY) {
+  alpacaMarketStream.connect();
+  console.log('   AlpacaData : WebSocket stream connecting…');
+}
+```
+
+---
+
+## PHASE 6 — Use Alpaca Stream in Intraday Signal Engine
+
+**File**: `server/src/services/autotrader/IntradaySignalEngine.ts`
+
+Add import at top:
+```typescript
+import { alpacaMarketStream, getAlpacaBars } from '../alpaca/alpacaMarketDataService';
+import { hasAlpacaCredentials } from '../alpaca/alpacaConfig';
+```
+
+Replace `subscribeWatchlistToTicks()` with:
+```typescript
+export function subscribeWatchlistToTicks(): void {
+  // Prefer Alpaca stream (authenticated, gives full 1-min OHLCV with VWAP)
+  if (hasAlpacaCredentials()) {
+    for (const symbol of INTRADAY_STOCK_WATCHLIST) {
+      alpacaMarketStream.subscribeBars(symbol, (sym, bar) => {
+        // Store in tick aggregator for signal engine to read
+        tickBarAggregator.ingestBar(sym, bar);
+      });
+    }
+    console.info('[IntradayEngine] Subscribed to Alpaca bar stream for', INTRADAY_STOCK_WATCHLIST.length, 'symbols');
+    return;
+  }
+
+  // Fall back to Finnhub WebSocket ticks
+  for (const symbol of INTRADAY_STOCK_WATCHLIST) {
+    tickBarAggregator.subscribe(symbol);
+    livePriceManager.subscribe(symbol, () => {});
+  }
+  console.info('[IntradayEngine] Subscribed to Finnhub tick data for', INTRADAY_STOCK_WATCHLIST.length, 'symbols');
+}
+```
+
+**File**: `server/src/services/market/TickBarAggregator.ts`
+
+Add a method to ingest a complete bar directly (no tick aggregation needed when Alpaca pushes full bars):
+```typescript
+ingestBar(symbol: string, bar: OHLCVBar): void {
+  const bars = this._bars.get(symbol) ?? [];
+  bars.push({
+    open:   bar.open,
+    high:   bar.high,
+    low:    bar.low,
+    close:  bar.close,
+    volume: bar.volume,
+    ts:     bar.timestamp.getTime(),
+  });
+  if (bars.length > this.MAX_BARS) bars.shift();
+  this._bars.set(symbol, bars);
+  // Update current price
+  const current = this._current.get(symbol) ?? { open: bar.close, high: bar.close, low: bar.close, close: bar.close, volume: 0, ts: bar.timestamp.getTime() };
+  current.close = bar.close;
+  this._current.set(symbol, current);
+}
+```
+
+---
+
+## PHASE 7 — Add Alpaca Market Data Route
+
+Expose the Alpaca market data to the frontend so charts and signals can use it.
+
+**File**: `server/src/routes/alpaca.ts`
+
+Add these two routes after the existing `/clock` route:
+
+```typescript
+// GET historical bars for a symbol (uses Alpaca Data API)
+router.get('/market-data/bars/:symbol', requireAuth, async (req: Request, res: Response) => {
+  try {
+    const { symbol }    = req.params;
+    const timeframe     = (req.query.timeframe as string) ?? '1Day';
+    const limit         = Math.min(500, parseInt(String(req.query.limit ?? '100'), 10));
+
+    const { getAlpacaBars } = await import('../services/alpaca/alpacaMarketDataService');
+    const bars = await getAlpacaBars(symbol.toUpperCase(), timeframe as any, limit, false);
+
+    res.json({ success: true, data: { symbol: symbol.toUpperCase(), timeframe, bars, count: bars.length } });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err instanceof Error ? err.message : 'Failed to fetch bars' });
+  }
+});
+
+// GET latest quote for a symbol
+router.get('/market-data/quote/:symbol', requireAuth, async (req: Request, res: Response) => {
+  try {
+    const { symbol } = req.params;
+    const { getAlpacaLatestQuote, getAlpacaLatestBar } = await import('../services/alpaca/alpacaMarketDataService');
+    const [quote, bar] = await Promise.all([
+      getAlpacaLatestQuote(symbol.toUpperCase()),
+      getAlpacaLatestBar(symbol.toUpperCase()),
+    ]);
+    res.json({ success: true, data: { symbol: symbol.toUpperCase(), quote, bar } });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err instanceof Error ? err.message : 'Failed to fetch quote' });
+  }
+});
+```
+
+**File**: `client/src/api/client.ts`
+
+In the `alpaca` section add:
+```typescript
+marketBars:  (symbol: string, timeframe?: string, limit?: number) =>
+  get(`/alpaca/market-data/bars/${symbol}`, { timeframe: timeframe ?? '1Day', limit: limit ?? 100 }),
+marketQuote: (symbol: string) =>
+  get(`/alpaca/market-data/quote/${symbol}`),
+```
+
+---
+
+## SUMMARY
+
+### New Files
+```
+server/src/services/alpaca/alpacaMarketDataService.ts   — REST bars + WebSocket stream
+```
+
+### Modified Files
+```
+server/src/services/technical/types.ts                   → add optional vwap to OHLCVBar
+server/src/services/market/stocks/YahooFinanceProvider.ts → use Alpaca for quote() and intraday history(), Yahoo as fallback
+server/src/services/autotrader/AutoTradeExecutor.ts      → PAPER entry price uses Alpaca quote directly
+server/src/services/market/TickBarAggregator.ts          → add ingestBar() for complete bars
+server/src/services/autotrader/IntradaySignalEngine.ts   → use Alpaca stream instead of Finnhub ticks
+server/src/routes/alpaca.ts                              → /market-data/bars/:symbol, /market-data/quote/:symbol
+server/src/index.ts                                      → start Alpaca stream at startup
+client/src/api/client.ts                                 → alpaca.marketBars(), alpaca.marketQuote()
+```
+
+### Data Flow After This
+
+| Use case | Before | After |
+|----------|--------|-------|
+| Stock quote for entry price | Yahoo Finance (unofficial) | Alpaca latest quote (authenticated) |
+| Intraday 1-min bars | Yahoo 5-min only | Alpaca 1-min with VWAP |
+| Daily/weekly bars | Yahoo Finance | Yahoo Finance (unchanged — still reliable for longer timeframes) |
+| Real-time bar stream | Finnhub WebSocket ticks → aggregate manually | Alpaca WebSocket pushes completed 1-min bars automatically |
+| VWAP calculation | Computed manually from closes (less accurate) | Native `vw` field from Alpaca |
+
+### No New Secrets Needed
+
+Everything uses `ALPACA_API_KEY_ID` + `ALPACA_API_SECRET` which are already stored from when you connected your Alpaca paper account. The IEX feed is free for all accounts — no plan upgrade required.
+
+### One Thing to Watch
+
+The IEX feed covers ~2.5% of US market volume. For paper trading signals this is fine — the prices are real, just from one exchange. If you ever want full consolidated pricing (SIP feed), that requires an Alpaca subscription upgrade, but for the purposes of this platform IEX is perfectly sufficient.

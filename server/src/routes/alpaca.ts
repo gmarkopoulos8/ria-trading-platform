@@ -740,4 +740,39 @@ router.post('/auto/adjust', requireAuth, async (req: Request, res: Response) => 
   }
 });
 
+// GET historical bars for a symbol via Alpaca Market Data API
+router.get('/market-data/bars/:symbol', requireAuth, async (req: Request, res: Response) => {
+  try {
+    const { symbol } = req.params;
+    const timeframe  = (req.query.timeframe as string) ?? '1Day';
+    const limit      = parseInt(req.query.limit as string ?? '100', 10);
+    const { getAlpacaBars } = await import('../services/alpaca/alpacaMarketDataService');
+    const { hasAlpacaCredentials } = await import('../services/alpaca/alpacaConfig');
+    if (!hasAlpacaCredentials()) {
+      return res.status(503).json({ success: false, error: 'Alpaca credentials not configured' });
+    }
+    const bars = await getAlpacaBars(symbol.toUpperCase(), timeframe as any, isNaN(limit) ? 100 : limit);
+    res.json({ success: true, data: { symbol: symbol.toUpperCase(), bars, count: bars.length } });
+  } catch (err: any) {
+    res.status(500).json({ success: false, error: err?.message ?? 'Failed to fetch bars' });
+  }
+});
+
+// GET latest quote for a symbol via Alpaca Market Data API
+router.get('/market-data/quote/:symbol', requireAuth, async (req: Request, res: Response) => {
+  try {
+    const { symbol } = req.params;
+    const { getAlpacaLatestQuote } = await import('../services/alpaca/alpacaMarketDataService');
+    const { hasAlpacaCredentials } = await import('../services/alpaca/alpacaConfig');
+    if (!hasAlpacaCredentials()) {
+      return res.status(503).json({ success: false, error: 'Alpaca credentials not configured' });
+    }
+    const quote = await getAlpacaLatestQuote(symbol.toUpperCase());
+    if (!quote) return res.status(404).json({ success: false, error: 'No quote available' });
+    res.json({ success: true, data: { symbol: symbol.toUpperCase(), ...quote } });
+  } catch (err: any) {
+    res.status(500).json({ success: false, error: err?.message ?? 'Failed to fetch quote' });
+  }
+});
+
 export default router;

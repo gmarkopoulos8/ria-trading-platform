@@ -1,10 +1,11 @@
 export interface OHLCVBar {
   timestamp: Date;
-  open: number;
-  high: number;
-  low: number;
-  close: number;
-  volume: number;
+  open:      number;
+  high:      number;
+  low:       number;
+  close:     number;
+  volume:    number;
+  vwap?:     number;
 }
 
 export type SignalDirection = 'BULLISH' | 'BEARISH' | 'NEUTRAL';

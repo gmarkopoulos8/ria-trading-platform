@@ -11,6 +11,8 @@
 
 import axios, { type AxiosInstance } from 'axios';
 import { IStocksProvider, SearchResult, NormalizedQuote, OHLCVBar, Timeframe } from '../types';
+import { getAlpacaBars, getAlpacaLatestQuote } from '../../alpaca/alpacaMarketDataService';
+import { hasAlpacaCredentials } from '../../alpaca/alpacaConfig';
 
 const YF_USER_AGENT = 'Mozilla/5.0 (compatible; RIA-BOT/1.0)';
 
@@ -101,55 +103,80 @@ async function fetchChart(symbol: string, range: string, interval: string): Prom
 
 export class YahooFinanceProvider implements IStocksProvider {
   async quote(symbol: string): Promise<NormalizedQuote> {
+    // Try Alpaca first (authenticated, more reliable)
+    if (hasAlpacaCredentials()) {
+      try {
+        const q = await getAlpacaLatestQuote(symbol);
+        if (q && q.price > 0) {
+          return {
+            symbol:        symbol.toUpperCase(),
+            price:         q.price,
+            bid:           q.bid,
+            ask:           q.ask,
+            change:        0,
+            changePercent: 0,
+            volume:        0,
+            marketCap:     undefined,
+          } as NormalizedQuote;
+        }
+      } catch { /* fall through to Yahoo */ }
+    }
+
+    // Fall back to Yahoo Finance
     console.log(`[YahooFinance] Fetching quote: ${symbol}`);
     const { meta } = await fetchChart(symbol, '2d', '1d');
 
-    const price = meta.regularMarketPrice ?? 0;
+    const price     = meta.regularMarketPrice ?? 0;
     const prevClose = meta.previousClose ?? meta.chartPreviousClose ?? price;
-    const change = meta.regularMarketChange ?? (price - prevClose);
+    const change    = meta.regularMarketChange ?? (price - prevClose);
     const changePct = meta.regularMarketChangePercent ?? (prevClose > 0 ? (change / prevClose) * 100 : 0);
 
     return {
-      symbol:          meta.symbol ?? symbol.toUpperCase(),
-      name:            meta.longName ?? meta.shortName ?? symbol.toUpperCase(),
+      symbol:        meta.symbol ?? symbol.toUpperCase(),
+      name:          meta.longName ?? meta.shortName ?? symbol.toUpperCase(),
       price,
-      open:            meta.regularMarketOpen ?? price,
-      high:            meta.regularMarketDayHigh ?? price,
-      low:             meta.regularMarketDayLow ?? price,
-      previousClose:   prevClose,
-      change:          parseFloat(change.toFixed(4)),
-      changePercent:   parseFloat(changePct.toFixed(4)),
-      volume:          meta.regularMarketVolume ?? 0,
-      marketCap:       meta.marketCap,
-      high52Week:      meta.fiftyTwoWeekHigh,
-      low52Week:       meta.fiftyTwoWeekLow,
-      currency:        meta.currency ?? 'USD',
-      assetClass:      exchangeToAssetClass(meta.exchangeName ?? ''),
-      exchange:        meta.exchangeName,
-      timestamp:       new Date(),
-      isMock:          false,
+      open:          meta.regularMarketOpen ?? price,
+      high:          meta.regularMarketDayHigh ?? price,
+      low:           meta.regularMarketDayLow ?? price,
+      previousClose: prevClose,
+      change:        parseFloat(change.toFixed(4)),
+      changePercent: parseFloat(changePct.toFixed(4)),
+      volume:        meta.regularMarketVolume ?? 0,
+      marketCap:     meta.marketCap,
+      high52Week:    meta.fiftyTwoWeekHigh,
+      low52Week:     meta.fiftyTwoWeekLow,
+      currency:      meta.currency ?? 'USD',
+      assetClass:    exchangeToAssetClass(meta.exchangeName ?? ''),
+      exchange:      meta.exchangeName,
+      timestamp:     new Date(),
+      isMock:        false,
     };
   }
 
   async history(symbol: string, timeframe: Timeframe): Promise<OHLCVBar[]> {
+    // Use Alpaca for intraday timeframes when credentials are available
+    if (hasAlpacaCredentials() && (timeframe === '1D' || timeframe === '1W')) {
+      try {
+        const alpacaTf = timeframe === '1D' ? '1Min' : '1Hour';
+        const limit    = timeframe === '1D' ? 390 : 168;
+        const bars     = await getAlpacaBars(symbol, alpacaTf, limit);
+        if (bars.length > 0) return bars;
+      } catch { /* fall through */ }
+    }
+
+    // Yahoo Finance for daily/weekly/monthly
     console.log(`[YahooFinance] Fetching history: ${symbol} (${timeframe})`);
-    const { range, interval } = TF_MAP[timeframe] ?? TF_MAP['1M'];
+    const { range, interval }  = TF_MAP[timeframe] ?? TF_MAP['1M'];
     const { timestamps, ohlcv } = await fetchChart(symbol, range, interval);
 
-    const bars: OHLCVBar[] = [];
-    for (let i = 0; i < timestamps.length; i++) {
-      const c = ohlcv.c[i];
-      if (c == null || isNaN(c)) continue;
-      bars.push({
-        timestamp:  new Date(timestamps[i] * 1000),
-        open:       ohlcv.o[i] ?? c,
-        high:       ohlcv.h[i] ?? c,
-        low:        ohlcv.l[i] ?? c,
-        close:      c,
-        volume:     ohlcv.v[i] ?? 0,
-      });
-    }
-    return bars;
+    return timestamps.map((ts, i) => ({
+      timestamp: new Date(ts * 1000),
+      open:      ohlcv.o[i],
+      high:      ohlcv.h[i],
+      low:       ohlcv.l[i],
+      close:     ohlcv.c[i],
+      volume:    ohlcv.v[i],
+    })).filter(b => b.close > 0);
   }
 
   async search(query: string): Promise<SearchResult[]> {

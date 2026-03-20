@@ -294,6 +294,10 @@ export const api = {
       post('/alpaca/auto/monitor', params),
     autoStatus:  () => get('/alpaca/auto/status'),
     autoAdjust:  (params: { base: any; bounds: any }) => post('/alpaca/auto/adjust', params),
+    marketBars:  (symbol: string, timeframe?: string, limit?: number) =>
+      get(`/alpaca/market-data/bars/${symbol}`, { timeframe: timeframe ?? '1Day', limit: limit ?? 100 }),
+    marketQuote: (symbol: string) =>
+      get(`/alpaca/market-data/quote/${symbol}`),
   },
 
   credentials: {

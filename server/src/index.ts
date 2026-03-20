@@ -32,6 +32,7 @@ import { startDrawdownMonitor } from './services/alpaca/alpacaKillswitchService'
 import { startAdaptiveLoop } from './services/alpaca/AdaptiveParameterEngine';
 import { startUniversalAdaptiveLoop } from './services/autotrader/UniversalAdaptiveEngine';
 import { livePriceManager } from './services/market/LivePriceManager';
+import { alpacaMarketStream } from './services/alpaca/alpacaMarketDataService';
 import { subscribeWatchlistToTicks } from './services/autotrader/IntradaySignalEngine';
 import { getPositions } from './services/alpaca/alpacaInfoService';
 import { closePosition } from './services/alpaca/alpacaExchangeService';
@@ -181,6 +182,10 @@ app.listen(PORT, async () => {
   }, 15_000);
 
   livePriceManager.connect();
+  if (hasAlpacaCredentials()) {
+    alpacaMarketStream.connect();
+    console.log('   AlpacaData : WebSocket stream connecting…');
+  }
   subscribeWatchlistToTicks();
   startDailyScanScheduler();
   startIntradayMonitor();

@@ -66,6 +66,23 @@ class TickBarAggregator {
     return this._current.get(symbol)?.close ?? null;
   }
 
+  ingestBar(symbol: string, bar: OHLCVBar): void {
+    const bars = this._bars.get(symbol) ?? [];
+    bars.push({
+      open:   bar.open,
+      high:   bar.high,
+      low:    bar.low,
+      close:  bar.close,
+      volume: bar.volume,
+      ts:     bar.timestamp.getTime(),
+    });
+    if (bars.length > this.MAX_BARS) bars.shift();
+    this._bars.set(symbol, bars);
+    const current = this._current.get(symbol) ?? { open: bar.close, high: bar.close, low: bar.close, close: bar.close, volume: 0, ts: bar.timestamp.getTime() };
+    current.close = bar.close;
+    this._current.set(symbol, current);
+  }
+
   private _toOHLCV(bar: TickBar): OHLCVBar {
     return {
       timestamp: new Date(bar.ts),
