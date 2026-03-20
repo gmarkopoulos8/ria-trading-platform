@@ -23,6 +23,7 @@ export interface RunScanOptions {
   skipDuplicateCheck?: boolean;
   fullUniverse?: boolean;
   filterCriteria?: Partial<FilterCriteria>;
+  existingScanRunId?: string;
 }
 
 export async function runDailyScan(opts: RunScanOptions = {}): Promise<string> {
@@ -35,6 +36,7 @@ export async function runDailyScan(opts: RunScanOptions = {}): Promise<string> {
     skipDuplicateCheck = false,
     fullUniverse = false,
     filterCriteria = {},
+    existingScanRunId,
   } = opts;
 
   if (!skipDuplicateCheck) {
@@ -45,10 +47,14 @@ export async function runDailyScan(opts: RunScanOptions = {}): Promise<string> {
     }
   }
 
-  const scanRun = await createScanRun({ runType, marketSession, assetScope, riskMode, scheduledFor, isFullUniverseScan: fullUniverse });
+  const scanRun = existingScanRunId
+    ? { id: existingScanRunId }
+    : await createScanRun({ runType, marketSession, assetScope, riskMode, scheduledFor, isFullUniverseScan: fullUniverse });
   console.log(`[DailyScan] Starting scan run ${scanRun.id} (${runType}/${marketSession})`);
 
-  await markRunStarted(scanRun.id);
+  if (!existingScanRunId) {
+    await markRunStarted(scanRun.id);
+  }
 
   const useFullUniverse = fullUniverse && process.env.ENABLE_FULL_UNIVERSE_SCAN === 'true' && !!process.env.FINNHUB_API_KEY;
 

@@ -7,6 +7,9 @@ import {
   getRunResults,
   getLatestCompletedRun,
   getSymbolRankingHistory,
+  createScanRun,
+  markRunStarted,
+  hasDuplicateRunToday,
 } from '../services/scans/scanPersistenceService';
 import {
   getSchedulerStatus,
@@ -20,26 +23,41 @@ router.use(requireAuth);
 router.post('/trigger', async (req: Request, res: Response) => {
   try {
     const {
-      runType = 'MANUAL',
+      runType       = 'MANUAL',
       marketSession = 'MARKET_OPEN',
-      assetScope = 'ALL',
-      riskMode = 'ALL',
-      force = false,
-      fullUniverse = false,
+      assetScope    = 'ALL',
+      riskMode      = 'ALL',
+      force         = false,
+      fullUniverse  = false,
       filterCriteria = {},
     } = req.body ?? {};
 
-    const scanRunId = await runDailyScan({
+    if (!(force === true || force === 'true')) {
+      const isDuplicate = await hasDuplicateRunToday(runType, marketSession);
+      if (isDuplicate) {
+        return res.status(400).json({ success: false, error: 'A scan for this session already completed today. Use force=true to override.' });
+      }
+    }
+
+    const scanRun = await createScanRun({ runType, marketSession, assetScope, riskMode, isFullUniverseScan: fullUniverse });
+    await markRunStarted(scanRun.id);
+
+    // Respond immediately with the scan ID — scan runs in the background
+    res.json({ success: true, data: { scanRunId: scanRun.id } });
+
+    runDailyScan({
       runType,
       marketSession,
       assetScope,
       riskMode,
-      skipDuplicateCheck: force === true || force === 'true',
+      skipDuplicateCheck: true,
       fullUniverse,
       filterCriteria,
+      existingScanRunId: scanRun.id,
+    }).catch((err) => {
+      console.error('[Trigger] Background scan failed:', err?.message);
     });
 
-    res.json({ success: true, data: { scanRunId } });
   } catch (err) {
     const message = err instanceof Error ? err.message : 'Scan trigger failed';
     res.status(400).json({ success: false, error: message });

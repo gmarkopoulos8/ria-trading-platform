@@ -1,0 +1,62 @@
+The /trigger route does await runDailyScan(...) — meaning the entire 2–5 minute scan runs inside a single HTTP request. On Replit, HTTP requests time out after ~30 seconds. When it times out, the client gets an error, the scan ID is never returned, but the scan keeps running in the background. The UI has no ID to connect to, so it stays on "Initializing" forever.
+Fix — make the trigger non-blocking:
+In server/src/routes/daily-scans.ts, find the /trigger route and replace it:
+typescriptrouter.post('/trigger', async (req: Request, res: Response) => {
+  try {
+    const {
+      runType       = 'MANUAL',
+      marketSession = 'MARKET_OPEN',
+      assetScope    = 'ALL',
+      riskMode      = 'ALL',
+      force         = false,
+      fullUniverse  = false,
+      filterCriteria = {},
+    } = req.body ?? {};
+
+    // Create the scan run record immediately so we have an ID to return
+    const { createScanRun, markRunStarted, hasDuplicateRunToday } = await import('../services/scans/scanPersistenceService');
+
+    if (!(force === true || force === 'true')) {
+      const isDuplicate = await hasDuplicateRunToday(runType, marketSession);
+      if (isDuplicate) {
+        return res.status(400).json({ success: false, error: 'A scan for this session already completed today. Use force=true to override.' });
+      }
+    }
+
+    const scanRun = await createScanRun({ runType, marketSession, assetScope, riskMode, isFullUniverseScan: fullUniverse });
+    await markRunStarted(scanRun.id);
+
+    // Return the scan ID immediately — scan runs in background
+    res.json({ success: true, data: { scanRunId: scanRun.id } });
+
+    // Run the scan asynchronously after responding
+    const { runDailyScan } = await import('../services/scans/dailyScanOrchestrator');
+    runDailyScan({
+      runType,
+      marketSession,
+      assetScope,
+      riskMode,
+      skipDuplicateCheck: true,   // already checked above
+      fullUniverse,
+      filterCriteria,
+      existingScanRunId: scanRun.id, // pass the pre-created run ID
+    }).catch((err) => {
+      console.error('[Trigger] Background scan failed:', err?.message);
+    });
+
+  } catch (err) {
+    const message = err instanceof Error ? err.message : 'Scan trigger failed';
+    res.status(400).json({ success: false, error: message });
+  }
+});
+Then update dailyScanOrchestrator.ts to accept an existingScanRunId option so it doesn't create a duplicate record:
+In RunScanOptions interface add:
+typescriptexistingScanRunId?: string;
+In runDailyScan(), replace the createScanRun + markRunStarted calls at the top with:
+typescriptconst scanRun = opts.existingScanRunId
+  ? { id: opts.existingScanRunId }
+  : await createScanRun({ runType, marketSession, assetScope, riskMode, scheduledFor, isFullUniverseScan: fullUniverse });
+
+if (!opts.existingScanRunId) {
+  await markRunStarted(scanRun.id);
+}
