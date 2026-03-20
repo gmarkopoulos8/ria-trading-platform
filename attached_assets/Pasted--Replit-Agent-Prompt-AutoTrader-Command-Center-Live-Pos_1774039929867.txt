@@ -1,11 +1,262 @@
-import { useState } from 'react';
+# Replit Agent Prompt — AutoTrader Command Center + Live Positions + Claude AI + Alpaca Panel
+
+This rebuilds the AutoTrader page into a true command center. It adds live positions across all three exchanges, an Alpaca-specific control panel, and Claude AI making the final go/no-go decision on every trade. All underlying APIs already exist — this is entirely UI + wiring work plus one new server endpoint.
+
+Only touch the files listed.
+
+---
+
+## PART A — New Server Endpoint: Unified Live Positions
+
+We need one endpoint that returns live positions from all connected exchanges simultaneously. Add this to the autotrader routes.
+
+**File**: `server/src/routes/autotrader.ts`
+
+Add this route after the existing `/logs` route:
+
+```typescript
+// GET unified live positions from all connected exchanges
+router.get('/live-positions', async (req: Request, res: Response) => {
+  try {
+    const positions: Array<{
+      exchange: string;
+      symbol: string;
+      side: 'long' | 'short';
+      size: number;
+      entryPrice: number;
+      currentPrice: number;
+      unrealizedPnl: number;
+      unrealizedPnlPct: number;
+      marketValue: number;
+    }> = [];
+
+    // Alpaca paper positions
+    try {
+      const { getPositions: getAlpacaPositions } = await import('../services/alpaca/alpacaInfoService');
+      const { hasAlpacaCredentials } = await import('../services/alpaca/alpacaConfig');
+      if (hasAlpacaCredentials()) {
+        const alpacaPos = await getAlpacaPositions();
+        for (const p of (alpacaPos ?? [])) {
+          positions.push({
+            exchange:         'PAPER',
+            symbol:           p.symbol,
+            side:             p.side === 'long' ? 'long' : 'short',
+            size:             parseFloat(p.qty ?? '0'),
+            entryPrice:       parseFloat(p.avg_entry_price ?? '0'),
+            currentPrice:     parseFloat(p.current_price ?? '0'),
+            unrealizedPnl:    parseFloat(p.unrealized_pl ?? '0'),
+            unrealizedPnlPct: parseFloat(p.unrealized_plpc ?? '0') * 100,
+            marketValue:      parseFloat(p.market_value ?? '0'),
+          });
+        }
+      }
+    } catch { /* Alpaca offline */ }
+
+    // Hyperliquid positions
+    try {
+      const { hasCredentials } = await import('../services/hyperliquid/hyperliquidConfig');
+      const { getUserState } = await import('../services/hyperliquid/hyperliquidInfoService');
+      const { getAllMids } = await import('../services/hyperliquid/hyperliquidInfoService');
+      if (hasCredentials()) {
+        const state = await getUserState();
+        const mids  = await getAllMids();
+        for (const pos of (state?.assetPositions ?? [])) {
+          const p = pos.position;
+          if (!p || parseFloat(p.szi ?? '0') === 0) continue;
+          const size     = parseFloat(p.szi ?? '0');
+          const entry    = parseFloat(p.entryPx ?? '0');
+          const current  = parseFloat(mids[p.coin] ?? '0');
+          const pnl      = (current - entry) * Math.abs(size);
+          const pnlPct   = entry > 0 ? ((current - entry) / entry) * 100 * Math.sign(size) : 0;
+          positions.push({
+            exchange:         'HYPERLIQUID',
+            symbol:           p.coin,
+            side:             size > 0 ? 'long' : 'short',
+            size:             Math.abs(size),
+            entryPrice:       entry,
+            currentPrice:     current,
+            unrealizedPnl:    pnl,
+            unrealizedPnlPct: pnlPct,
+            marketValue:      Math.abs(size) * current,
+          });
+        }
+      }
+    } catch { /* HL offline */ }
+
+    // TOS positions
+    try {
+      const { hasCredentials: hasTosCredentials } = await import('../services/tos/tosConfig');
+      const { getAccounts } = await import('../services/tos/tosInfoService');
+      if (hasTosCredentials()) {
+        const accounts = await getAccounts();
+        for (const acct of (accounts ?? [])) {
+          for (const pos of (acct.securitiesAccount?.positions ?? [])) {
+            const inst   = pos.instrument;
+            const qty    = pos.longQuantity > 0 ? pos.longQuantity : -pos.shortQuantity;
+            const entry  = pos.averagePrice ?? 0;
+            const current = pos.currentDayProfitLossPercentage != null
+              ? entry * (1 + pos.currentDayProfitLossPercentage / 100)
+              : entry;
+            if (qty === 0) continue;
+            positions.push({
+              exchange:         'TOS',
+              symbol:           inst?.symbol ?? '?',
+              side:             qty > 0 ? 'long' : 'short',
+              size:             Math.abs(qty),
+              entryPrice:       entry,
+              currentPrice:     current,
+              unrealizedPnl:    pos.currentDayProfitLoss ?? 0,
+              unrealizedPnlPct: pos.currentDayProfitLossPercentage ?? 0,
+              marketValue:      pos.marketValue ?? 0,
+            });
+          }
+        }
+      }
+    } catch { /* TOS offline */ }
+
+    res.json({ success: true, data: { positions, count: positions.length, fetchedAt: new Date() } });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err instanceof Error ? err.message : 'Failed to fetch live positions' });
+  }
+});
+```
+
+**File**: `client/src/api/client.ts`
+
+In the `autotrader` section add:
+```typescript
+livePositions: () => get('/autotrader/live-positions'),
+```
+
+---
+
+## PART B — Claude AI Trade Decision Endpoint
+
+Add a new endpoint that calls Claude to review a pending trade and return a go/no-go decision with reasoning.
+
+**File**: `server/src/routes/autotrader.ts`
+
+Add this route:
+
+```typescript
+// POST — Claude AI reviews a trade signal and returns go/no-go decision
+router.post('/ai-decision', async (req: Request, res: Response) => {
+  try {
+    const { signals, regime, portfolioState, exchange } = req.body;
+
+    if (!process.env.ANTHROPIC_API_KEY) {
+      // Graceful fallback: approve all signals that meet threshold
+      return res.json({
+        success: true,
+        data: {
+          decisions: (signals ?? []).map((s: any) => ({
+            symbol:    s.symbol,
+            approved:  s.convictionScore >= 72,
+            conviction: s.convictionScore,
+            reasoning: 'Auto-approved (no API key configured)',
+            riskWarning: null,
+            holdDays:  14,
+          })),
+          modelUsed: 'fallback',
+        },
+      });
+    }
+
+    const axios = (await import('axios')).default;
+
+    const prompt = `You are an expert autonomous trading system making final go/no-go decisions on stock and crypto trades.
+
+Exchange: ${exchange ?? 'PAPER'}
+Market regime: ${regime?.regime ?? 'UNKNOWN'} | VIX: ${regime?.vix?.toFixed(1) ?? 'N/A'}
+Portfolio equity: $${portfolioState?.totalEquity?.toFixed(0) ?? 'N/A'} | Open positions: ${portfolioState?.openPositionCount ?? 0} | Today P&L: $${portfolioState?.dailyPnl?.toFixed(2) ?? '0'}
+
+Proposed trades:
+${(signals ?? []).slice(0, 6).map((s: any, i: number) => `
+${i + 1}. ${s.symbol} (${s.assetClass ?? 'stock'}) — ${s.bias}
+   Conviction: ${s.convictionScore}/100 | Confidence: ${s.confidenceScore ?? 'N/A'}/100 | Risk: ${s.riskScore ?? 'N/A'}
+   Entry: $${s.entryPrice?.toFixed(2) ?? 'market'} | Stop: $${s.stopLoss?.toFixed(2) ?? 'N/A'} | Target: $${s.takeProfit?.toFixed(2) ?? 'N/A'}
+   Setup: ${s.setupType ?? 'N/A'} | Reason: ${s.reason ?? 'scan signal'}
+`).join('')}
+
+For each trade decide:
+1. Should this execute NOW given current regime and portfolio state?
+2. Any immediate risk factors (earnings tonight, macro event, correlated position)?
+3. Appropriate hold window in days?
+
+Respond ONLY with JSON array, no other text:
+[{"symbol":"AAPL","approved":true,"conviction":82,"reasoning":"Clean breakout, low correlation to existing holdings, regime supports longs","riskWarning":null,"holdDays":10}]
+
+Approve max 3 trades. Reject if: regime is BEAR_CRISIS, conviction < 68, or obvious near-term risk.`;
+
+    const response = await axios.post(
+      'https://api.anthropic.com/v1/messages',
+      {
+        model: 'claude-sonnet-4-20250514',
+        max_tokens: 800,
+        messages: [{ role: 'user', content: prompt }],
+      },
+      {
+        headers: {
+          'x-api-key':         process.env.ANTHROPIC_API_KEY,
+          'anthropic-version': '2023-06-01',
+          'content-type':      'application/json',
+        },
+        timeout: 20_000,
+      },
+    );
+
+    const text  = response.data?.content?.[0]?.text ?? '[]';
+    const clean = text.replace(/```json|```/g, '').trim();
+    const decisions = JSON.parse(clean);
+
+    res.json({ success: true, data: { decisions, modelUsed: 'claude-sonnet-4-20250514' } });
+  } catch (err: any) {
+    // AI failure is non-fatal — fall back to score-based approval
+    const { signals } = req.body;
+    res.json({
+      success: true,
+      data: {
+        decisions: (signals ?? []).map((s: any) => ({
+          symbol:     s.symbol,
+          approved:   s.convictionScore >= 72,
+          conviction: s.convictionScore,
+          reasoning:  `Fallback approval: ${err?.message ?? 'AI unavailable'}`,
+          riskWarning: null,
+          holdDays:   14,
+        })),
+        modelUsed: 'fallback',
+        error: err?.message,
+      },
+    });
+  }
+});
+```
+
+**File**: `client/src/api/client.ts`
+
+In `autotrader` section add:
+```typescript
+aiDecision: (body: { signals: any[]; regime?: any; portfolioState?: any; exchange?: string }) =>
+  post('/autotrader/ai-decision', body),
+```
+
+---
+
+## PART C — Rebuilt AutoTrader Page
+
+**File**: `client/src/pages/AutoTrader.tsx`
+
+Replace the entire file with the following. This is a complete rewrite — do not merge, replace entirely:
+
+```tsx
+import { useState, useEffect, useCallback } from 'react';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { toast } from 'sonner';
 import {
-  Bot, Activity, TrendingUp, DollarSign, Zap,
+  Bot, Activity, TrendingUp, TrendingDown, DollarSign, Zap,
   Power, PowerOff, RefreshCw, Settings2, AlertOctagon, Brain,
   PlayCircle, StopCircle, PauseCircle, CheckCircle2, XCircle,
-  BarChart3, Globe, Shield, Eye,
+  ArrowUpRight, ArrowDownRight, BarChart3, Globe, Shield, Eye,
 } from 'lucide-react';
 import { cn } from '../lib/utils';
 import { api } from '../api/client';
@@ -24,23 +275,23 @@ const fmtPct = (n: number) => `${n >= 0 ? '+' : ''}${n.toFixed(2)}%`;
 // ── Exchange color/icon map ───────────────────────────────────────────────────
 
 const EXCHANGE_META: Record<string, { color: string; dot: string; label: string }> = {
-  PAPER:       { color: 'text-violet-400', dot: 'bg-violet-400', label: 'Alpaca Paper' },
-  HYPERLIQUID: { color: 'text-cyan-400',   dot: 'bg-cyan-400',   label: 'Hyperliquid'  },
-  TOS:         { color: 'text-blue-400',   dot: 'bg-blue-400',   label: 'ThinkorSwim'  },
+  PAPER:       { color: 'text-violet-400',  dot: 'bg-violet-400',  label: 'Alpaca Paper' },
+  HYPERLIQUID: { color: 'text-cyan-400',    dot: 'bg-cyan-400',    label: 'Hyperliquid'  },
+  TOS:         { color: 'text-blue-400',    dot: 'bg-blue-400',    label: 'ThinkorSwim'  },
 };
 
 // ── Live Positions Panel ──────────────────────────────────────────────────────
 
 function LivePositionsPanel() {
   const { data: raw, isLoading, refetch } = useQuery({
-    queryKey:        ['live-positions-all'],
-    queryFn:         () => api.autotrader.livePositions().then((r: any) => r.data),
+    queryKey: ['live-positions-all'],
+    queryFn:  () => api.autotrader.livePositions().then((r: any) => r.data),
     refetchInterval: 10_000,
   });
 
   const positions: any[] = raw?.positions ?? [];
-  const totalPnl   = positions.reduce((s, p) => s + (p.unrealizedPnl ?? 0), 0);
-  const totalValue = positions.reduce((s, p) => s + (p.marketValue   ?? 0), 0);
+  const totalPnl    = positions.reduce((s, p) => s + (p.unrealizedPnl ?? 0), 0);
+  const totalValue  = positions.reduce((s, p) => s + (p.marketValue ?? 0), 0);
 
   const byExchange = positions.reduce((acc: Record<string, any[]>, p) => {
     (acc[p.exchange] = acc[p.exchange] ?? []).push(p);
@@ -82,7 +333,7 @@ function LivePositionsPanel() {
       {!isLoading && positions.length > 0 && (
         <div className="space-y-4">
           {Object.entries(byExchange).map(([exchange, pos]) => {
-            const meta  = EXCHANGE_META[exchange] ?? { color: 'text-slate-400', dot: 'bg-slate-400', label: exchange };
+            const meta = EXCHANGE_META[exchange] ?? { color: 'text-slate-400', dot: 'bg-slate-400', label: exchange };
             const exPnl = pos.reduce((s: number, p: any) => s + (p.unrealizedPnl ?? 0), 0);
             return (
               <div key={exchange}>
@@ -96,10 +347,13 @@ function LivePositionsPanel() {
                 </div>
                 <div className="space-y-1">
                   {pos.map((p: any) => (
-                    <div key={p.symbol + exchange} className={cn(
-                      'flex items-center gap-2 text-xs rounded-lg px-3 py-2 border',
-                      p.unrealizedPnl >= 0 ? 'bg-emerald-500/5 border-emerald-500/15' : 'bg-red-500/5 border-red-500/15',
-                    )}>
+                    <div key={p.symbol + exchange}
+                      className={cn(
+                        'flex items-center gap-2 text-xs rounded-lg px-3 py-2 border',
+                        p.unrealizedPnl >= 0
+                          ? 'bg-emerald-500/5 border-emerald-500/15'
+                          : 'bg-red-500/5 border-red-500/15',
+                      )}>
                       <span className={cn('text-[10px] font-bold px-1.5 py-0.5 rounded',
                         p.side === 'long' ? 'bg-emerald-500/20 text-emerald-400' : 'bg-red-500/20 text-red-400')}>
                         {p.side?.toUpperCase()}
@@ -133,36 +387,37 @@ function LivePositionsPanel() {
 function AlpacaCommandPanel() {
   const qc = useQueryClient();
 
-  const { data: statusRaw }    = useQuery({ queryKey: ['alpaca-status'],          queryFn: () => api.alpaca.status().then((r: any) => r.data),          refetchInterval: 15_000 });
-  const { data: accountRaw }   = useQuery({ queryKey: ['alpaca-account'],         queryFn: () => api.alpaca.account().then((r: any) => r.data),         refetchInterval: 30_000 });
-  const { data: positionsRaw } = useQuery({ queryKey: ['alpaca-positions-cmd'],   queryFn: () => api.alpaca.positions().then((r: any) => r.data ?? []),  refetchInterval: 10_000 });
-  const { data: autoStatusRaw} = useQuery({ queryKey: ['alpaca-auto-status-cmd'], queryFn: () => api.alpaca.autoStatus().then((r: any) => r.data),       refetchInterval: 30_000 });
-  const { data: clockRaw }     = useQuery({ queryKey: ['alpaca-clock'],           queryFn: () => api.alpaca.clock().then((r: any) => r.data),            refetchInterval: 60_000 });
+  const { data: statusRaw }    = useQuery({ queryKey: ['alpaca-status'],   queryFn: () => api.alpaca.status().then((r: any) => r.data),   refetchInterval: 15_000 });
+  const { data: accountRaw }   = useQuery({ queryKey: ['alpaca-account'],  queryFn: () => api.alpaca.account().then((r: any) => r.data),  refetchInterval: 30_000 });
+  const { data: positionsRaw } = useQuery({ queryKey: ['alpaca-positions-cmd'], queryFn: () => api.alpaca.positions().then((r: any) => r.data ?? []), refetchInterval: 10_000 });
+  const { data: autoStatusRaw} = useQuery({ queryKey: ['alpaca-auto-status-cmd'], queryFn: () => api.alpaca.autoStatus().then((r: any) => r.data), refetchInterval: 30_000 });
+  const { data: clockRaw }     = useQuery({ queryKey: ['alpaca-clock'], queryFn: () => api.alpaca.clock().then((r: any) => r.data), refetchInterval: 60_000 });
 
-  const status     = statusRaw    as any;
-  const account    = accountRaw   as any;
-  const positions  = (positionsRaw as any[]) ?? [];
+  const status    = statusRaw as any;
+  const account   = accountRaw as any;
+  const positions = (positionsRaw as any[]) ?? [];
   const autoStatus = autoStatusRaw as any;
-  const clock      = clockRaw     as any;
+  const clock     = clockRaw as any;
 
-  const equity       = parseFloat(account?.equity      ?? '0');
-  const buyingPower  = parseFloat(account?.buying_power ?? '0');
-  const dayPnl       = parseFloat(account?.equity ?? '0') - parseFloat(account?.last_equity ?? account?.equity ?? '0');
-  const totalPnl     = positions.reduce((s: number, p: any) => s + parseFloat(p.unrealized_pl ?? '0'), 0);
-  const isMarketOpen = clock?.is_open ?? false;
-  const controlLevel = status?.killswitch?.controlLevel ?? 'ACTIVE';
-  const isConnected  = status?.connected ?? false;
+  const equity        = parseFloat(account?.equity ?? '0');
+  const buyingPower   = parseFloat(account?.buying_power ?? '0');
+  const dayPnl        = parseFloat(account?.equity ?? '0') - parseFloat(account?.last_equity ?? account?.equity ?? '0');
+  const totalPnl      = positions.reduce((s: number, p: any) => s + parseFloat(p.unrealized_pl ?? '0'), 0);
+  const isMarketOpen  = clock?.is_open ?? false;
+  const controlLevel  = status?.killswitch?.controlLevel ?? 'ACTIVE';
+  const isConnected   = status?.connected ?? false;
 
-  const pauseMut    = useMutation({ mutationFn: () => api.alpaca.pause('Manual pause'),                                    onSuccess: () => { toast.info('Alpaca paused');                        qc.invalidateQueries({ queryKey: ['alpaca-status'] }); } });
-  const hardStopMut = useMutation({ mutationFn: () => api.alpaca.hardStop('Manual hard stop'),                             onSuccess: () => { toast.warning('Alpaca hard stopped');               qc.invalidateQueries({ queryKey: ['alpaca-status'] }); } });
-  const resumeMut   = useMutation({ mutationFn: () => api.alpaca.resume(),                                                 onSuccess: () => { toast.success('Alpaca resumed');                    qc.invalidateQueries({ queryKey: ['alpaca-status'] }); } });
-  const exitMut     = useMutation({ mutationFn: () => api.alpaca.emergencyExit('Emergency exit from command center', 'CONFIRM'), onSuccess: () => { toast.error('Emergency exit — all positions closed'); qc.invalidateQueries({ queryKey: ['alpaca-positions-cmd', 'alpaca-status'] }); } });
+  const pauseMut     = useMutation({ mutationFn: () => api.alpaca.pause('Manual pause'), onSuccess: () => { toast.info('Alpaca paused'); qc.invalidateQueries({ queryKey: ['alpaca-status'] }); } });
+  const hardStopMut  = useMutation({ mutationFn: () => api.alpaca.hardStop('Manual hard stop'), onSuccess: () => { toast.warning('Alpaca hard stopped'); qc.invalidateQueries({ queryKey: ['alpaca-status'] }); } });
+  const resumeMut    = useMutation({ mutationFn: () => api.alpaca.resume(), onSuccess: () => { toast.success('Alpaca resumed'); qc.invalidateQueries({ queryKey: ['alpaca-status'] }); } });
+  const exitMut      = useMutation({ mutationFn: () => api.alpaca.emergencyExit('Emergency exit from command center', 'CONFIRM'), onSuccess: () => { toast.error('Emergency exit — all positions closed'); qc.invalidateQueries({ queryKey: ['alpaca-positions-cmd', 'alpaca-status'] }); } });
 
   const isStopped = controlLevel === 'HARD_STOP';
   const isPaused  = controlLevel === 'PAUSE';
 
   return (
     <Card className={cn('p-4 border', isConnected ? 'border-violet-500/20' : 'border-surface-border')}>
+      {/* Header */}
       <div className="flex items-center gap-3 mb-4">
         <div className={cn('w-9 h-9 rounded-xl flex items-center justify-center border',
           isConnected ? 'bg-violet-500/20 border-violet-500/30' : 'bg-surface-3 border-surface-border')}>
@@ -173,9 +428,9 @@ function AlpacaCommandPanel() {
             <h3 className="text-sm font-bold text-white">Alpaca Paper</h3>
             <span className={cn('text-[10px] font-bold px-2 py-0.5 rounded-full',
               !isConnected ? 'bg-slate-700 text-slate-400' :
-              isStopped   ? 'bg-red-500/20 text-red-400 animate-pulse' :
-              isPaused    ? 'bg-amber-500/20 text-amber-400' :
-                            'bg-violet-500/20 text-violet-400')}>
+              isStopped ? 'bg-red-500/20 text-red-400 animate-pulse' :
+              isPaused   ? 'bg-amber-500/20 text-amber-400' :
+                           'bg-violet-500/20 text-violet-400')}>
               {!isConnected ? 'NOT CONNECTED' : isStopped ? '⛔ HARD STOP' : isPaused ? '⏸ PAUSED' : '● ACTIVE'}
             </span>
             {isConnected && (
@@ -185,17 +440,20 @@ function AlpacaCommandPanel() {
               </span>
             )}
           </div>
-          {!isConnected && <p className="text-xs text-slate-500 mt-0.5">Connect Alpaca in Settings → Credentials</p>}
+          {!isConnected && (
+            <p className="text-xs text-slate-500 mt-0.5">Connect Alpaca in Settings → Credentials</p>
+          )}
         </div>
       </div>
 
       {isConnected && (
         <>
+          {/* Account stats */}
           <div className="grid grid-cols-3 gap-2 mb-4">
             {[
-              { label: 'Equity',       value: fmtDollar(equity),      color: 'text-white' },
-              { label: 'Buying Power', value: fmtDollar(buyingPower), color: 'text-cyan-400' },
-              { label: 'Day P&L',      value: fmtDollar(dayPnl),      color: dayPnl >= 0 ? 'text-emerald-400' : 'text-red-400' },
+              { label: 'Equity',        value: fmtDollar(equity),      color: 'text-white' },
+              { label: 'Buying Power',  value: fmtDollar(buyingPower), color: 'text-cyan-400' },
+              { label: 'Day P&L',       value: fmtDollar(dayPnl),      color: dayPnl >= 0 ? 'text-emerald-400' : 'text-red-400' },
             ].map(({ label, value, color }) => (
               <div key={label} className="bg-surface-2 rounded-lg p-2 text-center">
                 <p className="text-[10px] text-slate-500 uppercase tracking-wider mb-0.5">{label}</p>
@@ -204,6 +462,7 @@ function AlpacaCommandPanel() {
             ))}
           </div>
 
+          {/* AI adaptive params */}
           {autoStatus?.adaptiveParams && (
             <div className="mb-3 p-2.5 bg-violet-950/30 border border-violet-500/20 rounded-lg">
               <div className="flex items-center gap-1.5 mb-1.5">
@@ -222,6 +481,7 @@ function AlpacaCommandPanel() {
             </div>
           )}
 
+          {/* Open positions */}
           {positions.length > 0 && (
             <div className="mb-3">
               <div className="flex items-center justify-between mb-1.5">
@@ -233,7 +493,7 @@ function AlpacaCommandPanel() {
               <div className="space-y-1">
                 {positions.map((p: any) => {
                   const pnlPct = parseFloat(p.unrealized_plpc ?? '0') * 100;
-                  const pnl    = parseFloat(p.unrealized_pl  ?? '0');
+                  const pnl    = parseFloat(p.unrealized_pl ?? '0');
                   return (
                     <div key={p.symbol} className={cn(
                       'flex items-center gap-2 text-xs rounded-lg px-2.5 py-1.5 border',
@@ -245,7 +505,9 @@ function AlpacaCommandPanel() {
                       </span>
                       <span className="font-mono font-bold text-white w-14">{p.symbol}</span>
                       <span className="text-slate-400 flex-1">{fmtDollar(parseFloat(p.avg_entry_price ?? '0'))} → {fmtDollar(parseFloat(p.current_price ?? '0'))}</span>
-                      <span className={cn('font-mono font-bold', pnlPct >= 0 ? 'text-emerald-400' : 'text-red-400')}>{fmtPct(pnlPct)}</span>
+                      <span className={cn('font-mono font-bold', pnlPct >= 0 ? 'text-emerald-400' : 'text-red-400')}>
+                        {fmtPct(pnlPct)}
+                      </span>
                       <span className={cn('font-mono text-[10px] w-14 text-right', pnl >= 0 ? 'text-emerald-400' : 'text-red-400')}>
                         {pnl >= 0 ? '+' : ''}{fmtDollar(pnl)}
                       </span>
@@ -256,8 +518,11 @@ function AlpacaCommandPanel() {
             </div>
           )}
 
-          {positions.length === 0 && <div className="text-xs text-slate-600 text-center py-3 mb-3">No open positions</div>}
+          {positions.length === 0 && (
+            <div className="text-xs text-slate-600 text-center py-3 mb-3">No open positions</div>
+          )}
 
+          {/* Controls */}
           <div className="flex gap-2">
             {(isStopped || isPaused) ? (
               <button onClick={() => resumeMut.mutate()} disabled={resumeMut.isPending}
@@ -269,15 +534,18 @@ function AlpacaCommandPanel() {
               <>
                 <button onClick={() => pauseMut.mutate()} disabled={pauseMut.isPending}
                   className="flex-1 py-2 rounded-lg bg-amber-500/10 border border-amber-500/30 text-amber-400 text-xs font-semibold hover:bg-amber-500/20 transition-colors flex items-center justify-center gap-1.5">
-                  <PauseCircle className="h-3 w-3" /> Pause
+                  <PauseCircle className="h-3 w-3" />
+                  Pause
                 </button>
                 <button onClick={() => hardStopMut.mutate()} disabled={hardStopMut.isPending}
                   className="flex-1 py-2 rounded-lg bg-orange-500/10 border border-orange-500/30 text-orange-400 text-xs font-semibold hover:bg-orange-500/20 transition-colors flex items-center justify-center gap-1.5">
-                  <StopCircle className="h-3 w-3" /> Hard Stop
+                  <StopCircle className="h-3 w-3" />
+                  Hard Stop
                 </button>
                 <button onClick={() => exitMut.mutate()} disabled={exitMut.isPending}
                   className="py-2 px-3 rounded-lg bg-red-500/10 border border-red-500/30 text-red-400 text-xs font-semibold hover:bg-red-500/20 transition-colors flex items-center justify-center gap-1.5">
-                  <XCircle className="h-3 w-3" /> Exit All
+                  <XCircle className="h-3 w-3" />
+                  Exit All
                 </button>
               </>
             )}
@@ -356,7 +624,9 @@ function AIDecisionPanel({ signals, regime, portfolioState }: { signals: any[]; 
                 {d.holdDays && <span className="text-slate-500">Hold: <span className="text-white">{d.holdDays}d</span></span>}
               </div>
               <p className="text-slate-400 pl-5 leading-relaxed">{d.reasoning}</p>
-              {d.riskWarning && <p className="text-amber-400 pl-5 text-[10px] mt-0.5">⚠ {d.riskWarning}</p>}
+              {d.riskWarning && (
+                <p className="text-amber-400 pl-5 text-[10px] mt-0.5">⚠ {d.riskWarning}</p>
+              )}
             </div>
           ))}
         </div>
@@ -420,39 +690,37 @@ export default function AutoTrader() {
   const [cycleResults, setCycleResults] = useState<unknown[] | null>(null);
 
   const { data: statusRaw, isLoading } = useQuery({
-    queryKey:        ['autotrader-status'],
-    queryFn:         () => api.autotrader.status(),
-    refetchInterval: 30_000,
-    staleTime:       15_000,
+    queryKey: ['autotrader-status'],
+    queryFn:  () => api.autotrader.status(),
+    refetchInterval: 30_000, staleTime: 15_000,
   });
   const status = (statusRaw as any)?.data;
 
   const { data: signalsRaw } = useQuery({
-    queryKey:  ['autotrader-signals'],
-    queryFn:   () => api.autotrader.signalsPreview(),
+    queryKey: ['autotrader-signals'],
+    queryFn:  () => api.autotrader.signalsPreview(),
     staleTime: 60_000,
   });
   const signals: any[] = (signalsRaw as any)?.data?.signals ?? [];
 
   const { data: logsRaw } = useQuery({
-    queryKey:        ['autotrader-logs'],
-    queryFn:         () => api.autotrader.logs({ limit: 30 }),
-    refetchInterval: 15_000,
-    staleTime:       10_000,
+    queryKey: ['autotrader-logs'],
+    queryFn:  () => api.autotrader.logs({ limit: 30 }),
+    refetchInterval: 15_000, staleTime: 10_000,
   });
   const logs: any[] = (logsRaw as any)?.data?.logs ?? [];
 
-  const { data: hlStatusRaw }  = useQuery({ queryKey: ['hl-status'],  queryFn: () => api.hyperliquid.status(), refetchInterval: 30_000 });
+  const { data: hlStatusRaw } = useQuery({ queryKey: ['hl-status'],  queryFn: () => api.hyperliquid.status(), refetchInterval: 30_000 });
   const { data: tosStatusRaw } = useQuery({ queryKey: ['tos-status'], queryFn: () => api.tos.status(),         refetchInterval: 30_000 });
   const hlCtrlLevel  = (hlStatusRaw  as any)?.data?.killswitch?.controlLevel ?? 'ACTIVE';
   const tosCtrlLevel = (tosStatusRaw as any)?.data?.killswitch?.controlLevel ?? 'ACTIVE';
 
-  const hlPauseMut     = useMutation({ mutationFn: () => (api.hyperliquid as any).pause('Manual pause'),  onSuccess: () => { toast.info('HL paused');      qc.invalidateQueries({ queryKey: ['hl-status'] }); } });
-  const hlHardStopMut  = useMutation({ mutationFn: () => (api.hyperliquid as any).hardStop('Hard stop'),  onSuccess: () => { toast.warning('HL stopped');   qc.invalidateQueries({ queryKey: ['hl-status'] }); } });
-  const hlResumeMut    = useMutation({ mutationFn: () => (api.hyperliquid as any).resume(),               onSuccess: () => { toast.success('HL resumed');   qc.invalidateQueries({ queryKey: ['hl-status'] }); } });
-  const tosPauseMut    = useMutation({ mutationFn: () => (api.tos as any).pause('Manual pause'),          onSuccess: () => { toast.info('TOS paused');     qc.invalidateQueries({ queryKey: ['tos-status'] }); } });
-  const tosHardStopMut = useMutation({ mutationFn: () => (api.tos as any).hardStop('Hard stop'),          onSuccess: () => { toast.warning('TOS stopped'); qc.invalidateQueries({ queryKey: ['tos-status'] }); } });
-  const tosResumeMut   = useMutation({ mutationFn: () => (api.tos as any).resume(),                      onSuccess: () => { toast.success('TOS resumed'); qc.invalidateQueries({ queryKey: ['tos-status'] }); } });
+  const hlPauseMut    = useMutation({ mutationFn: () => (api.hyperliquid as any).pause('Manual pause'),       onSuccess: () => { toast.info('HL paused');   qc.invalidateQueries({ queryKey: ['hl-status'] }); } });
+  const hlHardStopMut = useMutation({ mutationFn: () => (api.hyperliquid as any).hardStop('Hard stop'),       onSuccess: () => { toast.warning('HL stopped'); qc.invalidateQueries({ queryKey: ['hl-status'] }); } });
+  const hlResumeMut   = useMutation({ mutationFn: () => (api.hyperliquid as any).resume(),                    onSuccess: () => { toast.success('HL resumed');  qc.invalidateQueries({ queryKey: ['hl-status'] }); } });
+  const tosPauseMut   = useMutation({ mutationFn: () => (api.tos as any).pause('Manual pause'),               onSuccess: () => { toast.info('TOS paused');   qc.invalidateQueries({ queryKey: ['tos-status'] }); } });
+  const tosHardStopMut= useMutation({ mutationFn: () => (api.tos as any).hardStop('Hard stop'),               onSuccess: () => { toast.warning('TOS stopped'); qc.invalidateQueries({ queryKey: ['tos-status'] }); } });
+  const tosResumeMut  = useMutation({ mutationFn: () => (api.tos as any).resume(),                            onSuccess: () => { toast.success('TOS resumed');  qc.invalidateQueries({ queryKey: ['tos-status'] }); } });
 
   const enableMut  = useMutation({ mutationFn: () => api.autotrader.enable(),  onSuccess: () => { qc.invalidateQueries({ queryKey: ['autotrader-status'] }); toast.success('Auto-trading enabled'); } });
   const disableMut = useMutation({ mutationFn: () => api.autotrader.disable(), onSuccess: () => { qc.invalidateQueries({ queryKey: ['autotrader-status'] }); toast.success('Auto-trading disabled'); } });
@@ -474,9 +742,7 @@ export default function AutoTrader() {
   const enabled   = status?.enabled ?? false;
   const config    = status?.config;
   const portfolio = status?.portfolioState;
-
-  void cycleResults;
-  void showConfig;
+  const cb        = status?.circuitBreaker;
 
   return (
     <div className="p-6 space-y-5 max-w-[1400px] mx-auto">
@@ -537,10 +803,10 @@ export default function AutoTrader() {
 
       {/* ── Portfolio stats ── */}
       <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
-        <StatCard label="Portfolio Equity"  value={portfolio ? fmtDollar(portfolio.totalEquity) : '—'} icon={<DollarSign className="h-4 w-4" />} color="cyan"   />
-        <StatCard label="Today's Trades"    value={status?.todayTradeCount ?? 0}                        icon={<Activity   className="h-4 w-4" />} color="blue"   />
-        <StatCard label="Active Positions"  value={status?.activePositionCount ?? 0}                    icon={<TrendingUp className="h-4 w-4" />} color="purple" />
-        <StatCard label="Today's P&L"       value={status ? fmtDollar(status.todayPnl) : '—'}          icon={<Zap        className="h-4 w-4" />} color={status?.todayPnl >= 0 ? 'green' : 'red'} />
+        <StatCard label="Portfolio Equity"  value={portfolio ? fmtDollar(portfolio.totalEquity) : '—'}   icon={<DollarSign className="h-4 w-4" />} color="cyan"   />
+        <StatCard label="Today's Trades"    value={status?.todayTradeCount ?? 0}                           icon={<Activity className="h-4 w-4" />}   color="blue"   />
+        <StatCard label="Active Positions"  value={status?.activePositionCount ?? 0}                       icon={<TrendingUp className="h-4 w-4" />} color="purple" />
+        <StatCard label="Today's P&L"       value={status ? fmtDollar(status.todayPnl) : '—'}             icon={<Zap className="h-4 w-4" />}        color={status?.todayPnl >= 0 ? 'green' : 'red'} />
       </div>
 
       {/* ── Main grid: Live positions + Alpaca panel ── */}
@@ -561,9 +827,9 @@ export default function AutoTrader() {
           <span className="text-xs text-slate-600">Per-exchange pause / hard stop</span>
         </div>
         <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
-          <ExchangeControlCard exchange="HYPERLIQUID" label="Hyperliquid"  ctrlLevel={hlCtrlLevel}
-            pauseMut={hlPauseMut}  hardStopMut={hlHardStopMut}  resumeMut={hlResumeMut} />
-          <ExchangeControlCard exchange="TOS"         label="ThinkorSwim" ctrlLevel={tosCtrlLevel}
+          <ExchangeControlCard exchange="HYPERLIQUID" label="Hyperliquid" ctrlLevel={hlCtrlLevel}
+            pauseMut={hlPauseMut} hardStopMut={hlHardStopMut} resumeMut={hlResumeMut} />
+          <ExchangeControlCard exchange="TOS" label="ThinkorSwim" ctrlLevel={tosCtrlLevel}
             pauseMut={tosPauseMut} hardStopMut={tosHardStopMut} resumeMut={tosResumeMut} />
         </div>
       </Card>
@@ -580,9 +846,7 @@ export default function AutoTrader() {
             action={
               <button onClick={() => cycleMut.mutate()} disabled={cycleMut.isPending || !enabled}
                 className={cn('flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold transition-colors',
-                  enabled
-                    ? 'bg-accent-blue/20 border border-accent-blue/30 text-accent-blue hover:bg-accent-blue/30'
-                    : 'bg-surface-3 border border-surface-border text-slate-500 cursor-not-allowed')}>
+                  enabled ? 'bg-accent-blue/20 border border-accent-blue/30 text-accent-blue hover:bg-accent-blue/30' : 'bg-surface-3 border border-surface-border text-slate-500 cursor-not-allowed')}>
                 {cycleMut.isPending ? <RefreshCw className="h-3.5 w-3.5 animate-spin" /> : <PlayCircle className="h-3.5 w-3.5" />}
                 Run Cycle
               </button>
@@ -598,14 +862,14 @@ export default function AutoTrader() {
               <table className="w-full text-xs">
                 <thead>
                   <tr className="border-b border-surface-border">
-                    {['Symbol', 'Bias', 'Conviction', 'Confidence', 'Setup', 'Entry'].map(h => (
+                    {['Symbol','Bias','Conviction','Confidence','Setup','Entry'].map(h => (
                       <th key={h} className="text-left px-4 py-2 text-[10px] text-slate-500 uppercase tracking-wider">{h}</th>
                     ))}
                   </tr>
                 </thead>
                 <tbody>
                   {signals.map((s: any) => {
-                    const cv  = s.convictionScore;
+                    const cv = s.convictionScore;
                     const bar = cv >= 80 ? 'bg-accent-green' : cv >= 65 ? 'bg-accent-blue' : 'bg-accent-amber';
                     return (
                       <tr key={s.symbol} className="border-b border-surface-border/50 hover:bg-surface-2 transition-colors">
@@ -651,7 +915,7 @@ export default function AutoTrader() {
             <table className="w-full text-xs">
               <thead>
                 <tr className="border-b border-surface-border">
-                  {['Time', 'Symbol', 'Exchange', 'Action', 'Status', 'Price', 'Amount', 'Reason'].map(h => (
+                  {['Time','Symbol','Exchange','Action','Status','Price','Amount','Reason'].map(h => (
                     <th key={h} className="text-left px-3 py-2 text-[10px] text-slate-500 uppercase tracking-wider">{h}</th>
                   ))}
                 </tr>
@@ -696,3 +960,33 @@ export default function AutoTrader() {
     </div>
   );
 }
+```
+
+---
+
+## SUMMARY
+
+### Files Modified
+```
+server/src/routes/autotrader.ts        → /live-positions (all 3 exchanges), /ai-decision (Claude API)
+client/src/api/client.ts               → autotrader.livePositions(), autotrader.aiDecision()
+client/src/pages/AutoTrader.tsx        → Full rebuild: live positions, Alpaca panel, Claude AI panel, exchange controls
+```
+
+### What the New Page Has
+
+**Top bar** — Enable/Disable with live status dot, full config summary bar showing exchange + stop/target/conviction/mode
+
+**Portfolio stats row** — equity, today's trades, active positions, today's P&L
+
+**Main grid (2/3 + 1/3)**
+- Left: Live Positions panel — fetches real positions from Alpaca + HL + TOS simultaneously, grouped by exchange with individual P&L per position, total value, total P&L, auto-refreshes every 10s
+- Right: Alpaca Command Panel — equity, buying power, day P&L; AI adaptive params currently active; all open Alpaca positions with live P&L; pause/hard stop/resume/exit all controls; market open/closed indicator
+
+**Exchange Controls** — HL and TOS pause/hard stop/resume in their own row
+
+**Signals + Claude AI** (side by side)
+- Left: qualifying signals from latest scan with conviction bar, setup type, entry price, Run Cycle button
+- Right: Claude AI Decision panel — click "Ask Claude" sends all signals + regime + portfolio state to Claude, returns go/no-go per signal with conviction score, reasoning, risk warnings, hold window
+
+**Trade Log** — last 30 executions with exchange-colored labels, action, status (FILLED/DRY_RUN/BLOCKED/ERROR), price, amount, reason

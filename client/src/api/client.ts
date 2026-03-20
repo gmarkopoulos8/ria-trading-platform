@@ -242,6 +242,9 @@ export const api = {
     intradayRun: (params?: { maxSignals?: number; dryRun?: boolean }) => post('/autotrader/intraday/run', params ?? {}),
     intradayConfig: (params: { intervalSeconds: number; timeframe: '1min' | '3min' | '5min' }) =>
       post('/autotrader/intraday/config', params),
+    livePositions: () => get('/autotrader/live-positions'),
+    aiDecision: (body: { signals: any[]; regime?: any; portfolioState?: any; exchange?: string }) =>
+      post('/autotrader/ai-decision', body),
     exchangeConfig: {
       get: (exchange: string) => get(`/autotrader/exchange-config/${exchange}`),
       save: (exchange: string, data: unknown) => put(`/autotrader/exchange-config/${exchange}`, data),

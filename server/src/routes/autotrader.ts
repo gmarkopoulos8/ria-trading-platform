@@ -471,4 +471,176 @@ router.post('/intraday/config', async (req: Request, res: Response) => {
   }
 });
 
+// GET unified live positions from all connected exchanges
+router.get('/live-positions', async (req: Request, res: Response) => {
+  try {
+    const positions: Array<{
+      exchange: string;
+      symbol: string;
+      side: 'long' | 'short';
+      size: number;
+      entryPrice: number;
+      currentPrice: number;
+      unrealizedPnl: number;
+      unrealizedPnlPct: number;
+      marketValue: number;
+    }> = [];
+
+    // Alpaca paper positions
+    try {
+      const { getPositions: getAlpacaPositions } = await import('../services/alpaca/alpacaInfoService');
+      const { hasAlpacaCredentials } = await import('../services/alpaca/alpacaConfig');
+      if (hasAlpacaCredentials()) {
+        const alpacaPos = await getAlpacaPositions();
+        for (const p of (alpacaPos ?? [])) {
+          positions.push({
+            exchange:         'PAPER',
+            symbol:           p.symbol,
+            side:             p.side === 'long' ? 'long' : 'short',
+            size:             parseFloat(p.qty ?? '0'),
+            entryPrice:       parseFloat(p.avg_entry_price ?? '0'),
+            currentPrice:     parseFloat(p.current_price ?? '0'),
+            unrealizedPnl:    parseFloat(p.unrealized_pl ?? '0'),
+            unrealizedPnlPct: parseFloat(p.unrealized_plpc ?? '0') * 100,
+            marketValue:      parseFloat(p.market_value ?? '0'),
+          });
+        }
+      }
+    } catch { /* Alpaca offline */ }
+
+    // Hyperliquid positions
+    try {
+      const { hasCredentials } = await import('../services/hyperliquid/hyperliquidConfig');
+      const { getUserState, getAllMids } = await import('../services/hyperliquid/hyperliquidInfoService');
+      if (hasCredentials()) {
+        const state = await getUserState();
+        const mids  = await getAllMids();
+        for (const pos of (state?.assetPositions ?? [])) {
+          const p = pos.position;
+          if (!p || parseFloat(p.szi ?? '0') === 0) continue;
+          const size    = parseFloat(p.szi ?? '0');
+          const entry   = parseFloat(p.entryPx ?? '0');
+          const current = parseFloat((mids as any)[p.coin] ?? '0');
+          const pnl     = (current - entry) * Math.abs(size);
+          const pnlPct  = entry > 0 ? ((current - entry) / entry) * 100 * Math.sign(size) : 0;
+          positions.push({
+            exchange: 'HYPERLIQUID', symbol: p.coin, side: size > 0 ? 'long' : 'short',
+            size: Math.abs(size), entryPrice: entry, currentPrice: current,
+            unrealizedPnl: pnl, unrealizedPnlPct: pnlPct, marketValue: Math.abs(size) * current,
+          });
+        }
+      }
+    } catch { /* HL offline */ }
+
+    // TOS positions
+    try {
+      const { hasCredentials: hasTosCredentials } = await import('../services/tos/tosConfig');
+      const { getAccounts } = await import('../services/tos/tosInfoService');
+      if (hasTosCredentials()) {
+        const accounts = await getAccounts();
+        for (const acct of (accounts ?? [])) {
+          for (const pos of ((acct as any).securitiesAccount?.positions ?? [])) {
+            const inst    = pos.instrument;
+            const qty     = pos.longQuantity > 0 ? pos.longQuantity : -pos.shortQuantity;
+            const entry   = pos.averagePrice ?? 0;
+            const current = pos.currentDayProfitLossPercentage != null
+              ? entry * (1 + pos.currentDayProfitLossPercentage / 100) : entry;
+            if (qty === 0) continue;
+            positions.push({
+              exchange: 'TOS', symbol: inst?.symbol ?? '?',
+              side: qty > 0 ? 'long' : 'short', size: Math.abs(qty),
+              entryPrice: entry, currentPrice: current,
+              unrealizedPnl: pos.currentDayProfitLoss ?? 0,
+              unrealizedPnlPct: pos.currentDayProfitLossPercentage ?? 0,
+              marketValue: pos.marketValue ?? 0,
+            });
+          }
+        }
+      }
+    } catch { /* TOS offline */ }
+
+    res.json({ success: true, data: { positions, count: positions.length, fetchedAt: new Date() } });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err instanceof Error ? err.message : 'Failed to fetch live positions' });
+  }
+});
+
+// POST — Claude AI reviews trade signals and returns go/no-go decisions
+router.post('/ai-decision', async (req: Request, res: Response) => {
+  try {
+    const { signals, regime, portfolioState, exchange } = req.body;
+
+    if (!process.env.ANTHROPIC_API_KEY) {
+      return res.json({
+        success: true,
+        data: {
+          decisions: (signals ?? []).map((s: any) => ({
+            symbol:      s.symbol,
+            approved:    s.convictionScore >= 72,
+            conviction:  s.convictionScore,
+            reasoning:   'Auto-approved (no API key configured)',
+            riskWarning: null,
+            holdDays:    14,
+          })),
+          modelUsed: 'fallback',
+        },
+      });
+    }
+
+    const axios = (await import('axios')).default;
+
+    const prompt = `You are an expert autonomous trading system making final go/no-go decisions on stock and crypto trades.
+
+Exchange: ${exchange ?? 'PAPER'}
+Market regime: ${regime?.regime ?? 'UNKNOWN'} | VIX: ${regime?.vix?.toFixed(1) ?? 'N/A'}
+Portfolio equity: $${portfolioState?.totalEquity?.toFixed(0) ?? 'N/A'} | Open positions: ${portfolioState?.openPositionCount ?? 0} | Today P&L: $${portfolioState?.dailyPnl?.toFixed(2) ?? '0'}
+
+Proposed trades:
+${(signals ?? []).slice(0, 6).map((s: any, i: number) => `
+${i + 1}. ${s.symbol} (${s.assetClass ?? 'stock'}) — ${s.bias}
+   Conviction: ${s.convictionScore}/100 | Confidence: ${s.confidenceScore ?? 'N/A'}/100 | Risk: ${s.riskScore ?? 'N/A'}
+   Entry: $${s.entryPrice?.toFixed(2) ?? 'market'} | Stop: $${s.stopLoss?.toFixed(2) ?? 'N/A'} | Target: $${s.takeProfit?.toFixed(2) ?? 'N/A'}
+   Setup: ${s.setupType ?? 'N/A'} | Reason: ${s.reason ?? 'scan signal'}
+`).join('')}
+
+For each trade decide:
+1. Should this execute NOW given current regime and portfolio state?
+2. Any immediate risk factors (earnings tonight, macro event, correlated position)?
+3. Appropriate hold window in days?
+
+Respond ONLY with JSON array, no other text:
+[{"symbol":"AAPL","approved":true,"conviction":82,"reasoning":"Clean breakout, low correlation to existing holdings, regime supports longs","riskWarning":null,"holdDays":10}]
+
+Approve max 3 trades. Reject if: regime is BEAR_CRISIS, conviction < 68, or obvious near-term risk.`;
+
+    const response = await axios.post(
+      'https://api.anthropic.com/v1/messages',
+      { model: 'claude-sonnet-4-20250514', max_tokens: 800, messages: [{ role: 'user', content: prompt }] },
+      {
+        headers: { 'x-api-key': process.env.ANTHROPIC_API_KEY, 'anthropic-version': '2023-06-01', 'content-type': 'application/json' },
+        timeout: 20_000,
+      },
+    );
+
+    const text      = response.data?.content?.[0]?.text ?? '[]';
+    const clean     = text.replace(/```json|```/g, '').trim();
+    const decisions = JSON.parse(clean);
+
+    res.json({ success: true, data: { decisions, modelUsed: 'claude-sonnet-4-20250514' } });
+  } catch (err: any) {
+    const { signals } = req.body;
+    res.json({
+      success: true,
+      data: {
+        decisions: (signals ?? []).map((s: any) => ({
+          symbol: s.symbol, approved: s.convictionScore >= 72, conviction: s.convictionScore,
+          reasoning: `Fallback approval: ${err?.message ?? 'AI unavailable'}`, riskWarning: null, holdDays: 14,
+        })),
+        modelUsed: 'fallback',
+        error: err?.message,
+      },
+    });
+  }
+});
+
 export default router;
