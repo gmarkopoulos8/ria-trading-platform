@@ -1,0 +1,929 @@
+# Replit Agent Prompt — Fix Daily Scan + Auto Trading Flow + Positions Panel
+
+This prompt fixes four things:
+1. **Expand the scan universe** to 150+ stocks + crypto so there are always qualifying signals
+2. **Auto-scan when Start Trading is clicked** — if no recent scan exists, run one automatically with a live progress bar
+3. **Fix the scan timeout** — return the scan ID immediately, run in background
+4. **Add a live trading activity panel** showing what was traded and current positions
+
+Only touch the files listed below.
+
+---
+
+## FIX 1 — Expand Universe to 150 Symbols
+
+**File**: `server/src/services/scans/scanUniverseService.ts`
+
+Replace the entire file:
+
+```typescript
+import { isCryptoSymbol } from '../market/utils';
+
+export interface CandidateAsset {
+  ticker: string;
+  name: string;
+  assetClass: 'stock' | 'crypto' | 'etf';
+  sector?: string;
+  isCrypto: boolean;
+}
+
+export type AssetScope = 'ALL' | 'STOCKS_ONLY' | 'CRYPTO_ONLY';
+export type RiskMode = 'ALL' | 'CONSERVATIVE' | 'AGGRESSIVE';
+
+const STOCK_UNIVERSE: CandidateAsset[] = [
+  // Mega-cap Tech
+  { ticker: 'AAPL',  name: 'Apple Inc',                    assetClass: 'stock', sector: 'Technology',              isCrypto: false },
+  { ticker: 'MSFT',  name: 'Microsoft Corp',               assetClass: 'stock', sector: 'Technology',              isCrypto: false },
+  { ticker: 'NVDA',  name: 'NVIDIA Corp',                  assetClass: 'stock', sector: 'Technology',              isCrypto: false },
+  { ticker: 'GOOGL', name: 'Alphabet Inc',                 assetClass: 'stock', sector: 'Communication Services',  isCrypto: false },
+  { ticker: 'AMZN',  name: 'Amazon.com',                   assetClass: 'stock', sector: 'Consumer Discretionary',  isCrypto: false },
+  { ticker: 'META',  name: 'Meta Platforms',               assetClass: 'stock', sector: 'Communication Services',  isCrypto: false },
+  { ticker: 'TSLA',  name: 'Tesla Inc',                    assetClass: 'stock', sector: 'Consumer Discretionary',  isCrypto: false },
+  // Semiconductors
+  { ticker: 'AMD',   name: 'Advanced Micro Devices',       assetClass: 'stock', sector: 'Technology',              isCrypto: false },
+  { ticker: 'INTC',  name: 'Intel Corp',                   assetClass: 'stock', sector: 'Technology',              isCrypto: false },
+  { ticker: 'QCOM',  name: 'Qualcomm Inc',                 assetClass: 'stock', sector: 'Technology',              isCrypto: false },
+  { ticker: 'AVGO',  name: 'Broadcom Inc',                 assetClass: 'stock', sector: 'Technology',              isCrypto: false },
+  { ticker: 'MU',    name: 'Micron Technology',            assetClass: 'stock', sector: 'Technology',              isCrypto: false },
+  { ticker: 'MRVL',  name: 'Marvell Technology',           assetClass: 'stock', sector: 'Technology',              isCrypto: false },
+  { ticker: 'ARM',   name: 'ARM Holdings',                 assetClass: 'stock', sector: 'Technology',              isCrypto: false },
+  { ticker: 'SMCI',  name: 'Super Micro Computer',         assetClass: 'stock', sector: 'Technology',              isCrypto: false },
+  // Software / SaaS
+  { ticker: 'CRM',   name: 'Salesforce Inc',               assetClass: 'stock', sector: 'Technology',              isCrypto: false },
+  { ticker: 'ORCL',  name: 'Oracle Corp',                  assetClass: 'stock', sector: 'Technology',              isCrypto: false },
+  { ticker: 'ADBE',  name: 'Adobe Inc',                    assetClass: 'stock', sector: 'Technology',              isCrypto: false },
+  { ticker: 'NOW',   name: 'ServiceNow Inc',               assetClass: 'stock', sector: 'Technology',              isCrypto: false },
+  { ticker: 'SNOW',  name: 'Snowflake Inc',                assetClass: 'stock', sector: 'Technology',              isCrypto: false },
+  { ticker: 'DDOG',  name: 'Datadog Inc',                  assetClass: 'stock', sector: 'Technology',              isCrypto: false },
+  { ticker: 'SHOP',  name: 'Shopify Inc',                  assetClass: 'stock', sector: 'Technology',              isCrypto: false },
+  { ticker: 'PLTR',  name: 'Palantir Technologies',        assetClass: 'stock', sector: 'Technology',              isCrypto: false },
+  { ticker: 'PANW',  name: 'Palo Alto Networks',           assetClass: 'stock', sector: 'Technology',              isCrypto: false },
+  { ticker: 'CRWD',  name: 'CrowdStrike Holdings',         assetClass: 'stock', sector: 'Technology',              isCrypto: false },
+  { ticker: 'ZS',    name: 'Zscaler Inc',                  assetClass: 'stock', sector: 'Technology',              isCrypto: false },
+  // AI / Emerging Tech
+  { ticker: 'AI',    name: 'C3.ai Inc',                    assetClass: 'stock', sector: 'Technology',              isCrypto: false },
+  { ticker: 'IONQ',  name: 'IonQ Inc',                     assetClass: 'stock', sector: 'Technology',              isCrypto: false },
+  { ticker: 'RGTI',  name: 'Rigetti Computing',            assetClass: 'stock', sector: 'Technology',              isCrypto: false },
+  { ticker: 'SOUN',  name: 'SoundHound AI',                assetClass: 'stock', sector: 'Technology',              isCrypto: false },
+  { ticker: 'BBAI',  name: 'BigBear.ai Holdings',          assetClass: 'stock', sector: 'Technology',              isCrypto: false },
+  // Internet / Media
+  { ticker: 'NFLX',  name: 'Netflix Inc',                  assetClass: 'stock', sector: 'Communication Services',  isCrypto: false },
+  { ticker: 'SPOT',  name: 'Spotify Technology',           assetClass: 'stock', sector: 'Communication Services',  isCrypto: false },
+  { ticker: 'PINS',  name: 'Pinterest Inc',                assetClass: 'stock', sector: 'Communication Services',  isCrypto: false },
+  { ticker: 'SNAP',  name: 'Snap Inc',                     assetClass: 'stock', sector: 'Communication Services',  isCrypto: false },
+  { ticker: 'RBLX',  name: 'Roblox Corp',                  assetClass: 'stock', sector: 'Communication Services',  isCrypto: false },
+  // Financials
+  { ticker: 'JPM',   name: 'JPMorgan Chase',               assetClass: 'stock', sector: 'Financials',              isCrypto: false },
+  { ticker: 'GS',    name: 'Goldman Sachs',                assetClass: 'stock', sector: 'Financials',              isCrypto: false },
+  { ticker: 'V',     name: 'Visa Inc',                     assetClass: 'stock', sector: 'Financials',              isCrypto: false },
+  { ticker: 'MA',    name: 'Mastercard Inc',               assetClass: 'stock', sector: 'Financials',              isCrypto: false },
+  { ticker: 'PYPL',  name: 'PayPal Holdings',              assetClass: 'stock', sector: 'Financials',              isCrypto: false },
+  { ticker: 'SQ',    name: 'Block Inc',                    assetClass: 'stock', sector: 'Financials',              isCrypto: false },
+  { ticker: 'COIN',  name: 'Coinbase Global',              assetClass: 'stock', sector: 'Financials',              isCrypto: false },
+  { ticker: 'MSTR',  name: 'MicroStrategy',                assetClass: 'stock', sector: 'Financials',              isCrypto: false },
+  { ticker: 'HOOD',  name: 'Robinhood Markets',            assetClass: 'stock', sector: 'Financials',              isCrypto: false },
+  // Healthcare / Biotech
+  { ticker: 'LLY',   name: 'Eli Lilly and Co',             assetClass: 'stock', sector: 'Healthcare',              isCrypto: false },
+  { ticker: 'ABBV',  name: 'AbbVie Inc',                   assetClass: 'stock', sector: 'Healthcare',              isCrypto: false },
+  { ticker: 'MRNA',  name: 'Moderna Inc',                  assetClass: 'stock', sector: 'Healthcare',              isCrypto: false },
+  { ticker: 'BNTX',  name: 'BioNTech SE',                  assetClass: 'stock', sector: 'Healthcare',              isCrypto: false },
+  { ticker: 'ISRG',  name: 'Intuitive Surgical',           assetClass: 'stock', sector: 'Healthcare',              isCrypto: false },
+  { ticker: 'RXRX',  name: 'Recursion Pharmaceuticals',    assetClass: 'stock', sector: 'Healthcare',              isCrypto: false },
+  // Consumer
+  { ticker: 'SBUX',  name: 'Starbucks Corp',               assetClass: 'stock', sector: 'Consumer Discretionary',  isCrypto: false },
+  { ticker: 'NKE',   name: 'Nike Inc',                     assetClass: 'stock', sector: 'Consumer Discretionary',  isCrypto: false },
+  { ticker: 'LULU',  name: 'Lululemon Athletica',          assetClass: 'stock', sector: 'Consumer Discretionary',  isCrypto: false },
+  { ticker: 'ABNB',  name: 'Airbnb Inc',                   assetClass: 'stock', sector: 'Consumer Discretionary',  isCrypto: false },
+  { ticker: 'UBER',  name: 'Uber Technologies',            assetClass: 'stock', sector: 'Consumer Discretionary',  isCrypto: false },
+  { ticker: 'LYFT',  name: 'Lyft Inc',                     assetClass: 'stock', sector: 'Consumer Discretionary',  isCrypto: false },
+  { ticker: 'DASH',  name: 'DoorDash Inc',                 assetClass: 'stock', sector: 'Consumer Discretionary',  isCrypto: false },
+  // Energy / EV
+  { ticker: 'ENPH',  name: 'Enphase Energy',               assetClass: 'stock', sector: 'Energy',                  isCrypto: false },
+  { ticker: 'FSLR',  name: 'First Solar Inc',              assetClass: 'stock', sector: 'Energy',                  isCrypto: false },
+  { ticker: 'RIVN',  name: 'Rivian Automotive',            assetClass: 'stock', sector: 'Consumer Discretionary',  isCrypto: false },
+  { ticker: 'LCID',  name: 'Lucid Group',                  assetClass: 'stock', sector: 'Consumer Discretionary',  isCrypto: false },
+  // Industrial / Space / Defense
+  { ticker: 'RKLB',  name: 'Rocket Lab USA',               assetClass: 'stock', sector: 'Industrials',             isCrypto: false },
+  { ticker: 'SPCE',  name: 'Virgin Galactic',              assetClass: 'stock', sector: 'Industrials',             isCrypto: false },
+  { ticker: 'BA',    name: 'Boeing Co',                    assetClass: 'stock', sector: 'Industrials',             isCrypto: false },
+  { ticker: 'LMT',   name: 'Lockheed Martin',              assetClass: 'stock', sector: 'Industrials',             isCrypto: false },
+  { ticker: 'RTX',   name: 'RTX Corp',                     assetClass: 'stock', sector: 'Industrials',             isCrypto: false },
+  // High-Beta / Momentum
+  { ticker: 'DKNG',  name: 'DraftKings Inc',               assetClass: 'stock', sector: 'Consumer Discretionary',  isCrypto: false },
+  { ticker: 'PENN',  name: 'PENN Entertainment',           assetClass: 'stock', sector: 'Consumer Discretionary',  isCrypto: false },
+  { ticker: 'GME',   name: 'GameStop Corp',                assetClass: 'stock', sector: 'Consumer Discretionary',  isCrypto: false },
+  { ticker: 'AMC',   name: 'AMC Entertainment',            assetClass: 'stock', sector: 'Communication Services',  isCrypto: false },
+  { ticker: 'BBBY',  name: 'Beyond Meat Inc',              assetClass: 'stock', sector: 'Consumer Staples',         isCrypto: false },
+  { ticker: 'BYND',  name: 'Beyond Meat Inc',              assetClass: 'stock', sector: 'Consumer Staples',         isCrypto: false },
+];
+
+export const CRYPTO_UNIVERSE: CandidateAsset[] = [
+  { ticker: 'BTC',   name: 'Bitcoin',        assetClass: 'crypto', sector: 'Crypto', isCrypto: true },
+  { ticker: 'ETH',   name: 'Ethereum',       assetClass: 'crypto', sector: 'Crypto', isCrypto: true },
+  { ticker: 'SOL',   name: 'Solana',         assetClass: 'crypto', sector: 'Crypto', isCrypto: true },
+  { ticker: 'BNB',   name: 'BNB',            assetClass: 'crypto', sector: 'Crypto', isCrypto: true },
+  { ticker: 'XRP',   name: 'XRP',            assetClass: 'crypto', sector: 'Crypto', isCrypto: true },
+  { ticker: 'AVAX',  name: 'Avalanche',      assetClass: 'crypto', sector: 'Crypto', isCrypto: true },
+  { ticker: 'DOGE',  name: 'Dogecoin',       assetClass: 'crypto', sector: 'Crypto', isCrypto: true },
+  { ticker: 'LINK',  name: 'Chainlink',      assetClass: 'crypto', sector: 'Crypto', isCrypto: true },
+  { ticker: 'DOT',   name: 'Polkadot',       assetClass: 'crypto', sector: 'Crypto', isCrypto: true },
+  { ticker: 'ADA',   name: 'Cardano',        assetClass: 'crypto', sector: 'Crypto', isCrypto: true },
+  { ticker: 'MATIC', name: 'Polygon',        assetClass: 'crypto', sector: 'Crypto', isCrypto: true },
+  { ticker: 'ATOM',  name: 'Cosmos',         assetClass: 'crypto', sector: 'Crypto', isCrypto: true },
+  { ticker: 'NEAR',  name: 'NEAR Protocol',  assetClass: 'crypto', sector: 'Crypto', isCrypto: true },
+  { ticker: 'APT',   name: 'Aptos',          assetClass: 'crypto', sector: 'Crypto', isCrypto: true },
+  { ticker: 'ARB',   name: 'Arbitrum',       assetClass: 'crypto', sector: 'Crypto', isCrypto: true },
+  { ticker: 'OP',    name: 'Optimism',       assetClass: 'crypto', sector: 'Crypto', isCrypto: true },
+  { ticker: 'INJ',   name: 'Injective',      assetClass: 'crypto', sector: 'Crypto', isCrypto: true },
+  { ticker: 'SUI',   name: 'Sui',            assetClass: 'crypto', sector: 'Crypto', isCrypto: true },
+  { ticker: 'TIA',   name: 'Celestia',       assetClass: 'crypto', sector: 'Crypto', isCrypto: true },
+  { ticker: 'JUP',   name: 'Jupiter',        assetClass: 'crypto', sector: 'Crypto', isCrypto: true },
+];
+
+export const ETF_UNIVERSE: CandidateAsset[] = [
+  { ticker: 'SPY',   name: 'SPDR S&P 500 ETF',              assetClass: 'etf', sector: 'ETF', isCrypto: false },
+  { ticker: 'QQQ',   name: 'Invesco QQQ Trust',             assetClass: 'etf', sector: 'ETF', isCrypto: false },
+  { ticker: 'IWM',   name: 'iShares Russell 2000 ETF',      assetClass: 'etf', sector: 'ETF', isCrypto: false },
+  { ticker: 'XLK',   name: 'Technology Select SPDR ETF',    assetClass: 'etf', sector: 'ETF', isCrypto: false },
+  { ticker: 'XLF',   name: 'Financial Select SPDR ETF',     assetClass: 'etf', sector: 'ETF', isCrypto: false },
+  { ticker: 'ARKK',  name: 'ARK Innovation ETF',            assetClass: 'etf', sector: 'ETF', isCrypto: false },
+  { ticker: 'SOXL',  name: 'Direxion Semis 3x Bull',        assetClass: 'etf', sector: 'ETF', isCrypto: false },
+  { ticker: 'TQQQ',  name: 'ProShares UltraPro QQQ 3x',     assetClass: 'etf', sector: 'ETF', isCrypto: false },
+];
+
+export function buildUniverse(scope: AssetScope = 'ALL', riskMode: RiskMode = 'ALL'): CandidateAsset[] {
+  let universe: CandidateAsset[] = [];
+
+  if (scope === 'ALL' || scope === 'STOCKS_ONLY') {
+    universe.push(...STOCK_UNIVERSE);
+    universe.push(...ETF_UNIVERSE);
+  }
+  if (scope === 'ALL' || scope === 'CRYPTO_ONLY') {
+    universe.push(...CRYPTO_UNIVERSE);
+  }
+
+  if (riskMode === 'CONSERVATIVE') {
+    universe = universe.filter(a =>
+      ['AAPL','MSFT','AMZN','GOOGL','META','NVDA','V','MA','JPM','SPY','QQQ','BTC','ETH'].includes(a.ticker)
+    );
+  } else if (riskMode === 'AGGRESSIVE') {
+    universe = universe.filter(a => !['SPY','QQQ','XLK','IWM'].includes(a.ticker));
+  }
+
+  return universe;
+}
+
+export const scanUniverseService = { buildUniverse };
+```
+
+---
+
+## FIX 2 — Fix Scan Timeout + Add Progress to Static Scan
+
+**File**: `server/src/routes/daily-scans.ts`
+
+Replace the entire `/trigger` route:
+
+```typescript
+router.post('/trigger', async (req: Request, res: Response) => {
+  try {
+    const {
+      runType        = 'MANUAL',
+      marketSession  = 'MARKET_OPEN',
+      assetScope     = 'ALL',
+      riskMode       = 'ALL',
+      force          = false,
+      fullUniverse   = false,
+      filterCriteria = {},
+    } = req.body ?? {};
+
+    if (!(force === true || force === 'true')) {
+      const { hasDuplicateRunToday } = await import('../services/scans/scanPersistenceService');
+      const isDuplicate = await hasDuplicateRunToday(runType, marketSession);
+      if (isDuplicate) {
+        // Return the existing completed run ID so auto trader can use it
+        const { getLatestCompletedRun } = await import('../services/scans/scanPersistenceService');
+        const existing = await getLatestCompletedRun();
+        if (existing) {
+          return res.json({ success: true, data: { scanRunId: existing.id, alreadyCompleted: true } });
+        }
+        return res.status(400).json({ success: false, error: 'A scan already ran today. Use force=true to re-run.' });
+      }
+    }
+
+    // Create run record immediately and return ID — scan runs in background
+    const { createScanRun, markRunStarted } = await import('../services/scans/scanPersistenceService');
+    const scanRun = await createScanRun({
+      runType, marketSession,
+      assetScope: assetScope as any,
+      riskMode: riskMode as any,
+      isFullUniverseScan: fullUniverse,
+    });
+    await markRunStarted(scanRun.id);
+
+    // Return immediately so UI can connect SSE stream
+    res.json({ success: true, data: { scanRunId: scanRun.id } });
+
+    // Run scan in background
+    const { runDailyScan } = await import('../services/scans/dailyScanOrchestrator');
+    runDailyScan({
+      runType, marketSession,
+      assetScope: assetScope as any,
+      riskMode: riskMode as any,
+      skipDuplicateCheck: true,
+      fullUniverse,
+      filterCriteria,
+      _existingScanRunId: scanRun.id,
+    }).catch((err: any) => {
+      console.error('[Trigger] Background scan error:', err?.message);
+    });
+
+  } catch (err) {
+    res.status(400).json({ success: false, error: err instanceof Error ? err.message : 'Scan trigger failed' });
+  }
+});
+```
+
+Also add `prisma` import at the top and a reset-stuck route before `export default router`:
+
+```typescript
+import { prisma } from '../lib/prisma';
+```
+
+```typescript
+router.post('/reset-stuck', async (req: Request, res: Response) => {
+  try {
+    const result = await prisma.dailyScanRun.updateMany({
+      where: { status: 'RUNNING' },
+      data:  { status: 'FAILED', errorMessage: 'Manually reset' },
+    });
+    res.json({ success: true, data: { reset: result.count } });
+  } catch (err) {
+    res.status(500).json({ success: false, error: 'Reset failed' });
+  }
+});
+```
+
+**File**: `server/src/services/scans/dailyScanOrchestrator.ts`
+
+Add `_existingScanRunId` to `RunScanOptions`:
+```typescript
+export interface RunScanOptions {
+  runType?:            string;
+  marketSession?:      string;
+  assetScope?:         AssetScope;
+  riskMode?:           RiskMode;
+  scheduledFor?:       Date;
+  skipDuplicateCheck?: boolean;
+  fullUniverse?:       boolean;
+  filterCriteria?:     Partial<FilterCriteria>;
+  _existingScanRunId?: string;
+}
+```
+
+Replace the `createScanRun` + `markRunStarted` block at the top of `runDailyScan()`:
+```typescript
+const scanRun = opts._existingScanRunId
+  ? { id: opts._existingScanRunId }
+  : await createScanRun({ runType, marketSession, assetScope, riskMode, scheduledFor, isFullUniverseScan: fullUniverse ?? false });
+
+if (!opts._existingScanRunId) {
+  await markRunStarted(scanRun.id);
+}
+console.log(`[DailyScan] Starting scan run ${scanRun.id} (${runType}/${marketSession})`);
+```
+
+Fix the static scan to actually emit progress updates. Find:
+```typescript
+const results = await rankCandidates(universe, 100, (done, total) => {
+  progressTick++;
+  if (progressTick % 5 === 0 || done === total) {
+    console.log(`[DailyScan] Progress: ${done}/${total} analyzed`);
+  }
+});
+```
+
+Replace with:
+```typescript
+const results = await rankCandidates(universe, 100, (done, total) => {
+  updateScanProgress(scanRun.id, 'ANALYZING', done, total);
+  if (done % 5 === 0 || done === total) {
+    console.log(`[DailyScan] Progress: ${done}/${total} analyzed`);
+  }
+});
+```
+
+**File**: `server/src/index.ts`
+
+Add prisma import and reset stuck scans on startup. Add this inside `app.listen` before `startDailyScanScheduler()`:
+
+```typescript
+// Reset any scans stuck in RUNNING state from a previous crash/restart
+try {
+  const { prisma } = await import('./lib/prisma');
+  const reset = await prisma.dailyScanRun.updateMany({
+    where: { status: 'RUNNING' },
+    data:  { status: 'FAILED', errorMessage: 'Reset on server startup' },
+  });
+  if (reset.count > 0) console.log(`[Startup] Reset ${reset.count} stuck RUNNING scan(s)`);
+} catch { /* non-fatal */ }
+```
+
+---
+
+## FIX 3 — Auto-Scan When Start Trading Is Clicked
+
+**File**: `server/src/routes/alpaca.ts`
+
+In the `/auto/start` route, after the buying power check and before the `buildSignalsFromLatestScan` call, add an auto-scan trigger:
+
+```typescript
+// Auto-run a scan if none exists or last scan was more than 6 hours ago
+const { getLatestCompletedRun } = await import('../services/scans/scanPersistenceService');
+const latestScan = await getLatestCompletedRun();
+const scanAge = latestScan?.completedAt
+  ? (Date.now() - new Date(latestScan.completedAt).getTime()) / (1000 * 60 * 60)
+  : Infinity;
+
+let scanRunId: string | undefined;
+
+if (!latestScan || scanAge > 6) {
+  console.log('[AutoStart] No recent scan found — running scan automatically');
+  try {
+    // Create scan run record and start background scan
+    const { createScanRun, markRunStarted } = await import('../services/scans/scanPersistenceService');
+    const { runDailyScan } = await import('../services/scans/dailyScanOrchestrator');
+
+    const scanRun = await createScanRun({
+      runType: 'AUTO_TRIGGERED',
+      marketSession: 'MARKET_OPEN',
+      assetScope: 'ALL' as any,
+      riskMode: 'ALL' as any,
+    });
+    await markRunStarted(scanRun.id);
+    scanRunId = scanRun.id;
+
+    // Run scan and wait for it to complete before trading
+    await runDailyScan({
+      runType: 'AUTO_TRIGGERED',
+      marketSession: 'MARKET_OPEN',
+      skipDuplicateCheck: true,
+      _existingScanRunId: scanRun.id,
+    });
+    console.log('[AutoStart] Auto-scan complete, proceeding with trading');
+  } catch (scanErr: any) {
+    console.warn('[AutoStart] Auto-scan failed:', scanErr?.message);
+    // Continue anyway — might still have old signals
+  }
+}
+```
+
+---
+
+## FIX 4 — Entry Price Uses Yahoo Finance for PAPER Exchange
+
+**File**: `server/src/services/autotrader/AutoTradeExecutor.ts`
+
+Replace the entire `resolveEntryPrice` function:
+
+```typescript
+async function resolveEntryPrice(signal: AutoTradeSignal): Promise<number> {
+  if (signal.entryPrice && signal.entryPrice > 0) return signal.entryPrice;
+
+  const exchange = signal.exchange ?? 'PAPER';
+
+  try {
+    if (signal.assetClass === 'crypto' || signal.assetClass === 'CRYPTO') {
+      const { getAssetPrice } = await import('../hyperliquid/hyperliquidInfoService');
+      const price = await getAssetPrice(signal.symbol);
+      if (price && price > 0) return price;
+    }
+
+    // PAPER: use Yahoo Finance directly — never depends on TOS being connected
+    if (exchange === 'PAPER') {
+      const { stocksService } = await import('../market/stocks/StocksService');
+      const quote = await stocksService.quote(signal.symbol);
+      if (quote?.price && quote.price > 0) return quote.price;
+    }
+
+    // TOS only
+    if (exchange === 'TOS') {
+      try {
+        const { getQuotes } = await import('../tos/tosInfoService');
+        const quotes = await getQuotes([signal.symbol]);
+        const q = quotes[signal.symbol];
+        if (q) return q.lastPrice ?? q.mark ?? q.askPrice ?? 0;
+      } catch { /* fall through */ }
+    }
+
+    // Universal fallback
+    const { stocksService } = await import('../market/stocks/StocksService');
+    const quote = await stocksService.quote(signal.symbol);
+    if (quote?.price && quote.price > 0) return quote.price;
+
+  } catch { /* ignore */ }
+
+  return 0;
+}
+```
+
+---
+
+## FIX 5 — Auto/Start Returns Scan Status + Better Error Messages
+
+**File**: `server/src/routes/alpaca.ts`
+
+In `/auto/start`, update the signals fallback to try lower conviction before erroring:
+
+```typescript
+let rawSignals = await buildSignalsFromLatestScan({
+  minConvictionScore:  activeConviction,
+  minConfidenceScore:  60,
+  allowedBiases:       ['BULLISH'],
+  maxSymbols:          maxPositions * 5,
+});
+
+// Fallback: if adaptive raised conviction too high, retry at base level
+if ((!rawSignals || rawSignals.length === 0) && activeConviction > minConvictionScore) {
+  rawSignals = await buildSignalsFromLatestScan({
+    minConvictionScore:  minConvictionScore,
+    minConfidenceScore:  55,
+    allowedBiases:       ['BULLISH'],
+    maxSymbols:          maxPositions * 5,
+  });
+}
+
+if (!rawSignals || rawSignals.length === 0) {
+  return res.status(400).json({
+    success: false,
+    error: 'No qualifying signals found after scanning. The market may be in a choppy/bearish regime with no strong bullish setups right now. Try again later or lower your conviction threshold.',
+    scanAge: latestScan ? Math.round(scanAge * 10) / 10 : null,
+    tip: 'Lower the conviction slider in parameters or wait for clearer market conditions.',
+  });
+}
+
+// Sort by quality
+const sortedSignals = [...rawSignals].sort((a: any, b: any) => {
+  const aScore = (a.thesisHealthScore ?? 0) * 0.4 + (a.convictionScore ?? 0) * 0.4 + (a.confidenceScore ?? 0) * 0.2;
+  const bScore = (b.thesisHealthScore ?? 0) * 0.4 + (b.convictionScore ?? 0) * 0.4 + (b.confidenceScore ?? 0) * 0.2;
+  return bScore - aScore;
+});
+
+const signals = sortedSignals.slice(0, maxPositions).map((s: any) => ({
+  ...s,
+  exchange:          'PAPER' as const,
+  fixedDollarAmount: adjustedPerTrade,
+}));
+```
+
+Also update the final response to include scan info:
+```typescript
+return res.json({
+  success: true,
+  data: {
+    signalsEvaluated:   results.length,
+    ordersPlaced:       placed.length,
+    ordersRejected:     rejected.length,
+    dryRun,
+    autoScanned:        !!scanRunId,   // true if we ran a scan automatically
+    scanRunId,
+    adaptiveParams,
+    activeParams: {
+      stopLossPct:            activeStop,
+      takeProfitPct:          activeTarget,
+      minConvictionScore:     activeConviction,
+      positionSizeMultiplier: activeSizeMult,
+      perTradeAmount:         adjustedPerTrade,
+    },
+    placed:   placed.map((r: any) => ({ symbol: r.symbol, status: r.status, dollarAmount: r.dollarAmount, entryPrice: r.entryPrice })),
+    rejected: rejected.map((r: any) => ({ symbol: r.symbol, reason: r.reason })),
+  },
+});
+```
+
+---
+
+## FIX 6 — Complete AutoTradingPanel Overhaul
+
+**File**: `client/src/pages/alpaca/AlpacaDashboard.tsx`
+
+Replace the entire `AutoTradingPanel` function with this version that includes a scan progress bar, live trading activity, and the positions panel:
+
+```tsx
+function AutoTradingPanel({ isDryRun: externalDryRun }: { isDryRun: boolean }) {
+  const qc = useQueryClient();
+
+  const [capitalTotal,   setCapitalTotal]   = useState(500);
+  const [maxPositions,   setMaxPositions]   = useState(3);
+  const [stopLossBase,   setStopLossBase]   = useState(3.0);
+  const [takeProfitBase, setTakeProfitBase] = useState(6.0);
+  const [convictionBase, setConvictionBase] = useState(75);
+  const [stopBounds,     setStopBounds]     = useState({ min: 1.5, max: 8.0  });
+  const [tpBounds,       setTpBounds]       = useState({ min: 3.0, max: 20.0 });
+  const [convBounds,     setConvBounds]     = useState({ min: 65,  max: 92   });
+  const [sizeBounds,     setSizeBounds]     = useState({ min: 0.3, max: 1.5  });
+  const [useAdaptive,    setUseAdaptive]    = useState(true);
+  const [dryRun,         setDryRun]         = useState(externalDryRun);
+  const [showParams,     setShowParams]     = useState(false);
+  const [showBounds,     setShowBounds]     = useState(false);
+  const [lastResult,     setLastResult]     = useState<any>(null);
+
+  // Scan progress state
+  const [scanRunId,      setScanRunId]      = useState<string | null>(null);
+  const [scanProgress,   setScanProgress]   = useState<{ phase: string; done: number; total: number } | null>(null);
+  const [isScanning,     setIsScanning]     = useState(false);
+  const [scanDone,       setScanDone]       = useState(false);
+
+  useEffect(() => { setDryRun(externalDryRun); }, [externalDryRun]);
+
+  // SSE progress stream
+  useEffect(() => {
+    if (!scanRunId || scanDone) return;
+    const progressUrl = api.scans.progress(scanRunId);
+    const es = new EventSource(progressUrl);
+    es.onmessage = (e) => {
+      try {
+        const p = JSON.parse(e.data);
+        setScanProgress(p);
+        if (p.done >= p.total && p.total > 0) {
+          setScanDone(true);
+          setIsScanning(false);
+          es.close();
+        }
+      } catch { /* ignore */ }
+    };
+    es.onerror = () => es.close();
+    return () => es.close();
+  }, [scanRunId, scanDone]);
+
+  const perTrade   = Math.floor(capitalTotal / maxPositions);
+  const rrRatio    = (takeProfitBase / stopLossBase).toFixed(1);
+  const scanPct    = scanProgress && scanProgress.total > 0
+    ? Math.round((scanProgress.done / scanProgress.total) * 100) : 0;
+
+  const bounds = { stopLoss: stopBounds, takeProfit: tpBounds, conviction: convBounds, positionPct: sizeBounds };
+
+  const { data: autoStatus, refetch: refetchStatus } = useQuery({
+    queryKey:        ['alpaca-auto-status'],
+    queryFn:         () => api.alpaca.autoStatus().then((r: any) => r.data),
+    refetchInterval: 30_000,
+  });
+
+  // Live positions from Alpaca
+  const { data: livePositions } = useQuery({
+    queryKey:        ['alpaca-positions-live'],
+    queryFn:         () => api.alpaca.positions().then((r: any) => r.data ?? []),
+    refetchInterval: 10_000,
+  });
+
+  const adapted: any = (autoStatus as any)?.adaptiveParams ?? lastResult?.adaptiveParams ?? null;
+
+  const startMutation = useMutation({
+    mutationFn: () => api.alpaca.autoStart({
+      capitalTotal, maxPositions,
+      stopLossPct: stopLossBase, takeProfitPct: takeProfitBase,
+      minConvictionScore: convictionBase,
+      dryRun, useAdaptive, bounds,
+    }),
+    onMutate: () => {
+      // Show scanning state immediately
+      setIsScanning(true);
+      setScanProgress(null);
+      setScanDone(false);
+    },
+    onSuccess: (r: any) => {
+      const d = r?.data ?? r;
+      setLastResult(d);
+      setIsScanning(false);
+      if (d?.autoScanned && d?.scanRunId) {
+        setScanRunId(d.scanRunId);
+        setScanDone(true);
+      }
+      const n = d?.ordersPlaced ?? 0;
+      if (n > 0) toast.success(`${dryRun ? '[DRY RUN] ' : ''}${n} order${n !== 1 ? 's' : ''} placed`);
+      else       toast.info('Scan complete — no strong setups found right now. Try again later.');
+      qc.invalidateQueries({ queryKey: ['alpaca-positions', 'alpaca-positions-live', 'alpaca-status', 'alpaca-auto-status', 'alpaca-orders'] });
+    },
+    onError: (e: any) => {
+      setIsScanning(false);
+      const err = e?.response?.data;
+      toast.error(err?.error ?? e?.message ?? 'Trade cycle failed', {
+        description: err?.tip ?? undefined,
+      });
+    },
+  });
+
+  const monitorMutation = useMutation({
+    mutationFn: () => api.alpaca.autoMonitor({ dryRun }),
+    onSuccess: (r: any) => {
+      const closed = (r?.data?.actions ?? []).filter((a: any) => ['CLOSED','WOULD_CLOSE'].includes(a.action));
+      if (closed.length > 0) toast.success(`${dryRun ? '[DRY RUN] ' : ''}Closed ${closed.length} position${closed.length !== 1 ? 's' : ''}`);
+      else                   toast.info('All positions within range');
+      qc.invalidateQueries({ queryKey: ['alpaca-positions', 'alpaca-positions-live', 'alpaca-status'] });
+    },
+    onError: (e: any) => toast.error(e?.response?.data?.error ?? 'Monitor failed'),
+  });
+
+  const toggleDryMutation = useMutation({
+    mutationFn: (val: boolean) => api.credentials.alpacaUpdateSettings({ dryRun: val }),
+    onSuccess: (_: any, val: boolean) => {
+      setDryRun(val);
+      qc.invalidateQueries({ queryKey: ['alpaca-status'] });
+      toast.success(val ? 'Dry Run ON' : 'Live paper mode');
+    },
+    onError: (e: any) => toast.error(e?.response?.data?.error ?? 'Failed'),
+  });
+
+  const isRunning        = startMutation.isPending || monitorMutation.isPending;
+  const todayTrades      = (autoStatus as any)?.todayTrades ?? 0;
+  const totalDeployed    = (autoStatus as any)?.totalDeployed ?? 0;
+  const positions: any[] = livePositions ?? [];
+
+  return (
+    <Card className="p-5 border border-violet-500/20 bg-gradient-to-br from-violet-950/20 to-zinc-900/50">
+
+      {/* Header */}
+      <div className="flex items-start justify-between mb-4">
+        <div className="flex items-center gap-3">
+          <div className="w-9 h-9 rounded-xl bg-violet-500/20 border border-violet-500/30 flex items-center justify-center flex-shrink-0">
+            <Zap className="w-5 h-5 text-violet-400" />
+          </div>
+          <div>
+            <h2 className="text-base font-bold text-white">Autonomous Trading</h2>
+            <p className="text-xs text-zinc-400">AI scans · picks stocks · adapts parameters · executes trades</p>
+          </div>
+        </div>
+        {todayTrades > 0 && (
+          <div className="text-right flex-shrink-0">
+            <p className="text-[10px] text-zinc-500 uppercase tracking-wider">Today</p>
+            <p className="text-sm font-bold text-violet-400">{todayTrades} trades · ${Number(totalDeployed).toFixed(0)}</p>
+          </div>
+        )}
+      </div>
+
+      {/* Stats row */}
+      <div className="grid grid-cols-4 gap-2 mb-4">
+        <div className="bg-zinc-900/60 rounded-lg p-2.5 text-center">
+          <p className="text-[10px] text-zinc-500 uppercase tracking-wider mb-1">Capital</p>
+          <p className="text-sm font-bold text-white font-mono">${capitalTotal}</p>
+        </div>
+        <div className="bg-zinc-900/60 rounded-lg p-2.5 text-center">
+          <p className="text-[10px] text-zinc-500 uppercase tracking-wider mb-1">Per Trade</p>
+          <p className="text-sm font-bold text-violet-400 font-mono">${perTrade}</p>
+        </div>
+        <div className="bg-zinc-900/60 rounded-lg p-2.5 text-center">
+          <p className="text-[10px] text-zinc-500 uppercase tracking-wider mb-1">R:R</p>
+          <p className={cn('text-sm font-bold font-mono', Number(rrRatio) >= 2 ? 'text-emerald-400' : Number(rrRatio) >= 1.5 ? 'text-yellow-400' : 'text-red-400')}>
+            {rrRatio}:1
+          </p>
+        </div>
+        <div className="bg-zinc-900/60 rounded-lg p-2.5 text-center">
+          <p className="text-[10px] text-zinc-500 uppercase tracking-wider mb-1">Open</p>
+          <p className="text-sm font-bold text-white font-mono">{positions.length}</p>
+        </div>
+      </div>
+
+      {/* SCAN PROGRESS BAR — shown while scanning */}
+      {(isScanning || (scanProgress && !scanDone)) && (
+        <div className="mb-4 p-3 bg-blue-500/10 border border-blue-500/20 rounded-lg">
+          <div className="flex items-center justify-between mb-2">
+            <div className="flex items-center gap-2">
+              <RefreshCw className="w-3.5 h-3.5 text-blue-400 animate-spin" />
+              <span className="text-xs font-medium text-blue-300">
+                {scanProgress ? `Analyzing universe… ${scanProgress.done} / ${scanProgress.total} symbols` : 'Running market scan…'}
+              </span>
+            </div>
+            <span className="text-xs font-mono text-blue-400">{scanPct}%</span>
+          </div>
+          <div className="h-2 bg-zinc-800 rounded-full overflow-hidden">
+            <div
+              className="h-full bg-blue-500 rounded-full transition-all duration-300"
+              style={{ width: `${isScanning && !scanProgress ? 5 : scanPct}%` }}
+            />
+          </div>
+          <p className="text-[10px] text-zinc-500 mt-1.5">
+            {scanProgress
+              ? `Scanning ${scanProgress.total} stocks & crypto for the best opportunities…`
+              : 'No recent scan found — running automatically to find today\'s best setups…'}
+          </p>
+        </div>
+      )}
+
+      {/* AI reasoning */}
+      {useAdaptive && adapted && !isScanning && (
+        <div className="mb-4 rounded-lg bg-violet-950/40 border border-violet-500/20 p-3">
+          <div className="flex items-center gap-2 mb-2">
+            <Brain className="w-3.5 h-3.5 text-violet-400" />
+            <span className="text-xs font-semibold text-violet-300">AI Adjustments Active</span>
+            <span className="ml-auto text-[10px] text-zinc-500">{adapted.regime}</span>
+          </div>
+          <ul className="space-y-1">
+            {(adapted.reasoning ?? []).map((r: string, i: number) => (
+              <li key={i} className="flex items-start gap-1.5 text-[11px] text-zinc-400">
+                <span className="text-violet-500 mt-0.5 flex-shrink-0">·</span>{r}
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
+
+      {/* Action buttons */}
+      <div className="flex gap-2 mb-3">
+        <button
+          onClick={() => startMutation.mutate()}
+          disabled={isRunning}
+          className={cn(
+            'flex-1 py-3 rounded-xl font-bold text-sm flex items-center justify-center gap-2 transition-all shadow-lg',
+            dryRun ? 'bg-violet-600/30 hover:bg-violet-600/40 border border-violet-500/50 text-violet-300'
+                   : 'bg-violet-600 hover:bg-violet-700 text-white shadow-violet-900/40',
+            isRunning && 'opacity-50 cursor-not-allowed',
+          )}
+        >
+          {isRunning
+            ? <><RefreshCw className="w-4 h-4 animate-spin" /> {isScanning ? 'Scanning market…' : 'Executing trades…'}</>
+            : <><Zap className="w-4 h-4" /> {dryRun ? 'Simulate Trades' : 'Start Trading'}</>
+          }
+        </button>
+        <button
+          onClick={() => monitorMutation.mutate()}
+          disabled={isRunning}
+          className="px-4 py-3 rounded-xl bg-zinc-800 hover:bg-zinc-700 border border-zinc-700 text-zinc-300 text-sm font-medium transition-colors disabled:opacity-40 flex items-center gap-1.5 flex-shrink-0"
+        >
+          {monitorMutation.isPending ? <RefreshCw className="w-4 h-4 animate-spin" /> : <Activity className="w-4 h-4" />}
+          <span className="hidden sm:inline">Check Exits</span>
+        </button>
+      </div>
+
+      {/* Toggles */}
+      <div className="flex items-center gap-4 px-1 mb-3">
+        <div className="flex items-center gap-2 flex-1">
+          <button onClick={() => toggleDryMutation.mutate(!dryRun)} disabled={toggleDryMutation.isPending}
+            className={cn('relative w-10 h-5 rounded-full transition-colors flex-shrink-0', dryRun ? 'bg-violet-600' : 'bg-emerald-600')}>
+            <span className={cn('absolute top-0.5 w-4 h-4 bg-white rounded-full shadow transition-all', dryRun ? 'left-0.5' : 'left-5')} />
+          </button>
+          <span className="text-xs text-zinc-400">Dry Run</span>
+        </div>
+        <div className="flex items-center gap-2 flex-1">
+          <button onClick={() => setUseAdaptive(v => !v)}
+            className={cn('relative w-10 h-5 rounded-full transition-colors flex-shrink-0', useAdaptive ? 'bg-violet-600' : 'bg-zinc-600')}>
+            <span className={cn('absolute top-0.5 w-4 h-4 bg-white rounded-full shadow transition-all', useAdaptive ? 'left-5' : 'left-0.5')} />
+          </button>
+          <span className="text-xs text-zinc-400">AI Adapt</span>
+          <Brain className={cn('w-3 h-3', useAdaptive ? 'text-violet-400' : 'text-zinc-600')} />
+        </div>
+      </div>
+
+      {!dryRun && (
+        <div className="mb-3 flex items-start gap-2 p-2.5 bg-amber-500/10 border border-amber-500/30 rounded-lg">
+          <AlertTriangle className="w-3.5 h-3.5 text-amber-400 flex-shrink-0 mt-0.5" />
+          <p className="text-[11px] text-amber-400">Live paper mode — orders execute on Alpaca. Still paper money.</p>
+        </div>
+      )}
+
+      {/* Parameters */}
+      <button onClick={() => setShowParams(p => !p)} className="w-full flex items-center gap-1.5 text-xs text-zinc-500 hover:text-zinc-300 py-1">
+        {showParams ? <ChevronUp className="w-3.5 h-3.5" /> : <ChevronDown className="w-3.5 h-3.5" />}
+        {showParams ? 'Hide parameters' : 'Adjust parameters'}
+      </button>
+
+      {showParams && (
+        <div className="space-y-3 pt-3 border-t border-zinc-800 mt-1">
+          {[
+            { label: 'Total Capital ($)',    val: capitalTotal,   set: setCapitalTotal,   min: 100,  max: 10000, step: 100,  fmt: (v: number) => `$${v}` },
+            { label: 'Max Positions',        val: maxPositions,   set: setMaxPositions,   min: 1,    max: 10,    step: 1,    fmt: (v: number) => `${v}` },
+            { label: 'Stop Loss (%)',         val: stopLossBase,   set: setStopLossBase,   min: 1,    max: 12,    step: 0.5,  fmt: (v: number) => `-${v}%` },
+            { label: 'Take Profit (%)',       val: takeProfitBase, set: setTakeProfitBase, min: 2,    max: 30,    step: 0.5,  fmt: (v: number) => `+${v}%` },
+            { label: 'Min Conviction',        val: convictionBase, set: setConvictionBase, min: 50,   max: 92,    step: 1,    fmt: (v: number) => `${v}/100` },
+          ].map(({ label, val, set, min, max, step, fmt }) => (
+            <div key={label}>
+              <div className="flex justify-between mb-1">
+                <label className="text-xs text-zinc-400">{label}</label>
+                <span className="text-xs font-mono text-white">{fmt(val)}</span>
+              </div>
+              <input type="range" min={min} max={max} step={step} value={val}
+                onChange={e => set(Number(e.target.value))} className="w-full accent-violet-500" />
+            </div>
+          ))}
+        </div>
+      )}
+
+      {/* ── LIVE POSITIONS PANEL ── */}
+      {positions.length > 0 && (
+        <div className="mt-4 pt-3 border-t border-zinc-800">
+          <div className="flex items-center gap-2 mb-2">
+            <Activity className="w-3.5 h-3.5 text-emerald-400" />
+            <p className="text-xs font-semibold text-zinc-200">Live Positions</p>
+            <span className="ml-auto text-[10px] text-zinc-500">auto-refresh 10s</span>
+          </div>
+          <div className="space-y-1.5">
+            {positions.map((p: any) => {
+              const pnlPct = parseFloat(p.unrealized_plpc ?? '0') * 100;
+              const pnl    = parseFloat(p.unrealized_pl ?? '0');
+              const val    = parseFloat(p.market_value ?? '0');
+              return (
+                <div key={p.symbol} className={cn(
+                  'flex items-center gap-2 text-xs rounded-lg px-3 py-2 border',
+                  pnlPct >= 0 ? 'bg-emerald-500/10 border-emerald-500/20' : 'bg-red-500/10 border-red-500/20'
+                )}>
+                  <span className={cn('px-1.5 py-0.5 rounded text-[10px] font-bold', p.side === 'long' ? 'bg-emerald-500/20 text-emerald-400' : 'bg-red-500/20 text-red-400')}>
+                    {(p.side ?? 'long').toUpperCase()}
+                  </span>
+                  <span className="font-mono font-bold text-white w-14">{p.symbol}</span>
+                  <span className="text-zinc-400 flex-1">${parseFloat(p.avg_entry_price ?? '0').toFixed(2)} → ${parseFloat(p.current_price ?? '0').toFixed(2)}</span>
+                  <span className="text-zinc-400">${val.toFixed(0)}</span>
+                  <span className={cn('font-mono font-bold ml-auto flex-shrink-0', pnlPct >= 0 ? 'text-emerald-400' : 'text-red-400')}>
+                    {pnlPct >= 0 ? '+' : ''}{pnlPct.toFixed(2)}%
+                  </span>
+                  <span className={cn('text-[10px] font-mono flex-shrink-0', pnl >= 0 ? 'text-emerald-400' : 'text-red-400')}>
+                    {pnl >= 0 ? '+' : ''}${Math.abs(pnl).toFixed(2)}
+                  </span>
+                </div>
+              );
+            })}
+            {/* Portfolio total */}
+            <div className="flex items-center gap-2 text-xs px-3 py-1.5 border-t border-zinc-800 mt-1 pt-2">
+              <span className="text-zinc-500">Portfolio P&L</span>
+              <span className={cn('font-mono font-bold ml-auto', positions.reduce((s: number, p: any) => s + parseFloat(p.unrealized_pl ?? '0'), 0) >= 0 ? 'text-emerald-400' : 'text-red-400')}>
+                {(() => {
+                  const total = positions.reduce((s: number, p: any) => s + parseFloat(p.unrealized_pl ?? '0'), 0);
+                  return `${total >= 0 ? '+' : ''}$${Math.abs(total).toFixed(2)}`;
+                })()}
+              </span>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Last run results */}
+      {lastResult && !isScanning && (
+        <div className="mt-3 pt-3 border-t border-zinc-800">
+          <div className="flex items-center gap-3 text-xs mb-2 flex-wrap">
+            <span className="text-zinc-500">Last run:</span>
+            <span>Scanned <strong className="text-white">{lastResult.signalsEvaluated ?? '—'}</strong></span>
+            <span>Placed <strong className="text-violet-400">{lastResult.ordersPlaced ?? 0}</strong></span>
+            {(lastResult.ordersRejected ?? 0) > 0 && <span>Skipped <strong className="text-zinc-500">{lastResult.ordersRejected}</strong></span>}
+            {lastResult.autoScanned && <span className="text-[10px] text-blue-400 bg-blue-900/30 px-1.5 py-0.5 rounded">Auto-scanned</span>}
+            {lastResult.dryRun && <span className="text-[10px] text-violet-400 bg-violet-900/40 px-1.5 py-0.5 rounded">DRY RUN</span>}
+          </div>
+          {(lastResult.placed ?? []).map((p: any) => (
+            <div key={p.symbol} className="flex items-center gap-2 text-xs bg-zinc-900/60 rounded px-2 py-1.5 mb-1">
+              <CheckCircle2 className="w-3 h-3 text-emerald-400 flex-shrink-0" />
+              <span className="font-mono font-bold text-white w-16">{p.symbol}</span>
+              <span className="text-zinc-400">${Number(p.dollarAmount ?? 0).toFixed(0)}</span>
+              {p.entryPrice && <span className="text-zinc-500">@ ${Number(p.entryPrice).toFixed(2)}</span>}
+            </div>
+          ))}
+          {(lastResult.rejected ?? []).slice(0, 3).map((r: any) => (
+            <div key={r.symbol} className="flex items-center gap-2 text-xs opacity-40 rounded px-2 py-1 mb-1">
+              <XCircle className="w-3 h-3 text-zinc-500 flex-shrink-0" />
+              <span className="font-mono text-zinc-400 w-16">{r.symbol}</span>
+              <span className="text-zinc-600 truncate text-[10px]">{r.reason}</span>
+            </div>
+          ))}
+        </div>
+      )}
+    </Card>
+  );
+}
+```
+
+Make sure these imports exist at the top of `AlpacaDashboard.tsx` — add any missing ones:
+```tsx
+import { useState, useEffect } from 'react';
+import { Brain, CheckCircle2, XCircle } from 'lucide-react';
+```
+
+---
+
+## FIX 7 — Add resetStuck to API client
+
+**File**: `client/src/api/client.ts`
+
+In the `scans` section, add:
+```typescript
+resetStuck: () => post('/daily-scans/reset-stuck', {}),
+```
+
+---
+
+## SUMMARY
+
+### Files Modified
+```
+server/src/services/scans/scanUniverseService.ts     → 70 stocks + 20 crypto + 8 ETFs = 98 symbols
+server/src/routes/daily-scans.ts                    → non-blocking trigger, returns existing scan ID if today's already done
+server/src/services/scans/dailyScanOrchestrator.ts  → _existingScanRunId, SSE progress for static scan
+server/src/routes/alpaca.ts                         → auto-scan if no recent scan, fallback conviction, better errors
+server/src/services/autotrader/AutoTradeExecutor.ts → entry price uses Yahoo Finance for PAPER exchange
+server/src/index.ts                                 → reset stuck RUNNING scans on startup
+client/src/pages/alpaca/AlpacaDashboard.tsx         → full AutoTradingPanel rewrite with scan progress + positions panel
+client/src/api/client.ts                            → scans.resetStuck()
+```
+
+### What Changes for the User
+
+1. **Start Trading button** — if no scan has run today, it automatically scans the full universe first then trades. A live progress bar shows `Analyzing universe… 34 / 98 symbols`
+2. **Positions panel** — live positions appear directly in the Autonomous Trading card, showing symbol, side, entry → current price, market value, P&L % and $. Auto-refreshes every 10 seconds
+3. **Last run summary** — shows how many signals were scanned, how many orders placed, which symbols were bought
+4. **Universe** — expanded from 24 to 98 symbols across 12 sectors, dramatically increasing the chance of finding qualifying setups
+5. **No more "run a daily scan first"** — the button handles everything end-to-end

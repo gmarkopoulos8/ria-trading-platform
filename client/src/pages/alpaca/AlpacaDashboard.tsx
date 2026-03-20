@@ -849,36 +849,62 @@ function AutoTradingPanel({ isDryRun: externalDryRun }: { isDryRun: boolean }) {
   const [stopLossBase,   setStopLossBase]   = useState(3.0);
   const [takeProfitBase, setTakeProfitBase] = useState(6.0);
   const [convictionBase, setConvictionBase] = useState(75);
+  const [stopBounds,     setStopBounds]     = useState({ min: 1.5, max: 8.0  });
+  const [tpBounds,       setTpBounds]       = useState({ min: 3.0, max: 20.0 });
+  const [convBounds,     setConvBounds]     = useState({ min: 65,  max: 92   });
+  const [sizeBounds,     setSizeBounds]     = useState({ min: 0.3, max: 1.5  });
+  const [useAdaptive,    setUseAdaptive]    = useState(true);
+  const [dryRun,         setDryRun]         = useState(externalDryRun);
+  const [showParams,     setShowParams]     = useState(false);
+  const [showBounds,     setShowBounds]     = useState(false);
+  const [lastResult,     setLastResult]     = useState<any>(null);
 
-  const [stopBounds,  setStopBounds]  = useState({ min: 1.5, max: 8.0  });
-  const [tpBounds,    setTpBounds]    = useState({ min: 3.0, max: 20.0 });
-  const [convBounds,  setConvBounds]  = useState({ min: 65,  max: 92   });
-  const [sizeBounds,  setSizeBounds]  = useState({ min: 0.3, max: 1.0  });
-
-  const [useAdaptive,      setUseAdaptive]      = useState(true);
-  const [dryRun,           setDryRun]           = useState(externalDryRun);
-  const [showParams,       setShowParams]       = useState(false);
-  const [showBounds,       setShowBounds]       = useState(false);
-  const [lastResult,       setLastResult]       = useState<any>(null);
-  const [tradingMode,      setTradingMode]      = useState<'stocks' | 'options' | 'both'>('stocks');
-  const [maxOptionsRiskPct, setMaxOptionsRiskPct] = useState(1.5);
+  // Scan progress state
+  const [scanRunId,      setScanRunId]      = useState<string | null>(null);
+  const [scanProgress,   setScanProgress]   = useState<{ phase: string; done: number; total: number } | null>(null);
+  const [isScanning,     setIsScanning]     = useState(false);
+  const [scanDone,       setScanDone]       = useState(false);
 
   useEffect(() => { setDryRun(externalDryRun); }, [externalDryRun]);
 
-  const perTrade = Math.floor(capitalTotal / maxPositions);
-  const rrRatio  = (takeProfitBase / stopLossBase).toFixed(1);
+  // SSE progress stream
+  useEffect(() => {
+    if (!scanRunId || scanDone) return;
+    const progressUrl = api.scans.progress(scanRunId);
+    const es = new EventSource(progressUrl);
+    es.onmessage = (e) => {
+      try {
+        const p = JSON.parse(e.data);
+        setScanProgress(p);
+        if (p.done >= p.total && p.total > 0) {
+          setScanDone(true);
+          setIsScanning(false);
+          es.close();
+        }
+      } catch { /* ignore */ }
+    };
+    es.onerror = () => es.close();
+    return () => es.close();
+  }, [scanRunId, scanDone]);
 
-  const bounds = {
-    stopLoss:    stopBounds,
-    takeProfit:  tpBounds,
-    conviction:  convBounds,
-    positionPct: sizeBounds,
-  };
+  const perTrade   = Math.floor(capitalTotal / maxPositions);
+  const rrRatio    = (takeProfitBase / stopLossBase).toFixed(1);
+  const scanPct    = scanProgress && scanProgress.total > 0
+    ? Math.round((scanProgress.done / scanProgress.total) * 100) : 0;
 
-  const { data: autoStatus, refetch: refetchStatus } = useQuery({
+  const bounds = { stopLoss: stopBounds, takeProfit: tpBounds, conviction: convBounds, positionPct: sizeBounds };
+
+  const { data: autoStatus } = useQuery({
     queryKey:        ['alpaca-auto-status'],
     queryFn:         () => api.alpaca.autoStatus().then((r: any) => r.data),
     refetchInterval: 30_000,
+  });
+
+  // Live positions from Alpaca
+  const { data: livePositions } = useQuery({
+    queryKey:        ['alpaca-positions-live'],
+    queryFn:         () => api.alpaca.positions().then((r: any) => r.data ?? []),
+    refetchInterval: 10_000,
   });
 
   const adapted: any = (autoStatus as any)?.adaptiveParams ?? lastResult?.adaptiveParams ?? null;
@@ -886,35 +912,46 @@ function AutoTradingPanel({ isDryRun: externalDryRun }: { isDryRun: boolean }) {
   const startMutation = useMutation({
     mutationFn: () => api.alpaca.autoStart({
       capitalTotal, maxPositions,
-      stopLossPct: stopLossBase, takeProfitPct: takeProfitBase, minConvictionScore: convictionBase,
-      dryRun, useAdaptive, bounds, tradingMode, maxOptionsRiskPct,
+      stopLossPct: stopLossBase, takeProfitPct: takeProfitBase,
+      minConvictionScore: convictionBase,
+      dryRun, useAdaptive, bounds,
     }),
+    onMutate: () => {
+      setIsScanning(true);
+      setScanProgress(null);
+      setScanDone(false);
+    },
     onSuccess: (r: any) => {
       const d = r?.data ?? r;
       setLastResult(d);
+      setIsScanning(false);
+      if (d?.autoScanned && d?.scanRunId) {
+        setScanRunId(d.scanRunId);
+        setScanDone(true);
+      }
       const n = d?.ordersPlaced ?? 0;
       if (n > 0) toast.success(`${dryRun ? '[DRY RUN] ' : ''}${n} order${n !== 1 ? 's' : ''} placed`);
-      else       toast.info('No qualifying trades found. Run a Daily Scan first.');
-      qc.invalidateQueries({ queryKey: ['alpaca-positions', 'alpaca-status', 'alpaca-auto-status', 'alpaca-orders'] });
+      else       toast.info('Scan complete — no strong setups found right now. Try again later.');
+      qc.invalidateQueries({ queryKey: ['alpaca-positions', 'alpaca-positions-live', 'alpaca-status', 'alpaca-auto-status', 'alpaca-orders'] });
     },
-    onError: (e: any) => toast.error(e?.response?.data?.error ?? e?.message ?? 'Trade cycle failed'),
+    onError: (e: any) => {
+      setIsScanning(false);
+      const err = e?.response?.data;
+      toast.error(err?.error ?? e?.message ?? 'Trade cycle failed', {
+        description: err?.tip ?? undefined,
+      });
+    },
   });
 
   const monitorMutation = useMutation({
     mutationFn: () => api.alpaca.autoMonitor({ dryRun }),
     onSuccess: (r: any) => {
-      const closed = (r?.data?.actions ?? []).filter((a: any) => ['CLOSED', 'WOULD_CLOSE'].includes(a.action));
-      if (closed.length > 0) toast.success(`${dryRun ? '[DRY RUN] Would close' : 'Closed'} ${closed.length} position${closed.length !== 1 ? 's' : ''}`);
-      else                   toast.info('All positions within range — holding');
-      qc.invalidateQueries({ queryKey: ['alpaca-positions', 'alpaca-status'] });
+      const closed = (r?.data?.actions ?? []).filter((a: any) => ['CLOSED','WOULD_CLOSE'].includes(a.action));
+      if (closed.length > 0) toast.success(`${dryRun ? '[DRY RUN] ' : ''}Closed ${closed.length} position${closed.length !== 1 ? 's' : ''}`);
+      else                   toast.info('All positions within range');
+      qc.invalidateQueries({ queryKey: ['alpaca-positions', 'alpaca-positions-live', 'alpaca-status'] });
     },
     onError: (e: any) => toast.error(e?.response?.data?.error ?? 'Monitor failed'),
-  });
-
-  const refreshAdaptiveMutation = useMutation({
-    mutationFn: () => api.alpaca.autoAdjust({ base: { stopLossPct: stopLossBase, takeProfitPct: takeProfitBase, minConvictionScore: convictionBase }, bounds }),
-    onSuccess: () => { toast.success('AI parameters refreshed'); refetchStatus(); },
-    onError: (e: any) => toast.error(e?.response?.data?.error ?? 'Refresh failed'),
   });
 
   const toggleDryMutation = useMutation({
@@ -922,28 +959,20 @@ function AutoTradingPanel({ isDryRun: externalDryRun }: { isDryRun: boolean }) {
     onSuccess: (_: any, val: boolean) => {
       setDryRun(val);
       qc.invalidateQueries({ queryKey: ['alpaca-status'] });
-      toast.success(val ? 'Dry Run ON' : 'Live paper mode — orders go to Alpaca');
+      toast.success(val ? 'Dry Run ON' : 'Live paper mode');
     },
     onError: (e: any) => toast.error(e?.response?.data?.error ?? 'Failed'),
   });
 
-  const isRunning = startMutation.isPending || monitorMutation.isPending;
-
-  const active = useAdaptive && adapted ? {
-    stop:       adapted.stopLossPct,
-    target:     adapted.takeProfitPct,
-    conviction: adapted.minConvictionScore,
-    sizeMult:   adapted.positionSizeMultiplier,
-  } : {
-    stop:       stopLossBase,
-    target:     takeProfitBase,
-    conviction: convictionBase,
-    sizeMult:   1.0,
-  };
-  const activePerTrade = Math.floor(perTrade * active.sizeMult);
+  const isRunning        = startMutation.isPending || monitorMutation.isPending;
+  const todayTrades      = (autoStatus as any)?.todayTrades ?? 0;
+  const totalDeployed    = (autoStatus as any)?.totalDeployed ?? 0;
+  const positions: any[] = livePositions ?? [];
 
   return (
     <Card className="p-5 border border-violet-500/20 bg-gradient-to-br from-violet-950/20 to-zinc-900/50">
+
+      {/* Header */}
       <div className="flex items-start justify-between mb-4">
         <div className="flex items-center gap-3">
           <div className="w-9 h-9 rounded-xl bg-violet-500/20 border border-violet-500/30 flex items-center justify-center flex-shrink-0">
@@ -951,17 +980,18 @@ function AutoTradingPanel({ isDryRun: externalDryRun }: { isDryRun: boolean }) {
           </div>
           <div>
             <h2 className="text-base font-bold text-white">Autonomous Trading</h2>
-            <p className="text-xs text-zinc-400">AI analyzes market · picks stocks · adapts parameters · executes trades</p>
+            <p className="text-xs text-zinc-400">AI scans · picks stocks · adapts parameters · executes trades</p>
           </div>
         </div>
-        {((autoStatus as any)?.todayTrades ?? 0) > 0 && (
+        {todayTrades > 0 && (
           <div className="text-right flex-shrink-0">
             <p className="text-[10px] text-zinc-500 uppercase tracking-wider">Today</p>
-            <p className="text-sm font-bold text-violet-400">{(autoStatus as any).todayTrades} trades · ${((autoStatus as any).totalDeployed ?? 0).toFixed(0)}</p>
+            <p className="text-sm font-bold text-violet-400">{todayTrades} trades · ${Number(totalDeployed).toFixed(0)}</p>
           </div>
         )}
       </div>
 
+      {/* Stats row */}
       <div className="grid grid-cols-4 gap-2 mb-4">
         <div className="bg-zinc-900/60 rounded-lg p-2.5 text-center">
           <p className="text-[10px] text-zinc-500 uppercase tracking-wider mb-1">Capital</p>
@@ -969,86 +999,84 @@ function AutoTradingPanel({ isDryRun: externalDryRun }: { isDryRun: boolean }) {
         </div>
         <div className="bg-zinc-900/60 rounded-lg p-2.5 text-center">
           <p className="text-[10px] text-zinc-500 uppercase tracking-wider mb-1">Per Trade</p>
-          <p className={cn('text-sm font-bold font-mono', active.sizeMult < 1 ? 'text-amber-400' : 'text-violet-400')}>
-            ${activePerTrade}
-            {useAdaptive && active.sizeMult !== 1.0 && <span className="text-[9px] ml-1">{active.sizeMult < 1 ? '▼' : '▲'}{Math.abs(Math.round((active.sizeMult - 1) * 100))}%</span>}
+          <p className="text-sm font-bold text-violet-400 font-mono">${perTrade}</p>
+        </div>
+        <div className="bg-zinc-900/60 rounded-lg p-2.5 text-center">
+          <p className="text-[10px] text-zinc-500 uppercase tracking-wider mb-1">R:R</p>
+          <p className={cn('text-sm font-bold font-mono', Number(rrRatio) >= 2 ? 'text-emerald-400' : Number(rrRatio) >= 1.5 ? 'text-yellow-400' : 'text-red-400')}>
+            {rrRatio}:1
           </p>
         </div>
         <div className="bg-zinc-900/60 rounded-lg p-2.5 text-center">
-          <p className="text-[10px] text-zinc-500 uppercase tracking-wider mb-1">Stop</p>
-          <p className={cn('text-sm font-bold font-mono', active.stop !== stopLossBase ? 'text-amber-400' : 'text-red-400')}>
-            -{active.stop}%
-          </p>
-        </div>
-        <div className="bg-zinc-900/60 rounded-lg p-2.5 text-center">
-          <p className="text-[10px] text-zinc-500 uppercase tracking-wider mb-1">Target</p>
-          <p className={cn('text-sm font-bold font-mono', active.target !== takeProfitBase ? 'text-amber-400' : 'text-emerald-400')}>
-            +{active.target}%
-          </p>
+          <p className="text-[10px] text-zinc-500 uppercase tracking-wider mb-1">Open</p>
+          <p className="text-sm font-bold text-white font-mono">{positions.length}</p>
         </div>
       </div>
 
-      {useAdaptive && adapted && (
+      {/* SCAN PROGRESS BAR — shown while scanning */}
+      {(isScanning || (scanProgress && !scanDone)) && (
+        <div className="mb-4 p-3 bg-blue-500/10 border border-blue-500/20 rounded-lg">
+          <div className="flex items-center justify-between mb-2">
+            <div className="flex items-center gap-2">
+              <RefreshCw className="w-3.5 h-3.5 text-blue-400 animate-spin" />
+              <span className="text-xs font-medium text-blue-300">
+                {scanProgress ? `Analyzing universe… ${scanProgress.done} / ${scanProgress.total} symbols` : 'Running market scan…'}
+              </span>
+            </div>
+            <span className="text-xs font-mono text-blue-400">{scanPct}%</span>
+          </div>
+          <div className="h-2 bg-zinc-800 rounded-full overflow-hidden">
+            <div
+              className="h-full bg-blue-500 rounded-full transition-all duration-300"
+              style={{ width: `${isScanning && !scanProgress ? 5 : scanPct}%` }}
+            />
+          </div>
+          <p className="text-[10px] text-zinc-500 mt-1.5">
+            {scanProgress
+              ? `Scanning ${scanProgress.total} stocks & crypto for the best opportunities…`
+              : 'No recent scan found — running automatically to find today\'s best setups…'}
+          </p>
+        </div>
+      )}
+
+      {/* AI reasoning */}
+      {useAdaptive && adapted && !isScanning && (
         <div className="mb-4 rounded-lg bg-violet-950/40 border border-violet-500/20 p-3">
           <div className="flex items-center gap-2 mb-2">
             <Brain className="w-3.5 h-3.5 text-violet-400" />
             <span className="text-xs font-semibold text-violet-300">AI Adjustments Active</span>
-            <span className="ml-auto text-[10px] text-zinc-500">
-              {adapted.regime} · updated {new Date(adapted.adjustedAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
-            </span>
-            <button
-              onClick={() => refreshAdaptiveMutation.mutate()}
-              disabled={refreshAdaptiveMutation.isPending}
-              className="text-zinc-600 hover:text-violet-400 transition-colors ml-1"
-              title="Refresh AI parameters now"
-            >
-              <RefreshCw className={cn('w-3 h-3', refreshAdaptiveMutation.isPending && 'animate-spin')} />
-            </button>
+            <span className="ml-auto text-[10px] text-zinc-500">{adapted.regime}</span>
           </div>
           <ul className="space-y-1">
             {(adapted.reasoning ?? []).map((r: string, i: number) => (
               <li key={i} className="flex items-start gap-1.5 text-[11px] text-zinc-400">
-                <span className="text-violet-500 mt-0.5 flex-shrink-0">·</span>
-                {r}
+                <span className="text-violet-500 mt-0.5 flex-shrink-0">·</span>{r}
               </li>
             ))}
           </ul>
         </div>
       )}
 
-      {useAdaptive && !adapted && (
-        <div className="mb-4 flex items-center gap-2 p-2.5 rounded-lg bg-zinc-900/40 border border-zinc-800 text-xs text-zinc-500">
-          <Brain className="w-3.5 h-3.5 text-zinc-600 flex-shrink-0" />
-          AI parameter adjustment will run on first trade cycle and every 30 min during market hours.
-        </div>
-      )}
-
-      <div className="flex items-start gap-2 p-2.5 rounded-lg bg-zinc-900/40 border border-zinc-800 mb-4 text-[11px] text-zinc-500">
-        <Activity className="w-3.5 h-3.5 text-zinc-600 flex-shrink-0 mt-0.5" />
-        <span>Reads the latest daily scan, picks the highest-conviction stocks, and places paper market orders on Alpaca. The AI adjusts stop/target/size within your allowed ranges based on market regime and trade performance. Use <strong className="text-zinc-400">Check Exits</strong> to close positions that hit limits.</span>
-      </div>
-
+      {/* Action buttons */}
       <div className="flex gap-2 mb-3">
         <button
           onClick={() => startMutation.mutate()}
           disabled={isRunning}
           className={cn(
             'flex-1 py-3 rounded-xl font-bold text-sm flex items-center justify-center gap-2 transition-all shadow-lg',
-            dryRun
-              ? 'bg-violet-600/30 hover:bg-violet-600/40 border border-violet-500/50 text-violet-300'
-              : 'bg-violet-600 hover:bg-violet-700 text-white shadow-violet-900/40',
+            dryRun ? 'bg-violet-600/30 hover:bg-violet-600/40 border border-violet-500/50 text-violet-300'
+                   : 'bg-violet-600 hover:bg-violet-700 text-white shadow-violet-900/40',
             isRunning && 'opacity-50 cursor-not-allowed',
           )}
         >
-          {startMutation.isPending
-            ? <><RefreshCw className="w-4 h-4 animate-spin" /> Analyzing &amp; trading…</>
+          {isRunning
+            ? <><RefreshCw className="w-4 h-4 animate-spin" /> {isScanning ? 'Scanning market…' : 'Executing trades…'}</>
             : <><Zap className="w-4 h-4" /> {dryRun ? 'Simulate Trades' : 'Start Trading'}</>
           }
         </button>
         <button
           onClick={() => monitorMutation.mutate()}
           disabled={isRunning}
-          title="Check if any positions hit their stop or take-profit"
           className="px-4 py-3 rounded-xl bg-zinc-800 hover:bg-zinc-700 border border-zinc-700 text-zinc-300 text-sm font-medium transition-colors disabled:opacity-40 flex items-center gap-1.5 flex-shrink-0"
         >
           {monitorMutation.isPending ? <RefreshCw className="w-4 h-4 animate-spin" /> : <Activity className="w-4 h-4" />}
@@ -1056,77 +1084,18 @@ function AutoTradingPanel({ isDryRun: externalDryRun }: { isDryRun: boolean }) {
         </button>
       </div>
 
-      {/* Trading Mode Selector */}
-      <div className="flex gap-1.5 mb-3 p-1 bg-zinc-900/60 rounded-xl border border-zinc-800">
-        {([
-          { value: 'stocks',  label: 'Stocks Only',      icon: '📈' },
-          { value: 'both',    label: 'Stocks + Options', icon: '⚡' },
-          { value: 'options', label: 'Options Only',     icon: '🎯' },
-        ] as const).map(({ value, label, icon }) => (
-          <button
-            key={value}
-            onClick={() => setTradingMode(value)}
-            className={cn(
-              'flex-1 py-1.5 px-2 rounded-lg text-[11px] font-medium transition-all',
-              tradingMode === value
-                ? 'bg-violet-600 text-white shadow'
-                : 'text-zinc-500 hover:text-zinc-300',
-            )}
-          >
-            <span className="mr-1">{icon}</span>{label}
-          </button>
-        ))}
-      </div>
-
-      {(tradingMode === 'options' || tradingMode === 'both') && (
-        <div className="mb-3 p-2.5 bg-blue-500/10 border border-blue-500/20 rounded-lg space-y-2">
-          <ul className="space-y-0.5">
-            {[
-              '📈 Bullish + low IV → Buy calls or spread',
-              '📈 Bullish + high IV → Sell cash-secured put or covered call',
-              '➡️ Neutral + high IV → Iron condor (range-bound income)',
-              '📉 Bearish + high IV → Bear put spread / iron condor',
-              '⚡ No stock signals → Sell premium on SPY, AAPL, etc.',
-            ].map(line => (
-              <li key={line} className="text-[10px] text-zinc-400 flex items-start gap-1.5">
-                <span className="flex-shrink-0">{line.slice(0, 2)}</span>
-                <span>{line.slice(2)}</span>
-              </li>
-            ))}
-          </ul>
-          <div className="flex items-center justify-between pt-1 border-t border-blue-500/10">
-            <span className="text-xs text-zinc-400">Options risk per trade (%)</span>
-            <div className="flex items-center gap-2">
-              <input
-                type="range" min={0.5} max={5} step={0.5} value={maxOptionsRiskPct}
-                onChange={e => setMaxOptionsRiskPct(Number(e.target.value))}
-                className="w-24 accent-blue-500"
-              />
-              <span className="text-xs font-mono text-white w-8">{maxOptionsRiskPct}%</span>
-            </div>
-          </div>
-          <p className="text-[10px] text-zinc-600">
-            ~${Math.floor((capitalTotal / maxPositions) * maxOptionsRiskPct / 100)} per trade · Requires FINNHUB_API_KEY
-          </p>
-        </div>
-      )}
-
+      {/* Toggles */}
       <div className="flex items-center gap-4 px-1 mb-3">
         <div className="flex items-center gap-2 flex-1">
-          <button
-            onClick={() => toggleDryMutation.mutate(!dryRun)}
-            disabled={toggleDryMutation.isPending}
-            className={cn('relative w-10 h-5 rounded-full transition-colors flex-shrink-0', dryRun ? 'bg-violet-600' : 'bg-emerald-600')}
-          >
-            <span className={cn('absolute top-0.5 w-4 h-4 bg-white rounded-full shadow transition-all', dryRun ? 'left-5' : 'left-0.5')} />
+          <button onClick={() => toggleDryMutation.mutate(!dryRun)} disabled={toggleDryMutation.isPending}
+            className={cn('relative w-10 h-5 rounded-full transition-colors flex-shrink-0', dryRun ? 'bg-violet-600' : 'bg-emerald-600')}>
+            <span className={cn('absolute top-0.5 w-4 h-4 bg-white rounded-full shadow transition-all', dryRun ? 'left-0.5' : 'left-5')} />
           </button>
           <span className="text-xs text-zinc-400">Dry Run</span>
         </div>
         <div className="flex items-center gap-2 flex-1">
-          <button
-            onClick={() => setUseAdaptive(v => !v)}
-            className={cn('relative w-10 h-5 rounded-full transition-colors flex-shrink-0', useAdaptive ? 'bg-violet-600' : 'bg-zinc-600')}
-          >
+          <button onClick={() => setUseAdaptive(v => !v)}
+            className={cn('relative w-10 h-5 rounded-full transition-colors flex-shrink-0', useAdaptive ? 'bg-violet-600' : 'bg-zinc-600')}>
             <span className={cn('absolute top-0.5 w-4 h-4 bg-white rounded-full shadow transition-all', useAdaptive ? 'left-5' : 'left-0.5')} />
           </button>
           <span className="text-xs text-zinc-400">AI Adapt</span>
@@ -1137,23 +1106,24 @@ function AutoTradingPanel({ isDryRun: externalDryRun }: { isDryRun: boolean }) {
       {!dryRun && (
         <div className="mb-3 flex items-start gap-2 p-2.5 bg-amber-500/10 border border-amber-500/30 rounded-lg">
           <AlertTriangle className="w-3.5 h-3.5 text-amber-400 flex-shrink-0 mt-0.5" />
-          <p className="text-[11px] text-amber-400">Live paper mode — orders execute on Alpaca. Still paper money, not real funds.</p>
+          <p className="text-[11px] text-amber-400">Live paper mode — orders execute on Alpaca. Still paper money.</p>
         </div>
       )}
 
+      {/* Parameters */}
       <button onClick={() => setShowParams(p => !p)} className="w-full flex items-center gap-1.5 text-xs text-zinc-500 hover:text-zinc-300 py-1">
         {showParams ? <ChevronUp className="w-3.5 h-3.5" /> : <ChevronDown className="w-3.5 h-3.5" />}
-        Base parameters {useAdaptive ? '(AI will adjust within bounds)' : '(used directly)'}
+        {showParams ? 'Hide parameters' : 'Adjust parameters'}
       </button>
 
       {showParams && (
         <div className="space-y-3 pt-3 border-t border-zinc-800 mt-1">
           {[
-            { label: 'Total Capital ($)',    val: capitalTotal,   set: setCapitalTotal,   min: 100, max: 10000, step: 100,  fmt: (v: number) => `$${v}` },
-            { label: 'Max Positions',        val: maxPositions,   set: setMaxPositions,   min: 1,   max: 10,    step: 1,    fmt: (v: number) => `${v}` },
-            { label: 'Base Stop Loss (%)',   val: stopLossBase,   set: setStopLossBase,   min: 1,   max: 12,    step: 0.5,  fmt: (v: number) => `-${v}%` },
-            { label: 'Base Take Profit (%)', val: takeProfitBase, set: setTakeProfitBase, min: 2,   max: 30,    step: 0.5,  fmt: (v: number) => `+${v}%` },
-            { label: 'Base Conviction',      val: convictionBase, set: setConvictionBase, min: 50,  max: 92,    step: 1,    fmt: (v: number) => `${v}/100` },
+            { label: 'Total Capital ($)',    val: capitalTotal,   set: setCapitalTotal,   min: 100,  max: 10000, step: 100,  fmt: (v: number) => `$${v}` },
+            { label: 'Max Positions',        val: maxPositions,   set: setMaxPositions,   min: 1,    max: 10,    step: 1,    fmt: (v: number) => `${v}` },
+            { label: 'Stop Loss (%)',         val: stopLossBase,   set: setStopLossBase,   min: 1,    max: 12,    step: 0.5,  fmt: (v: number) => `-${v}%` },
+            { label: 'Take Profit (%)',       val: takeProfitBase, set: setTakeProfitBase, min: 2,    max: 30,    step: 0.5,  fmt: (v: number) => `+${v}%` },
+            { label: 'Min Conviction',        val: convictionBase, set: setConvictionBase, min: 50,   max: 92,    step: 1,    fmt: (v: number) => `${v}/100` },
           ].map(({ label, val, set, min, max, step, fmt }) => (
             <div key={label}>
               <div className="flex justify-between mb-1">
@@ -1167,62 +1137,63 @@ function AutoTradingPanel({ isDryRun: externalDryRun }: { isDryRun: boolean }) {
         </div>
       )}
 
-      {useAdaptive && (
-        <>
-          <button onClick={() => setShowBounds(p => !p)} className="w-full flex items-center gap-1.5 text-xs text-zinc-500 hover:text-zinc-300 py-1 mt-1">
-            {showBounds ? <ChevronUp className="w-3.5 h-3.5" /> : <ChevronDown className="w-3.5 h-3.5" />}
-            <Brain className="w-3 h-3 text-violet-500" />
-            AI allowed ranges (bounds)
-          </button>
-          {showBounds && (
-            <div className="pt-3 border-t border-zinc-800 mt-1 space-y-3">
-              <p className="text-[11px] text-zinc-500">The AI will only adjust parameters within these ranges. Set wider ranges for more flexibility, narrower for more control.</p>
-              {[
-                { label: 'Stop Loss range (%)',     min: stopBounds.min, max: stopBounds.max, setMin: (v: number) => setStopBounds(b => ({...b, min: v})), setMax: (v: number) => setStopBounds(b => ({...b, max: v})), absMin: 1,   absMax: 15,  step: 0.5, color: 'text-red-400'     },
-                { label: 'Take Profit range (%)',   min: tpBounds.min,   max: tpBounds.max,   setMin: (v: number) => setTpBounds(b => ({...b, min: v})),   setMax: (v: number) => setTpBounds(b => ({...b, max: v})),   absMin: 2,   absMax: 30,  step: 0.5, color: 'text-emerald-400' },
-                { label: 'Conviction range',        min: convBounds.min, max: convBounds.max, setMin: (v: number) => setConvBounds(b => ({...b, min: v})), setMax: (v: number) => setConvBounds(b => ({...b, max: v})), absMin: 55,  absMax: 95,  step: 1,   color: 'text-violet-400'  },
-                { label: 'Position size range (×)', min: sizeBounds.min, max: sizeBounds.max, setMin: (v: number) => setSizeBounds(b => ({...b, min: v})), setMax: (v: number) => setSizeBounds(b => ({...b, max: v})), absMin: 0.2, absMax: 1.5, step: 0.1, color: 'text-blue-400'    },
-              ].map(({ label, min, max, setMin, setMax, absMin, absMax, step, color }) => (
-                <div key={label}>
-                  <div className="flex justify-between mb-1">
-                    <label className="text-xs text-zinc-400">{label}</label>
-                    <span className={cn('text-xs font-mono', color)}>{min} – {max}</span>
-                  </div>
-                  <div className="flex gap-2">
-                    <div className="flex-1">
-                      <p className="text-[10px] text-zinc-600 mb-0.5">Min</p>
-                      <input type="range" min={absMin} max={max - step} step={step} value={min}
-                        onChange={e => setMin(Number(e.target.value))} className="w-full accent-violet-500" />
-                    </div>
-                    <div className="flex-1">
-                      <p className="text-[10px] text-zinc-600 mb-0.5">Max</p>
-                      <input type="range" min={min + step} max={absMax} step={step} value={max}
-                        onChange={e => setMax(Number(e.target.value))} className="w-full accent-violet-500" />
-                    </div>
-                  </div>
+      {/* LIVE POSITIONS PANEL */}
+      {positions.length > 0 && (
+        <div className="mt-4 pt-3 border-t border-zinc-800">
+          <div className="flex items-center gap-2 mb-2">
+            <Activity className="w-3.5 h-3.5 text-emerald-400" />
+            <p className="text-xs font-semibold text-zinc-200">Live Positions</p>
+            <span className="ml-auto text-[10px] text-zinc-500">auto-refresh 10s</span>
+          </div>
+          <div className="space-y-1.5">
+            {positions.map((p: any) => {
+              const pnlPct = parseFloat(p.unrealized_plpc ?? '0') * 100;
+              const pnl    = parseFloat(p.unrealized_pl ?? '0');
+              const val    = parseFloat(p.market_value ?? '0');
+              return (
+                <div key={p.symbol} className={cn(
+                  'flex items-center gap-2 text-xs rounded-lg px-3 py-2 border',
+                  pnlPct >= 0 ? 'bg-emerald-500/10 border-emerald-500/20' : 'bg-red-500/10 border-red-500/20'
+                )}>
+                  <span className={cn('px-1.5 py-0.5 rounded text-[10px] font-bold', p.side === 'long' ? 'bg-emerald-500/20 text-emerald-400' : 'bg-red-500/20 text-red-400')}>
+                    {(p.side ?? 'long').toUpperCase()}
+                  </span>
+                  <span className="font-mono font-bold text-white w-14">{p.symbol}</span>
+                  <span className="text-zinc-400 flex-1">${parseFloat(p.avg_entry_price ?? '0').toFixed(2)} → ${parseFloat(p.current_price ?? '0').toFixed(2)}</span>
+                  <span className="text-zinc-400">${val.toFixed(0)}</span>
+                  <span className={cn('font-mono font-bold ml-auto flex-shrink-0', pnlPct >= 0 ? 'text-emerald-400' : 'text-red-400')}>
+                    {pnlPct >= 0 ? '+' : ''}{pnlPct.toFixed(2)}%
+                  </span>
+                  <span className={cn('text-[10px] font-mono flex-shrink-0', pnl >= 0 ? 'text-emerald-400' : 'text-red-400')}>
+                    {pnl >= 0 ? '+' : ''}${Math.abs(pnl).toFixed(2)}
+                  </span>
                 </div>
-              ))}
+              );
+            })}
+            {/* Portfolio total */}
+            <div className="flex items-center gap-2 text-xs px-3 py-1.5 border-t border-zinc-800 mt-1 pt-2">
+              <span className="text-zinc-500">Portfolio P&L</span>
+              <span className={cn('font-mono font-bold ml-auto', positions.reduce((s: number, p: any) => s + parseFloat(p.unrealized_pl ?? '0'), 0) >= 0 ? 'text-emerald-400' : 'text-red-400')}>
+                {(() => {
+                  const total = positions.reduce((s: number, p: any) => s + parseFloat(p.unrealized_pl ?? '0'), 0);
+                  return `${total >= 0 ? '+' : ''}$${Math.abs(total).toFixed(2)}`;
+                })()}
+              </span>
             </div>
-          )}
-        </>
+          </div>
+        </div>
       )}
 
-      {lastResult && (
+      {/* Last run results */}
+      {lastResult && !isScanning && (
         <div className="mt-3 pt-3 border-t border-zinc-800">
           <div className="flex items-center gap-3 text-xs mb-2 flex-wrap">
             <span className="text-zinc-500">Last run:</span>
-            <span>Evaluated <strong className="text-white">{lastResult.signalsEvaluated}</strong></span>
-            <span>Placed <strong className="text-violet-400">{lastResult.ordersPlaced}</strong></span>
-            {(lastResult.optionsPlaced ?? 0) > 0 && (
-              <span>Options <strong className="text-blue-400">{lastResult.optionsPlaced}</strong></span>
-            )}
-            {lastResult.ordersRejected > 0 && <span>Skipped <strong className="text-zinc-500">{lastResult.ordersRejected}</strong></span>}
+            <span>Scanned <strong className="text-white">{lastResult.signalsEvaluated ?? '—'}</strong></span>
+            <span>Placed <strong className="text-violet-400">{lastResult.ordersPlaced ?? 0}</strong></span>
+            {(lastResult.ordersRejected ?? 0) > 0 && <span>Skipped <strong className="text-zinc-500">{lastResult.ordersRejected}</strong></span>}
+            {lastResult.autoScanned && <span className="text-[10px] text-blue-400 bg-blue-900/30 px-1.5 py-0.5 rounded">Auto-scanned</span>}
             {lastResult.dryRun && <span className="text-[10px] text-violet-400 bg-violet-900/40 px-1.5 py-0.5 rounded">DRY RUN</span>}
-            {lastResult.activeParams && (
-              <span className="text-[10px] text-zinc-500 ml-auto">
-                AI used: stop -{lastResult.activeParams.stopLossPct}% / target +{lastResult.activeParams.takeProfitPct}% / conviction {lastResult.activeParams.minConvictionScore}
-              </span>
-            )}
           </div>
           {(lastResult.placed ?? []).map((p: any) => (
             <div key={p.symbol} className="flex items-center gap-2 text-xs bg-zinc-900/60 rounded px-2 py-1.5 mb-1">
@@ -1233,25 +1204,10 @@ function AutoTradingPanel({ isDryRun: externalDryRun }: { isDryRun: boolean }) {
             </div>
           ))}
           {(lastResult.rejected ?? []).slice(0, 3).map((r: any) => (
-            <div key={r.symbol} className="flex items-center gap-2 text-xs opacity-50 bg-zinc-900/30 rounded px-2 py-1.5 mb-1">
+            <div key={r.symbol} className="flex items-center gap-2 text-xs opacity-40 rounded px-2 py-1 mb-1">
               <XCircle className="w-3 h-3 text-zinc-500 flex-shrink-0" />
               <span className="font-mono text-zinc-400 w-16">{r.symbol}</span>
               <span className="text-zinc-600 truncate text-[10px]">{r.reason}</span>
-            </div>
-          ))}
-          {(lastResult.optionsResults ?? []).map((o: any) => (
-            <div key={o.symbol + o.strategy} className="flex items-center gap-2 text-xs bg-blue-900/20 border border-blue-500/20 rounded px-2 py-1.5 mb-1">
-              <span className="text-blue-400">🎯</span>
-              <span className="font-mono font-bold text-white w-16">{o.symbol}</span>
-              <span className="text-blue-300 text-[10px]">{(o.strategy ?? '').replace(/_/g, ' ')}</span>
-              {o.cost > 0 && <span className="text-zinc-400 ml-auto">${Number(o.cost).toFixed(0)} premium</span>}
-            </div>
-          ))}
-          {(lastResult.optionsSkipped ?? []).slice(0, 2).map((o: any) => (
-            <div key={o.symbol} className="flex items-center gap-2 text-xs opacity-40 rounded px-2 py-1 mb-1">
-              <span className="text-zinc-600">○</span>
-              <span className="font-mono text-zinc-500 w-16">{o.symbol}</span>
-              <span className="text-zinc-600 truncate text-[10px]">options: {o.reason}</span>
             </div>
           ))}
         </div>

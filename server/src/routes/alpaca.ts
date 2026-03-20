@@ -352,6 +352,42 @@ router.post('/auto/start', requireAuth, requireAlpacaCredentials, async (req: Re
       });
     }
 
+    // Auto-run a scan if none exists or last scan was more than 6 hours ago
+    const { getLatestCompletedRun } = await import('../services/scans/scanPersistenceService');
+    const latestScan = await getLatestCompletedRun();
+    const scanAge = latestScan?.completedAt
+      ? (Date.now() - new Date(latestScan.completedAt).getTime()) / (1000 * 60 * 60)
+      : Infinity;
+
+    let scanRunId: string | undefined;
+
+    if (!latestScan || scanAge > 6) {
+      console.log('[AutoStart] No recent scan found — running scan automatically');
+      try {
+        const { createScanRun, markRunStarted } = await import('../services/scans/scanPersistenceService');
+        const { runDailyScan } = await import('../services/scans/dailyScanOrchestrator');
+
+        const scanRun = await createScanRun({
+          runType: 'AUTO_TRIGGERED',
+          marketSession: 'MARKET_OPEN',
+          assetScope: 'ALL' as any,
+          riskMode: 'ALL' as any,
+        });
+        await markRunStarted(scanRun.id);
+        scanRunId = scanRun.id;
+
+        await runDailyScan({
+          runType: 'AUTO_TRIGGERED',
+          marketSession: 'MARKET_OPEN',
+          skipDuplicateCheck: true,
+          existingScanRunId: scanRun.id,
+        });
+        console.log('[AutoStart] Auto-scan complete, proceeding with trading');
+      } catch (scanErr: any) {
+        console.warn('[AutoStart] Auto-scan failed:', scanErr?.message);
+      }
+    }
+
     const { buildSignalsFromLatestScan } = await import('../services/scans/dynamicUniverseService');
     let rawSignals = await buildSignalsFromLatestScan({
       minConvictionScore:  activeConviction,
@@ -376,7 +412,9 @@ router.post('/auto/start', requireAuth, requireAlpacaCredentials, async (req: Re
     if ((!rawSignals || rawSignals.length === 0) && !isOptionsMode) {
       return res.status(400).json({
         success: false,
-        error: 'No qualifying signals found. Make sure you have run a Daily Scan today — go to the Daily Scan tab and click Run Scan, then try again.',
+        error: 'No qualifying signals found after scanning. The market may be in a choppy/bearish regime with no strong bullish setups right now. Try again later or lower your conviction threshold.',
+        scanAge: latestScan ? Math.round(scanAge * 10) / 10 : null,
+        tip: 'Lower the conviction slider in parameters or wait for clearer market conditions.',
       });
     }
 
@@ -526,6 +564,8 @@ router.post('/auto/start', requireAuth, requireAlpacaCredentials, async (req: Re
         optionsRejected:   optionsRejected.length,
         dryRun,
         tradingMode,
+        autoScanned:       !!scanRunId,
+        scanRunId,
         adaptiveParams,
         activeParams: {
           stopLossPct:            activeStop,

@@ -36,7 +36,12 @@ router.post('/trigger', async (req: Request, res: Response) => {
     if (!(force === true || force === 'true')) {
       const isDuplicate = await hasDuplicateRunToday(runType, marketSession);
       if (isDuplicate) {
-        return res.status(400).json({ success: false, error: 'A scan for this session already completed today. Use force=true to override.' });
+        // Return existing completed run ID so the auto trader can use it
+        const existing = await getLatestCompletedRun();
+        if (existing) {
+          return res.json({ success: true, data: { scanRunId: existing.id, alreadyCompleted: true } });
+        }
+        return res.status(400).json({ success: false, error: 'A scan already ran today. Use force=true to re-run.' });
       }
     }
 
