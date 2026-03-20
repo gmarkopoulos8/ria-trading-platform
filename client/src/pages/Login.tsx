@@ -56,7 +56,7 @@ export default function Login() {
               Trading RIA
             </h2>
             <p className="text-slate-400 mt-4 leading-relaxed">
-              Discover high-velocity opportunities, score your thesis with AI, and track paper positions with professional-grade analytics.
+              Discover high-velocity opportunities, score your thesis with AI, execute trades and track positions with professional-grade analytics.
             </p>
           </div>
 
@@ -198,7 +198,7 @@ export default function Login() {
 
           <div className="mt-4 p-3 rounded-lg bg-surface-2 border border-surface-border lg:mt-8">
             <p className="text-xs text-slate-600 font-mono text-center">
-              ⚠ Paper trading only · No real money involved
+              All rights reserved
             </p>
           </div>
         </div>
