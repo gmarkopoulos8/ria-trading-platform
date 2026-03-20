@@ -1,0 +1,866 @@
+# Replit Agent Prompt — Master Consolidation: Fix All Audit Issues
+
+This prompt applies every missing piece from previous sessions in one pass. Apply every section in order. Do not skip any section.
+
+---
+
+## ISSUE 1 — Regime Detector Kills Trading (Conviction 85–88 Required)
+
+The regime detector requires conviction ≥ 85 in CHOPPY markets and ≥ 88 in ELEVATED_VOLATILITY. Most signals score 70–82. This is why "no qualifying signals" appears constantly — it's not a signal problem, it's that the regime gate blocks everything.
+
+Also: SPY defaulting to `spyAbove50 = true` means if the VIX fetch fails, regime defaults to CHOPPY or ELEVATED_VOLATILITY, which then blocks all trading. The logic is inverted.
+
+**File**: `server/src/services/market/RegimeDetector.ts`
+
+Replace the `ADJUSTMENTS` constant:
+
+```typescript
+const ADJUSTMENTS: Record<MarketRegime, RegimeState['autoTraderAdjustments']> = {
+  BULL_TREND:          { minConvictionOverride: 70,  positionSizeMultiplier: 1.10, allowNewEntries: true,  longOnly: false },
+  CHOPPY:              { minConvictionOverride: 72,  positionSizeMultiplier: 0.75, allowNewEntries: true,  longOnly: false },
+  ELEVATED_VOLATILITY: { minConvictionOverride: 75,  positionSizeMultiplier: 0.50, allowNewEntries: true,  longOnly: false },
+  BEAR_CRISIS:         { minConvictionOverride: 85,  positionSizeMultiplier: 0.20, allowNewEntries: true,  longOnly: false },
+};
+```
+
+Also fix the default values when data fetches fail — they currently assume bull market which pushes regime to CHOPPY. Change the defaults so a data failure returns UNKNOWN/CHOPPY gracefully:
+
+In `detectRegime()`, find:
+```typescript
+let spyAbove50 = true;
+let spyAbove200 = true;
+let spyRecentDrawdown = 0;
+```
+
+Replace with:
+```typescript
+let spyAbove50 = false;       // default to false — if we can't get data, be conservative
+let spyAbove200 = false;
+let spyRecentDrawdown = 0;
+```
+
+---
+
+## ISSUE 2 — PortfolioStateService Shows Fake Balance (Not Real Alpaca)
+
+`getPaperBalance()` reads from the internal `paperPosition` Prisma table, not from the live Alpaca account. The "Portfolio Equity" on AutoTrader shows $100,000 hardcoded fallback instead of your real Alpaca paper balance.
+
+**File**: `server/src/services/portfolio/PortfolioStateService.ts`
+
+Add import at top:
+```typescript
+import { getAccount as getAlpacaAccount, getPositions as getAlpacaPositions } from '../alpaca/alpacaInfoService';
+import { hasAlpacaCredentials } from '../alpaca/alpacaConfig';
+```
+
+Replace the entire `getPaperBalance` function:
+
+```typescript
+async function getPaperBalance(portfolioId?: string): Promise<ExchangeBalance> {
+  // First try real Alpaca paper account
+  if (hasAlpacaCredentials()) {
+    try {
+      const [account, positions] = await Promise.all([
+        getAlpacaAccount(),
+        getAlpacaPositions(),
+      ]);
+      const equity = parseFloat(account.equity ?? '0');
+      const cash   = parseFloat(account.buying_power ?? '0');
+      const unrealizedPnl = positions.reduce(
+        (sum, p) => sum + parseFloat(p.unrealized_pl ?? '0'), 0
+      );
+      if (equity > 0) {
+        return { exchange: 'PAPER', equity, cash, unrealizedPnl, available: true };
+      }
+    } catch { /* fall through to internal paper portfolio */ }
+  }
+
+  // Fall back to internal paper portfolio
+  try {
+    const portfolio = portfolioId
+      ? await prisma.portfolio.findUnique({
+          where: { id: portfolioId },
+          include: { positions: { where: { status: 'OPEN' } } },
+        })
+      : await prisma.portfolio.findFirst({
+          include: { positions: { where: { status: 'OPEN' } } },
+          orderBy: { createdAt: 'asc' },
+        });
+
+    if (!portfolio) return { exchange: 'PAPER', equity: 100000, cash: 100000, unrealizedPnl: 0, available: true };
+
+    const openPositionValue = portfolio.positions.reduce((sum, p) => {
+      const currentPrice = p.currentPrice ?? p.entryPrice;
+      return sum + currentPrice * p.quantity;
+    }, 0);
+
+    const unrealizedPnl = portfolio.positions.reduce((sum, p) => {
+      const currentPrice = p.currentPrice ?? p.entryPrice;
+      const pnl = p.side === 'LONG'
+        ? (currentPrice - p.entryPrice) * p.quantity
+        : (p.entryPrice - currentPrice) * p.quantity;
+      return sum + pnl;
+    }, 0);
+
+    return {
+      exchange: 'PAPER',
+      equity:       portfolio.cashBalance + openPositionValue,
+      cash:         portfolio.cashBalance,
+      unrealizedPnl,
+      available:    true,
+    };
+  } catch {
+    return { exchange: 'PAPER', equity: 100000, cash: 100000, unrealizedPnl: 0, available: true };
+  }
+}
+```
+
+---
+
+## ISSUE 3 — Options Types Missing IRON_CONDOR and COVERED_CALL
+
+**File**: `server/src/services/options/types.ts`
+
+Find:
+```typescript
+export type OptionsStrategy =
+  | 'LONG_CALL'
+  | 'LONG_PUT'
+  | 'BULL_CALL_SPREAD'
+  | 'BEAR_PUT_SPREAD'
+  | 'CASH_SECURED_PUT'
+  | 'NONE';
+```
+
+Replace with:
+```typescript
+export type OptionsStrategy =
+  | 'LONG_CALL'
+  | 'LONG_PUT'
+  | 'BULL_CALL_SPREAD'
+  | 'BEAR_PUT_SPREAD'
+  | 'CASH_SECURED_PUT'
+  | 'COVERED_CALL'
+  | 'IRON_CONDOR'
+  | 'NONE';
+```
+
+---
+
+## ISSUE 4 — Autonomous Mode Fields Missing from Schema
+
+**File**: `server/prisma/schema.prisma`
+
+In the `UserSettings` model, find `autoTradeEnabled` and add the following fields immediately after it:
+
+```prisma
+autonomousMode          Boolean   @default(false)
+autonomousMinConviction Int       @default(75)
+autonomousMaxPositions  Int       @default(3)
+autonomousCapitalPct    Float     @default(5.0)
+lastAutonomousRun       DateTime?
+```
+
+After editing, run the migration:
+```
+cd server && npx prisma migrate dev --name add_autonomous_mode
+```
+
+---
+
+## ISSUE 5 — All New Autotrader Routes Missing
+
+The autotrader route file only has the original routes. Add everything from previous sessions.
+
+**File**: `server/src/routes/autotrader.ts`
+
+Add these imports at the top of the file:
+```typescript
+import { hasAlpacaCredentials, getAlpacaCredentials, setAlpacaRuntimeCredentials } from '../services/alpaca/alpacaConfig';
+```
+
+Add all of the following routes before `export default router`:
+
+```typescript
+// ─── Scan reset (unstick stuck RUNNING scans) ─────────────────────────────
+router.post('/reset-stuck-scans', async (req: Request, res: Response) => {
+  try {
+    const result = await prisma.dailyScanRun.updateMany({
+      where: { status: 'RUNNING' },
+      data:  { status: 'FAILED', errorMessage: 'Manually reset via API' },
+    });
+    res.json({ success: true, data: { reset: result.count } });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err instanceof Error ? err.message : 'Reset failed' });
+  }
+});
+
+// ─── Live positions across all connected exchanges ────────────────────────
+router.get('/live-positions', async (req: Request, res: Response) => {
+  try {
+    const positions: Array<{
+      exchange: string; symbol: string; side: string;
+      size: number; entryPrice: number; currentPrice: number;
+      unrealizedPnl: number; unrealizedPnlPct: number; marketValue: number;
+    }> = [];
+
+    // Alpaca paper
+    try {
+      if (hasAlpacaCredentials()) {
+        const { getPositions: getAlpacaPositions } = await import('../services/alpaca/alpacaInfoService');
+        const alpacaPos = await getAlpacaPositions();
+        for (const p of (alpacaPos ?? [])) {
+          positions.push({
+            exchange:         'PAPER',
+            symbol:           p.symbol,
+            side:             p.side === 'long' ? 'long' : 'short',
+            size:             parseFloat(p.qty ?? '0'),
+            entryPrice:       parseFloat(p.avg_entry_price ?? '0'),
+            currentPrice:     parseFloat(p.current_price ?? '0'),
+            unrealizedPnl:    parseFloat(p.unrealized_pl ?? '0'),
+            unrealizedPnlPct: parseFloat(p.unrealized_plpc ?? '0') * 100,
+            marketValue:      parseFloat(p.market_value ?? '0'),
+          });
+        }
+      }
+    } catch { /* Alpaca offline */ }
+
+    // Hyperliquid
+    try {
+      const { hasCredentials: hlHasCreds } = await import('../services/hyperliquid/hyperliquidConfig');
+      if (hlHasCreds()) {
+        const { getUserState, getAllMids } = await import('../services/hyperliquid/hyperliquidInfoService');
+        const [state, mids] = await Promise.all([getUserState(), getAllMids()]);
+        for (const pos of (state?.assetPositions ?? [])) {
+          const p    = pos.position;
+          if (!p || parseFloat(p.szi ?? '0') === 0) continue;
+          const size    = parseFloat(p.szi ?? '0');
+          const entry   = parseFloat(p.entryPx ?? '0');
+          const current = parseFloat(mids[p.coin] ?? '0');
+          positions.push({
+            exchange:         'HYPERLIQUID',
+            symbol:           p.coin,
+            side:             size > 0 ? 'long' : 'short',
+            size:             Math.abs(size),
+            entryPrice:       entry,
+            currentPrice:     current,
+            unrealizedPnl:    (current - entry) * Math.abs(size),
+            unrealizedPnlPct: entry > 0 ? ((current - entry) / entry) * 100 * Math.sign(size) : 0,
+            marketValue:      Math.abs(size) * current,
+          });
+        }
+      }
+    } catch { /* HL offline */ }
+
+    // TOS
+    try {
+      const { hasCredentials: tosHasCreds } = await import('../services/tos/tosConfig');
+      if (tosHasCreds()) {
+        const { getAccounts } = await import('../services/tos/tosInfoService');
+        const accounts = await getAccounts();
+        for (const acct of (accounts ?? [])) {
+          for (const pos of (acct.securitiesAccount?.positions ?? [])) {
+            const qty = (pos.longQuantity ?? 0) > 0 ? pos.longQuantity : -(pos.shortQuantity ?? 0);
+            if (qty === 0) continue;
+            const entry   = pos.averagePrice ?? 0;
+            const current = entry; // TOS doesn't always return live price in positions
+            positions.push({
+              exchange:         'TOS',
+              symbol:           pos.instrument?.symbol ?? '?',
+              side:             qty > 0 ? 'long' : 'short',
+              size:             Math.abs(qty),
+              entryPrice:       entry,
+              currentPrice:     current,
+              unrealizedPnl:    pos.currentDayProfitLoss ?? 0,
+              unrealizedPnlPct: pos.currentDayProfitLossPercentage ?? 0,
+              marketValue:      pos.marketValue ?? 0,
+            });
+          }
+        }
+      }
+    } catch { /* TOS offline */ }
+
+    res.json({ success: true, data: { positions, count: positions.length, fetchedAt: new Date() } });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err instanceof Error ? err.message : 'Failed to fetch live positions' });
+  }
+});
+
+// ─── Claude AI trade decision ─────────────────────────────────────────────
+router.post('/ai-decision', async (req: Request, res: Response) => {
+  try {
+    const { signals, regime, portfolioState, exchange } = req.body;
+
+    if (!process.env.ANTHROPIC_API_KEY) {
+      return res.json({
+        success: true,
+        data: {
+          decisions: (signals ?? []).map((s: any) => ({
+            symbol: s.symbol, approved: s.convictionScore >= 72,
+            conviction: s.convictionScore, reasoning: 'Auto-approved (no API key)',
+            riskWarning: null, holdDays: 14,
+          })),
+          modelUsed: 'fallback',
+        },
+      });
+    }
+
+    const axios = (await import('axios')).default;
+    const prompt = `You are an expert autonomous trading system making final go/no-go decisions.
+
+Exchange: ${exchange ?? 'PAPER'}
+Market regime: ${regime?.regime ?? 'UNKNOWN'} | VIX: ${regime?.vix?.toFixed(1) ?? 'N/A'}
+Portfolio equity: $${portfolioState?.totalEquity?.toFixed(0) ?? 'N/A'} | Open positions: ${portfolioState?.openPositionCount ?? 0}
+
+Proposed trades:
+${(signals ?? []).slice(0, 6).map((s: any, i: number) => `${i + 1}. ${s.symbol} (${s.assetClass ?? 'stock'}) — ${s.bias} | Conviction: ${s.convictionScore}/100 | Setup: ${s.setupType ?? 'N/A'} | Reason: ${s.reason ?? 'scan signal'}`).join('\n')}
+
+Decide for each: approved (true/false), conviction (0-100), reasoning (1 sentence), riskWarning (null or string), holdDays (int).
+Respond ONLY with JSON array: [{"symbol":"AAPL","approved":true,"conviction":82,"reasoning":"...","riskWarning":null,"holdDays":10}]
+Approve max 3. Reject if conviction < 68 or obvious near-term risk.`;
+
+    const response = await axios.post(
+      'https://api.anthropic.com/v1/messages',
+      { model: 'claude-sonnet-4-20250514', max_tokens: 800, messages: [{ role: 'user', content: prompt }] },
+      { headers: { 'x-api-key': process.env.ANTHROPIC_API_KEY, 'anthropic-version': '2023-06-01', 'content-type': 'application/json' }, timeout: 20_000 },
+    );
+    const text      = response.data?.content?.[0]?.text ?? '[]';
+    const decisions = JSON.parse(text.replace(/```json|```/g, '').trim());
+    res.json({ success: true, data: { decisions, modelUsed: 'claude-sonnet-4-20250514' } });
+  } catch (err: any) {
+    const { signals } = req.body;
+    res.json({
+      success: true,
+      data: {
+        decisions: (signals ?? []).map((s: any) => ({
+          symbol: s.symbol, approved: s.convictionScore >= 72,
+          conviction: s.convictionScore, reasoning: `Fallback: ${err?.message ?? 'AI unavailable'}`,
+          riskWarning: null, holdDays: 14,
+        })),
+        modelUsed: 'fallback',
+      },
+    });
+  }
+});
+
+// ─── Autonomous mode routes ───────────────────────────────────────────────
+router.post('/autonomous/enable', async (req: Request, res: Response) => {
+  try {
+    const userId = req.session!.userId as string;
+    const { minConviction = 75, maxPositions = 3, capitalPct = 5.0 } = req.body;
+    const settings = await getUserSettings(userId);
+    await prisma.userSettings.update({
+      where: { id: settings.id },
+      data: {
+        autonomousMode:          true,
+        autoTradeEnabled:        true,
+        autonomousMinConviction: minConviction,
+        autonomousMaxPositions:  maxPositions,
+        autonomousCapitalPct:    capitalPct,
+      } as any,
+    });
+    res.json({ success: true, data: { autonomousMode: true, minConviction, maxPositions, capitalPct } });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err instanceof Error ? err.message : 'Enable failed' });
+  }
+});
+
+router.post('/autonomous/disable', async (req: Request, res: Response) => {
+  try {
+    const userId = req.session!.userId as string;
+    const settings = await getUserSettings(userId);
+    await prisma.userSettings.update({ where: { id: settings.id }, data: { autonomousMode: false } as any });
+    res.json({ success: true, data: { autonomousMode: false } });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err instanceof Error ? err.message : 'Disable failed' });
+  }
+});
+
+router.post('/autonomous/run', async (req: Request, res: Response) => {
+  try {
+    const userId   = req.session!.userId as string;
+    const settings = await getUserSettings(userId);
+    const config   = parseConfig(settings);
+
+    // Reload Alpaca credentials if missing
+    let alpacaOk = hasAlpacaCredentials();
+    if (!alpacaOk) {
+      try {
+        const { credentialService } = await import('../services/credentials/CredentialService');
+        const creds = await credentialService.getAlpacaCredentials(userId);
+        if (creds) { setAlpacaRuntimeCredentials(creds); alpacaOk = true; }
+      } catch { /* non-fatal */ }
+    }
+    if (!alpacaOk) {
+      return res.status(400).json({ success: false, error: 'Alpaca not connected' });
+    }
+
+    const minConviction = (settings as any).autonomousMinConviction ?? 75;
+    const maxPositions  = (settings as any).autonomousMaxPositions  ?? 3;
+    const capitalPct    = (settings as any).autonomousCapitalPct    ?? 5.0;
+
+    const rawSignals = await buildSignalsFromLatestScan({
+      minConvictionScore: minConviction,
+      minConfidenceScore: 60,
+      allowedBiases:      ['BULLISH', 'NEUTRAL'],
+      maxSymbols:         maxPositions * 5,
+    });
+
+    if (rawSignals.length === 0) {
+      return res.json({ success: true, data: { message: 'No qualifying signals', tradesPlaced: 0 } });
+    }
+
+    const signals = rawSignals.slice(0, maxPositions).map((s: any) => ({
+      ...s,
+      exchange:          'PAPER' as const,
+      fixedDollarAmount: Math.floor((config.maxPositionPct / 100) * 1000 * (capitalPct / 5)),
+    }));
+
+    const activeConfig = { ...config, enabled: true, exchange: 'PAPER' as const, dryRun: getAlpacaCredentials()?.dryRun ?? true };
+    const results      = await runTradingCycle(settings.id, activeConfig, signals);
+    const placed       = results.filter(r => ['FILLED', 'DRY_RUN'].includes(r.status));
+
+    await prisma.userSettings.update({
+      where: { id: settings.id },
+      data:  { lastAutonomousRun: new Date() } as any,
+    });
+
+    res.json({ success: true, data: { tradesPlaced: placed.length, results, dryRun: activeConfig.dryRun } });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err instanceof Error ? err.message : 'Run failed' });
+  }
+});
+
+router.get('/autonomous/status', async (req: Request, res: Response) => {
+  try {
+    const userId   = req.session!.userId as string;
+    const settings = await getUserSettings(userId);
+
+    // Reload credentials from DB if runtime is empty
+    let alpacaConnected = hasAlpacaCredentials();
+    let alpacaDryRun    = getAlpacaCredentials()?.dryRun ?? true;
+    if (!alpacaConnected) {
+      try {
+        const { credentialService } = await import('../services/credentials/CredentialService');
+        const creds = await credentialService.getAlpacaCredentials(userId);
+        if (creds) { setAlpacaRuntimeCredentials(creds); alpacaConnected = true; alpacaDryRun = creds.dryRun; }
+      } catch { /* non-fatal */ }
+    }
+
+    res.json({
+      success: true,
+      data: {
+        autonomousMode:          (settings as any).autonomousMode          ?? false,
+        autonomousMinConviction: (settings as any).autonomousMinConviction ?? 75,
+        autonomousMaxPositions:  (settings as any).autonomousMaxPositions  ?? 3,
+        autonomousCapitalPct:    (settings as any).autonomousCapitalPct    ?? 5.0,
+        lastAutonomousRun:       (settings as any).lastAutonomousRun       ?? null,
+        alpacaConnected,
+        alpacaDryRun,
+      },
+    });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err instanceof Error ? err.message : 'Status failed' });
+  }
+});
+```
+
+---
+
+## ISSUE 6 — API Client Missing All New Methods
+
+**File**: `client/src/api/client.ts`
+
+Find the `autotrader` section and replace the entire section:
+
+```typescript
+autotrader: {
+  status:        () => get('/autotrader/status'),
+  enable:        () => post('/autotrader/enable'),
+  disable:       () => post('/autotrader/disable'),
+  updateConfig:  (body: unknown) => put('/autotrader/config', body),
+  runCycle:      () => post('/autotrader/run-cycle'),
+  logs:          (params?: Record<string, unknown>) => get('/autotrader/logs', params),
+  signalsPreview:() => get('/autotrader/signals/preview'),
+  livePositions: () => get('/autotrader/live-positions'),
+  aiDecision:    (body: { signals: any[]; regime?: any; portfolioState?: any; exchange?: string }) =>
+    post('/autotrader/ai-decision', body),
+  resetStuck:    () => post('/autotrader/reset-stuck-scans', {}),
+  autonomousEnable:  (params: { minConviction?: number; maxPositions?: number; capitalPct?: number }) =>
+    post('/autotrader/autonomous/enable', params),
+  autonomousDisable: () => post('/autotrader/autonomous/disable', {}),
+  autonomousRun:     () => post('/autotrader/autonomous/run', {}),
+  autonomousStatus:  () => get('/autotrader/autonomous/status'),
+  exchangeConfig: {
+    get:          (exchange: string) => get(`/autotrader/exchange-config/${exchange}`),
+    save:         (exchange: string, data: unknown) => put(`/autotrader/exchange-config/${exchange}`, data),
+    validate:     (exchange: string, data: unknown) => post(`/autotrader/exchange-config/${exchange}/validate`, data),
+    sessionStatus:(exchange: string) => get(`/autotrader/exchange-config/${exchange}/session-status`),
+    startSession: (exchange: string) => post(`/autotrader/exchange-config/${exchange}/session/start`, {}),
+    pauseSession: (exchange: string, reason?: string) => post(`/autotrader/exchange-config/${exchange}/session/pause`, { reason }),
+  },
+},
+```
+
+Also add `marketBars` and `marketQuote` to the `alpaca` section:
+```typescript
+marketBars:  (symbol: string, timeframe?: string, limit?: number) =>
+  get(`/alpaca/market-data/bars/${symbol}`, { timeframe: timeframe ?? '1Day', limit: limit ?? 100 }),
+marketQuote: (symbol: string) => get(`/alpaca/market-data/quote/${symbol}`),
+```
+
+And add `resetStuck` to the `scans` section:
+```typescript
+resetStuck: () => post('/daily-scans/reset-stuck', {}),
+```
+
+---
+
+## ISSUE 7 — index.ts Missing New Service Startups
+
+**File**: `server/src/index.ts`
+
+Add these imports near the existing ones:
+
+```typescript
+import { prisma } from './lib/prisma';
+```
+
+Inside `app.listen`, add the following right before `startDailyScanScheduler()`:
+
+```typescript
+// Reset any scans stuck in RUNNING state from a previous crash/restart
+try {
+  const stuckResult = await prisma.dailyScanRun.updateMany({
+    where: { status: 'RUNNING' },
+    data:  { status: 'FAILED', errorMessage: 'Reset on server startup — was stuck in RUNNING state' },
+  });
+  if (stuckResult.count > 0) {
+    console.log(`   ScanReset   : ${stuckResult.count} stuck scan(s) reset to FAILED`);
+  }
+} catch (err: any) {
+  console.warn('[Startup] Could not reset stuck scans:', err?.message);
+}
+```
+
+---
+
+## ISSUE 8 — Alpaca /status Route Must Return Both Field Names
+
+**File**: `server/src/routes/alpaca.ts`
+
+In the `/status` route, add the credential reload fallback and ensure `connected` field is returned. Find the opening of the route:
+
+```typescript
+router.get('/status', requireAuth, async (req, res) => {
+  try {
+    const controlStatus = getControlStatus();
+    if (!hasAlpacaCredentials()) {
+```
+
+Replace the entire `if (!hasAlpacaCredentials())` block at the top of the route:
+
+```typescript
+router.get('/status', requireAuth, async (req, res) => {
+  try {
+    const controlStatus = getControlStatus();
+
+    // Auto-reload credentials from DB if runtime cache is empty (happens after server restart)
+    if (!hasAlpacaCredentials()) {
+      try {
+        const userId = (req as any).session?.userId as string;
+        if (userId) {
+          const { credentialService } = await import('../services/credentials/CredentialService');
+          const { setAlpacaRuntimeCredentials: setAlpacaCreds } = await import('../services/alpaca/alpacaConfig');
+          const creds = await credentialService.getAlpacaCredentials(userId);
+          if (creds) setAlpacaCreds(creds);
+        }
+      } catch { /* non-fatal */ }
+    }
+
+    if (!hasAlpacaCredentials()) {
+      return res.json({
+        success: true,
+        data: {
+          hasCredentials: false,
+          connected: false,
+          killswitch: { ...controlStatus, controlLevel: controlStatus.controlLevel },
+        },
+      });
+    }
+```
+
+Also add `connected: true` to the success data block. Find:
+```typescript
+data: {
+  hasCredentials: true,
+  account,
+```
+
+Replace with:
+```typescript
+data: {
+  hasCredentials: true,
+  connected: true,
+  account,
+```
+
+---
+
+## ISSUE 9 — CredentialLoader Must Retry on Timing Failure
+
+**File**: `server/src/services/credentials/CredentialLoader.ts`
+
+Replace the entire file content:
+
+```typescript
+import { prisma } from '../../lib/prisma';
+import { credentialService } from './CredentialService';
+import { setHLRuntimeCredentials } from '../hyperliquid/hyperliquidConfig';
+import { setTOSRuntimeCredentials } from '../tos/tosConfig';
+import { setAlpacaRuntimeCredentials } from '../alpaca/alpacaConfig';
+
+async function attemptLoad(): Promise<boolean> {
+  const firstUser = await prisma.user.findFirst({ orderBy: { createdAt: 'asc' } });
+  if (!firstUser) return false; // no users yet — not an error
+
+  const [hlCreds, tosCreds, alpacaCreds] = await Promise.allSettled([
+    credentialService.getHLCredentials(firstUser.id),
+    credentialService.getTOSCredentials(firstUser.id),
+    credentialService.getAlpacaCredentials(firstUser.id),
+  ]);
+
+  if (hlCreds.status === 'fulfilled' && hlCreds.value?.source === 'database') {
+    setHLRuntimeCredentials({
+      walletAddress:   hlCreds.value.walletAddress,
+      agentPrivateKey: hlCreds.value.agentPrivateKey ?? undefined,
+      isMainnet:       hlCreds.value.isMainnet,
+      dryRun:          hlCreds.value.dryRun,
+      maxDrawdownPct:  hlCreds.value.maxDrawdownPct,
+      defaultLeverage: hlCreds.value.defaultLeverage,
+    });
+  }
+
+  if (tosCreds.status === 'fulfilled' && tosCreds.value?.source === 'database') {
+    const v = tosCreds.value;
+    const tosRec = await prisma.exchangeCredential.findUnique({
+      where: { userId_exchange: { userId: firstUser.id, exchange: 'tos' } },
+    }).catch(() => null);
+    setTOSRuntimeCredentials({
+      clientId:               v.clientId,
+      clientSecret:           v.clientSecret,
+      redirectUri:            v.redirectUri,
+      refreshToken:           v.refreshToken,
+      accountNumber:          v.accountNumber,
+      dryRun:                 v.dryRun,
+      maxDrawdownPct:         v.maxDrawdownPct,
+      viewAccountNumber:      tosRec?.viewAccountNumber ?? undefined,
+      autoTradeAccountNumber: tosRec?.autoTradeAccountNumber ?? undefined,
+    });
+  }
+
+  if (alpacaCreds.status === 'fulfilled' && alpacaCreds.value) {
+    setAlpacaRuntimeCredentials(alpacaCreds.value);
+    console.info('[CredentialLoader] ✅ Alpaca credentials loaded');
+  }
+
+  return true;
+}
+
+export async function loadDefaultCredentials(): Promise<void> {
+  const MAX_ATTEMPTS = 5;
+  const DELAY_MS     = 2_000;
+
+  for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+    try {
+      const loaded = await attemptLoad();
+      if (loaded) {
+        console.info('[CredentialLoader] Exchange credentials loaded from database');
+        return;
+      }
+      console.info('[CredentialLoader] No users found — skipping credential load');
+      return;
+    } catch (err: any) {
+      if (attempt === MAX_ATTEMPTS) {
+        console.warn(`[CredentialLoader] Could not load credentials after ${MAX_ATTEMPTS} attempts:`, err?.message);
+        return;
+      }
+      console.warn(`[CredentialLoader] Attempt ${attempt} failed, retrying in ${DELAY_MS}ms:`, err?.message);
+      await new Promise(resolve => setTimeout(resolve, DELAY_MS));
+    }
+  }
+}
+```
+
+---
+
+## ISSUE 10 — Daily Scan Trigger Must Be Non-Blocking
+
+**File**: `server/src/routes/daily-scans.ts`
+
+Replace the entire `/trigger` route:
+
+```typescript
+router.post('/trigger', async (req: Request, res: Response) => {
+  try {
+    const {
+      runType        = 'MANUAL',
+      marketSession  = 'MARKET_OPEN',
+      assetScope     = 'ALL',
+      riskMode       = 'ALL',
+      force          = false,
+      fullUniverse   = false,
+      filterCriteria = {},
+    } = req.body ?? {};
+
+    // Check duplicate before creating record
+    if (!(force === true || force === 'true')) {
+      const { hasDuplicateRunToday } = await import('../services/scans/scanPersistenceService');
+      const isDuplicate = await hasDuplicateRunToday(runType, marketSession);
+      if (isDuplicate) {
+        // Return existing completed run so UI can display results
+        const existing = await prisma.dailyScanRun.findFirst({
+          where: { status: 'COMPLETED', runType, marketSession },
+          orderBy: { completedAt: 'desc' },
+        });
+        return res.json({
+          success: true,
+          data: { scanRunId: existing?.id, alreadyCompleted: true,
+            message: 'Scan already completed today. Use force=true to re-run.' },
+        });
+      }
+    }
+
+    // Create run record and return ID immediately (scan runs in background)
+    const { createScanRun, markRunStarted } = await import('../services/scans/scanPersistenceService');
+    const scanRun = await createScanRun({
+      runType, marketSession,
+      assetScope:         assetScope as any,
+      riskMode:           riskMode as any,
+      isFullUniverseScan: fullUniverse,
+    });
+    await markRunStarted(scanRun.id);
+
+    // Respond immediately — SSE stream can now connect
+    res.json({ success: true, data: { scanRunId: scanRun.id } });
+
+    // Run scan in background
+    const { runDailyScan } = await import('../services/scans/dailyScanOrchestrator');
+    runDailyScan({
+      runType, marketSession,
+      assetScope:          assetScope as any,
+      riskMode:            riskMode as any,
+      skipDuplicateCheck:  true,
+      fullUniverse,
+      filterCriteria,
+      _existingScanRunId:  scanRun.id,
+    }).catch((err: any) => {
+      console.error('[Trigger] Background scan error:', err?.message);
+    });
+
+  } catch (err) {
+    res.status(400).json({ success: false, error: err instanceof Error ? err.message : 'Scan trigger failed' });
+  }
+});
+```
+
+Also add `prisma` import and reset-stuck route at the end of the file before `export default router`:
+
+```typescript
+import { prisma } from '../lib/prisma';
+```
+
+```typescript
+router.post('/reset-stuck', async (req: Request, res: Response) => {
+  try {
+    const result = await prisma.dailyScanRun.updateMany({
+      where: { status: 'RUNNING' },
+      data:  { status: 'FAILED', errorMessage: 'Manually reset via API' },
+    });
+    res.json({ success: true, data: { reset: result.count } });
+  } catch (err) {
+    res.status(500).json({ success: false, error: 'Reset failed' });
+  }
+});
+```
+
+**File**: `server/src/services/scans/dailyScanOrchestrator.ts`
+
+Add `_existingScanRunId` to `RunScanOptions`:
+```typescript
+export interface RunScanOptions {
+  runType?:            string;
+  marketSession?:      string;
+  assetScope?:         AssetScope;
+  riskMode?:           RiskMode;
+  scheduledFor?:       Date;
+  skipDuplicateCheck?: boolean;
+  fullUniverse?:       boolean;
+  filterCriteria?:     Partial<FilterCriteria>;
+  _existingScanRunId?: string;
+}
+```
+
+Replace the `createScanRun` + `markRunStarted` block at the top of `runDailyScan()`:
+```typescript
+const scanRun = opts._existingScanRunId
+  ? { id: opts._existingScanRunId }
+  : await createScanRun({ runType, marketSession, assetScope, riskMode, scheduledFor, isFullUniverseScan: fullUniverse ?? false });
+
+if (!opts._existingScanRunId) {
+  await markRunStarted(scanRun.id);
+}
+console.log(`[DailyScan] Starting scan run ${scanRun.id} (${runType}/${marketSession})`);
+```
+
+In the static scan path, fix progress reporting. Find:
+```typescript
+const results = await rankCandidates(universe, 100, (done, total) => {
+  progressTick++;
+  if (progressTick % 5 === 0 || done === total) {
+    console.log(`[DailyScan] Progress: ${done}/${total} analyzed`);
+  }
+});
+```
+
+Replace with:
+```typescript
+const results = await rankCandidates(universe, 100, (done, total) => {
+  updateScanProgress(scanRun.id, 'ANALYZING', done, total);
+  if (done % 5 === 0 || done === total) {
+    console.log(`[DailyScan] Progress: ${done}/${total} analyzed`);
+  }
+});
+```
+
+---
+
+## SUMMARY
+
+### Files Modified
+
+```
+server/src/services/market/RegimeDetector.ts          → Lower conviction thresholds (70/72/75/85); fix default values
+server/src/services/portfolio/PortfolioStateService.ts → Use real Alpaca account balance
+server/src/services/options/types.ts                  → Add IRON_CONDOR, COVERED_CALL
+server/prisma/schema.prisma                           → Add 5 autonomous mode fields + migrate
+server/src/routes/autotrader.ts                       → Add /live-positions, /ai-decision, /autonomous/*, /reset-stuck-scans
+server/src/routes/alpaca.ts                           → Auto-reload credentials on /status; add connected:true field
+server/src/routes/daily-scans.ts                      → Non-blocking trigger, reset-stuck endpoint
+server/src/services/scans/dailyScanOrchestrator.ts    → _existingScanRunId, SSE progress for static scan
+server/src/services/credentials/CredentialLoader.ts   → Retry loop with 5 attempts
+server/src/index.ts                                   → Reset stuck scans on startup
+client/src/api/client.ts                              → All new autotrader, alpaca, scans methods
+```
+
+### After Applying
+
+1. Daily scan triggers immediately and returns the scan ID — no timeout
+2. Progress bar moves in the scan UI as stocks are analyzed  
+3. Alpaca connection is detected correctly even after server restart
+4. Regime no longer blocks signals in volatile markets (conviction 75 max instead of 88)
+5. Portfolio equity shows real Alpaca balance
+6. AutoTrader command center `/live-positions` and `/ai-decision` endpoints work
+7. Autonomous mode enable/disable/run/status routes exist
+8. Options types include Iron Condor and Covered Call
+```

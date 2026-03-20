@@ -245,6 +245,7 @@ export const api = {
     livePositions: () => get('/autotrader/live-positions'),
     aiDecision: (body: { signals: any[]; regime?: any; portfolioState?: any; exchange?: string }) =>
       post('/autotrader/ai-decision', body),
+    resetStuck: () => post('/autotrader/reset-stuck-scans', {}),
     exchangeConfig: {
       get: (exchange: string) => get(`/autotrader/exchange-config/${exchange}`),
       save: (exchange: string, data: unknown) => put(`/autotrader/exchange-config/${exchange}`, data),

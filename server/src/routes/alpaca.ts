@@ -25,7 +25,7 @@ import {
 import { runTestSuite, getLastTestResult } from '../services/alpaca/AlpacaTestSuite';
 import { runStrategyReplay } from '../services/alpaca/StrategyReplayService';
 import { getLatencyStats } from '../services/alpaca/LatencyMonitor';
-import { hasAlpacaCredentials } from '../services/alpaca/alpacaConfig';
+import { hasAlpacaCredentials, setAlpacaRuntimeCredentials } from '../services/alpaca/alpacaConfig';
 import {
   computeAdaptiveParameters,
   getCurrentParams,
@@ -46,10 +46,22 @@ function requireAlpacaCredentials(req: any, res: any, next: any) {
 router.get('/status', requireAuth, async (req, res) => {
   try {
     const controlStatus = getControlStatus();
+
+    // Auto-reload credentials from DB if runtime cache is empty
+    if (!hasAlpacaCredentials()) {
+      try {
+        const userId = req.session!.userId as string;
+        const { credentialService } = await import('../services/credentials/CredentialService');
+        const creds = await credentialService.getAlpacaCredentials(userId);
+        if (creds) setAlpacaRuntimeCredentials(creds);
+      } catch { /* non-fatal */ }
+    }
+
     if (!hasAlpacaCredentials()) {
       return res.json({
         success: true,
         data: {
+          connected:      false,
           hasCredentials: false,
           killswitch: { ...controlStatus, controlLevel: controlStatus.controlLevel },
         },

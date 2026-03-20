@@ -22,10 +22,10 @@ const REGIME_CACHE_TTL = 15 * 60 * 1000;
 let _regimeCache: { state: RegimeState; ts: number } | null = null;
 
 const ADJUSTMENTS: Record<MarketRegime, RegimeState['autoTraderAdjustments']> = {
-  BULL_TREND:          { minConvictionOverride: 78,  positionSizeMultiplier: 1.0,  allowNewEntries: true,  longOnly: false },
-  CHOPPY:              { minConvictionOverride: 85,  positionSizeMultiplier: 0.60, allowNewEntries: true,  longOnly: true  },
-  ELEVATED_VOLATILITY: { minConvictionOverride: 88,  positionSizeMultiplier: 0.40, allowNewEntries: true,  longOnly: true  },
-  BEAR_CRISIS:         { minConvictionOverride: 99,  positionSizeMultiplier: 0.0,  allowNewEntries: false, longOnly: true  },
+  BULL_TREND:          { minConvictionOverride: 70,  positionSizeMultiplier: 1.10, allowNewEntries: true,  longOnly: false },
+  CHOPPY:              { minConvictionOverride: 72,  positionSizeMultiplier: 0.75, allowNewEntries: true,  longOnly: false },
+  ELEVATED_VOLATILITY: { minConvictionOverride: 75,  positionSizeMultiplier: 0.50, allowNewEntries: true,  longOnly: false },
+  BEAR_CRISIS:         { minConvictionOverride: 85,  positionSizeMultiplier: 0.20, allowNewEntries: true,  longOnly: false },
 };
 
 function computeSMA(values: number[], period: number): number | null {
@@ -61,8 +61,8 @@ export async function detectRegime(): Promise<RegimeState> {
   }
 
   let vix: number | null = null;
-  let spyAbove50 = true;
-  let spyAbove200 = true;
+  let spyAbove50 = false;
+  let spyAbove200 = false;
   let spyRecentDrawdown = 0;
 
   try {

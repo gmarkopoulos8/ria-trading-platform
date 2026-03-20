@@ -3,6 +3,8 @@ import { getUserState, type UserState } from '../hyperliquid/hyperliquidInfoServ
 import { hasCredentials as tosHasCredentials } from '../tos/tosConfig';
 import { hasCredentials as hlHasCredentials } from '../hyperliquid/hyperliquidConfig';
 import { prisma } from '../../lib/prisma';
+import { getAccount as getAlpacaAccount, getPositions as getAlpacaPositions } from '../alpaca/alpacaInfoService';
+import { hasAlpacaCredentials } from '../alpaca/alpacaConfig';
 
 export interface ExchangeBalance {
   exchange: 'TOS' | 'HYPERLIQUID' | 'PAPER';
@@ -64,6 +66,23 @@ async function getHyperliquidBalance(): Promise<ExchangeBalance> {
 }
 
 async function getPaperBalance(portfolioId?: string): Promise<ExchangeBalance> {
+  if (hasAlpacaCredentials()) {
+    try {
+      const [account, positions] = await Promise.all([
+        getAlpacaAccount(),
+        getAlpacaPositions(),
+      ]);
+      const equity = parseFloat(account.equity ?? '0');
+      const cash   = parseFloat(account.buying_power ?? '0');
+      const unrealizedPnl = positions.reduce(
+        (sum, p) => sum + parseFloat(p.unrealized_pl ?? '0'), 0
+      );
+      if (equity > 0) {
+        return { exchange: 'PAPER', equity, cash, unrealizedPnl, available: true };
+      }
+    } catch { /* fall through to internal paper portfolio */ }
+  }
+
   try {
     const portfolio = portfolioId
       ? await prisma.portfolio.findUnique({
@@ -90,13 +109,12 @@ async function getPaperBalance(portfolioId?: string): Promise<ExchangeBalance> {
       return sum + pnl;
     }, 0);
 
-    const equity = portfolio.cashBalance + openPositionValue;
     return {
       exchange: 'PAPER',
-      equity,
-      cash: portfolio.cashBalance,
+      equity:       portfolio.cashBalance + openPositionValue,
+      cash:         portfolio.cashBalance,
       unrealizedPnl,
-      available: true,
+      available:    true,
     };
   } catch {
     return { exchange: 'PAPER', equity: 100000, cash: 100000, unrealizedPnl: 0, available: true };
