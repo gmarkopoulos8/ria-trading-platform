@@ -273,6 +273,8 @@ export const api = {
       dryRun?: boolean;
       useAdaptive?: boolean;
       bounds?: any;
+      tradingMode?: 'stocks' | 'options' | 'both';
+      maxOptionsRiskPct?: number;
     }) => post('/alpaca/auto/start', params),
     autoMonitor: (params: { stopLossPct?: number; takeProfitPct?: number; dryRun?: boolean }) =>
       post('/alpaca/auto/monitor', params),

@@ -305,6 +305,8 @@ router.post('/auto/start', requireAuth, requireAlpacaCredentials, async (req: Re
       dryRun             = false,
       useAdaptive        = true,
       bounds,
+      tradingMode        = 'stocks',
+      maxOptionsRiskPct  = 1.5,
     } = req.body;
 
     const perTrade = Math.floor(capitalPerTrade ?? capitalTotal / maxPositions);
@@ -404,13 +406,88 @@ router.post('/auto/start', requireAuth, requireAlpacaCredentials, async (req: Re
     const placed   = results.filter((r: any) => ['FILLED', 'DRY_RUN'].includes(r.status));
     const rejected = results.filter((r: any) => !['FILLED', 'DRY_RUN'].includes(r.status));
 
+    // ── Options Trading ──────────────────────────────────────────────────────
+    const optionsPlaced:   Array<{ symbol: string; strategy: string; cost: number; legs: any[] }> = [];
+    const optionsRejected: Array<{ symbol: string; reason: string }> = [];
+
+    if ((tradingMode === 'options' || tradingMode === 'both') && process.env.FINNHUB_API_KEY) {
+      const { getRecommendation } = await import('../services/options/OptionsAnalyzer');
+      const { thesisEngine }      = await import('../services/thesis/ThesisEngine');
+      const { placeOptionsOrder } = await import('../services/alpaca/alpacaExchangeService');
+
+      const optionCandidates = tradingMode === 'options'
+        ? sortedSignals.slice(0, maxPositions)
+        : sortedSignals.slice(0, maxPositions * 2);
+
+      const maxOptionsRisk = Math.max(50, Math.floor(adjustedPerTrade * (maxOptionsRiskPct / 100)));
+
+      for (const candidate of optionCandidates) {
+        if (candidate.assetClass === 'crypto' || candidate.assetClass === 'CRYPTO') continue;
+        if (tradingMode === 'both' && placed.some((p: any) => p.symbol === candidate.symbol)) continue;
+
+        try {
+          const thesis       = await thesisEngine.analyze(candidate.symbol, 'stock');
+          const acct         = await getAccount();
+          const accountEquity = parseFloat((acct as any).equity ?? '100000');
+          const recommendation = await getRecommendation(thesis, accountEquity, maxOptionsRisk);
+
+          if (!recommendation || recommendation.strategy === 'NONE') {
+            optionsRejected.push({ symbol: candidate.symbol, reason: 'No viable options strategy found' });
+            continue;
+          }
+
+          const legOrders = recommendation.legs.map((leg: any) => ({
+            action:         leg.action,
+            contractSymbol: leg.contract.contractSymbol,
+            contracts:      leg.contracts,
+            limitPrice:     leg.contract.mid,
+          }));
+
+          if (legOrders.length === 0) {
+            optionsRejected.push({ symbol: candidate.symbol, reason: 'No valid legs in recommendation' });
+            continue;
+          }
+
+          const totalCost = recommendation.netDebit > 0
+            ? recommendation.netDebit * (recommendation.legs[0]?.contracts ?? 1) * 100
+            : 0;
+
+          const optResult = await placeOptionsOrder(
+            candidate.symbol,
+            recommendation.strategy,
+            legOrders,
+            settings!.id,
+            totalCost,
+          );
+
+          if (optResult.success) {
+            optionsPlaced.push({
+              symbol:   candidate.symbol,
+              strategy: recommendation.strategy,
+              cost:     totalCost,
+              legs:     optResult.orders.map((o: any) => ({ action: o.leg, contractSymbol: o.contractSymbol, orderId: o.orderId })),
+            });
+          } else {
+            optionsRejected.push({ symbol: candidate.symbol, reason: optResult.error ?? 'Options order failed' });
+          }
+
+          await new Promise(r => setTimeout(r, 300));
+        } catch (err: any) {
+          optionsRejected.push({ symbol: candidate.symbol, reason: err?.message ?? 'Options error' });
+        }
+      }
+    }
+
     return res.json({
       success: true,
       data: {
         signalsEvaluated:  results.length,
         ordersPlaced:      placed.length,
+        optionsPlaced:     optionsPlaced.length,
         ordersRejected:    rejected.length,
+        optionsRejected:   optionsRejected.length,
         dryRun,
+        tradingMode,
         adaptiveParams,
         activeParams: {
           stopLossPct:            activeStop,
@@ -419,8 +496,10 @@ router.post('/auto/start', requireAuth, requireAlpacaCredentials, async (req: Re
           positionSizeMultiplier: activeSizeMult,
           perTradeAmount:         adjustedPerTrade,
         },
-        placed:   placed.map((r: any)   => ({ symbol: r.symbol, status: r.status, dollarAmount: r.dollarAmount, entryPrice: r.entryPrice })),
-        rejected: rejected.map((r: any) => ({ symbol: r.symbol, reason: r.reason })),
+        placed:         placed.map((r: any)   => ({ symbol: r.symbol, status: r.status, dollarAmount: r.dollarAmount, entryPrice: r.entryPrice })),
+        rejected:       rejected.map((r: any) => ({ symbol: r.symbol, reason: r.reason })),
+        optionsResults: optionsPlaced,
+        optionsSkipped: optionsRejected,
       },
     });
   } catch (err: any) {
@@ -445,6 +524,9 @@ router.post('/auto/monitor', requireAuth, requireAlpacaCredentials, async (req: 
 
     const actions: any[] = [];
     for (const pos of positions) {
+      // Skip options contract positions — handled by dedicated options loop below
+      if (/\d{6}[CP]\d{8}/.test((pos as any).symbol ?? '')) continue;
+
       const entry   = parseFloat((pos as any).avg_entry_price ?? '0');
       const current = parseFloat((pos as any).current_price  ?? '0');
       if (entry <= 0 || current <= 0) continue;
@@ -482,6 +564,55 @@ router.post('/auto/monitor', requireAuth, requireAlpacaCredentials, async (req: 
         symbol:  (pos as any).symbol,
         action:  shouldClose ? (dryRun ? 'WOULD_CLOSE' : 'CLOSED') : 'HOLD',
         reason:  shouldClose ? closeReason : `Holding at ${pnlPct.toFixed(2)}%`,
+        pnlPct,
+      });
+    }
+
+    // ── Options position monitoring ──────────────────────────────────────────
+    for (const pos of positions) {
+      const symbol   = (pos as any).symbol ?? '';
+      const isOption = /\d{6}[CP]\d{8}/.test(symbol);
+      if (!isOption) continue;
+
+      const entry   = parseFloat((pos as any).avg_entry_price ?? '0');
+      const current = parseFloat((pos as any).current_price   ?? '0');
+      if (entry <= 0 || current <= 0) continue;
+
+      const pnlPct = ((current - entry) / entry) * 100;
+      const isLong = parseFloat((pos as any).qty ?? '0') > 0;
+
+      let shouldClose = false;
+      let closeReason = '';
+
+      if (isLong) {
+        if (pnlPct <= -50)  { shouldClose = true; closeReason = `Option 50% stop: ${pnlPct.toFixed(1)}%`; }
+        else if (pnlPct >= 100) { shouldClose = true; closeReason = `Option 100% target: +${pnlPct.toFixed(1)}%`; }
+      } else {
+        if (pnlPct >= 200)  { shouldClose = true; closeReason = `Short option loss 200%: +${pnlPct.toFixed(1)}%`; }
+        else if (pnlPct <= -80) { shouldClose = true; closeReason = `Short option profit 80% captured`; }
+      }
+
+      if (shouldClose && !dryRun) {
+        const closeSide = isLong ? 'sell' : 'buy';
+        try {
+          const { placeOrder: alpacaClose } = await import('../services/alpaca/alpacaExchangeService');
+          await alpacaClose({
+            symbol,
+            qty:         Math.abs(parseFloat((pos as any).qty ?? '1')),
+            side:        closeSide as 'buy' | 'sell',
+            type:        'market',
+            timeInForce: 'day',
+            userId,
+          });
+        } catch (e: any) {
+          console.warn(`[Options Monitor] Close ${symbol} failed:`, e?.message);
+        }
+      }
+
+      actions.push({
+        symbol,
+        action:  shouldClose ? (dryRun ? 'WOULD_CLOSE' : 'CLOSED') : 'HOLD',
+        reason:  closeReason || `Option holding at ${pnlPct.toFixed(1)}%`,
         pnlPct,
       });
     }

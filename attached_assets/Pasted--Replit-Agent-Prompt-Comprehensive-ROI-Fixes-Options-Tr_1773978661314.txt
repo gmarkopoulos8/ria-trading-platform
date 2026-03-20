@@ -1,0 +1,979 @@
+# Replit Agent Prompt — Comprehensive ROI Fixes + Options Trading
+
+Apply every change below exactly as written. Only touch the files listed. Do not modify anything else.
+
+---
+
+## FIX 1 — compositeScore Doesn't Exist in Prisma Schema (Runtime Crash)
+
+**File**: `server/src/services/scans/dynamicUniverseService.ts`
+
+Replace the entire file with:
+
+```typescript
+import { prisma } from '../../lib/prisma';
+import type { AutoTradeSignal } from '../autotrader/AutoTradeExecutor';
+
+export interface DynamicUniverseOptions {
+  minConvictionScore?: number;
+  minConfidenceScore?: number;
+  allowedBiases?: string[];
+  maxSymbols?: number;
+  exchange?: string;
+}
+
+export async function buildSignalsFromLatestScan(
+  opts: DynamicUniverseOptions = {},
+): Promise<AutoTradeSignal[]> {
+  const {
+    minConvictionScore = 65,
+    minConfidenceScore = 60,
+    allowedBiases = ['BULLISH'],
+    maxSymbols = 10,
+  } = opts;
+
+  const latestRun = await prisma.dailyScanRun.findFirst({
+    where: { status: 'COMPLETED' },
+    orderBy: { completedAt: 'desc' },
+  });
+
+  if (!latestRun) return [];
+
+  const results = await prisma.dailyScanResult.findMany({
+    where: {
+      scanRunId: latestRun.id,
+      bias: { in: allowedBiases.length > 0 ? allowedBiases : ['BULLISH', 'NEUTRAL'] },
+      convictionScore: { gte: minConvictionScore },
+      confidenceScore: { gte: minConfidenceScore },
+    },
+    orderBy: [
+      { rank: 'asc' },
+      { convictionScore: 'desc' },
+      { confidenceScore: 'desc' },
+    ],
+    take: maxSymbols,
+  });
+
+  const signals: AutoTradeSignal[] = results.map((r) => {
+    const entryZone = r.entryZoneJson as { low?: number; high?: number } | null;
+    const tp1       = r.takeProfit1Json as { price?: number } | null;
+    const inv       = r.invalidationZoneJson as { price?: number } | null;
+
+    return {
+      symbol:            r.symbol,
+      assetClass:        r.assetClass,
+      bias:              r.bias as 'BULLISH' | 'BEARISH' | 'NEUTRAL',
+      convictionScore:   r.convictionScore,
+      confidenceScore:   r.confidenceScore,
+      riskScore:         r.riskScore,
+      thesisHealthScore: r.thesisHealthScore,
+      entryPrice:        entryZone?.low ?? entryZone?.high ?? undefined,
+      stopLoss:          inv?.price ?? undefined,
+      takeProfit:        tp1?.price ?? undefined,
+      setupType:         r.setupType ?? undefined,
+      reason:            r.catalystSummary ?? r.patternSummary ?? undefined,
+      scanRunId:         latestRun.id,
+    };
+  });
+
+  return signals;
+}
+```
+
+---
+
+## FIX 2 — Add thesisHealthScore to AutoTradeSignal Interface
+
+**File**: `server/src/services/autotrader/AutoTradeExecutor.ts`
+
+Find the `AutoTradeSignal` interface and add two fields:
+
+```typescript
+export interface AutoTradeSignal {
+  // ... all existing fields unchanged ...
+  thesisHealthScore?: number;   // ADD — used for re-ranking candidates
+  fixedDollarAmount?: number;   // already exists — keep it
+}
+```
+
+---
+
+## FIX 3 — Entry Price Uses TOS for Alpaca Trades (Critical)
+
+**File**: `server/src/services/autotrader/AutoTradeExecutor.ts`
+
+Replace the entire `resolveEntryPrice` function:
+
+```typescript
+async function resolveEntryPrice(signal: AutoTradeSignal): Promise<number> {
+  if (signal.entryPrice && signal.entryPrice > 0) return signal.entryPrice;
+
+  const exchange = signal.exchange ?? 'PAPER';
+
+  try {
+    if (signal.assetClass === 'crypto' || signal.assetClass === 'CRYPTO') {
+      const { getAssetPrice } = await import('../hyperliquid/hyperliquidInfoService');
+      const price = await getAssetPrice(signal.symbol);
+      if (price && price > 0) return price;
+    }
+
+    if (exchange === 'PAPER') {
+      try {
+        const { getLatestQuote } = await import('../alpaca/alpacaInfoService');
+        const quote = await getLatestQuote(signal.symbol);
+        if (quote && quote > 0) return quote;
+      } catch { /* fall through */ }
+    }
+
+    if (exchange === 'TOS') {
+      try {
+        const { getQuotes } = await import('../tos/tosInfoService');
+        const quotes = await getQuotes([signal.symbol]);
+        const q = quotes[signal.symbol];
+        if (q) return q.lastPrice ?? q.mark ?? q.askPrice ?? 0;
+      } catch { /* fall through */ }
+    }
+
+    const { stocksService } = await import('../market/stocks/StocksService');
+    const quote = await stocksService.quote(signal.symbol);
+    if (quote?.price && quote.price > 0) return quote.price;
+  } catch { /* ignore */ }
+
+  return 0;
+}
+```
+
+---
+
+## FIX 4 — Add getLatestQuote to Alpaca Info Service
+
+**File**: `server/src/services/alpaca/alpacaInfoService.ts`
+
+Add at the bottom of the file:
+
+```typescript
+export async function getLatestQuote(symbol: string): Promise<number | null> {
+  try {
+    const headers = authHeaders();
+    const url = `https://data.alpaca.markets/v2/stocks/${encodeURIComponent(symbol)}/quotes/latest`;
+    const { data } = await axios.get(url, { headers, timeout: 5000 });
+    const bid = parseFloat(data?.quote?.bp ?? '0');
+    const ask = parseFloat(data?.quote?.ap ?? '0');
+    if (bid > 0 && ask > 0) return (bid + ask) / 2;
+    const tradeUrl = `https://data.alpaca.markets/v2/stocks/${encodeURIComponent(symbol)}/trades/latest`;
+    const { data: tradeData } = await axios.get(tradeUrl, { headers, timeout: 5000 });
+    const last = parseFloat(tradeData?.trade?.p ?? '0');
+    return last > 0 ? last : null;
+  } catch {
+    return null;
+  }
+}
+```
+
+---
+
+## FIX 5 — PnL Never Written Back When Monitor Closes a Position
+
+**File**: `server/src/routes/alpaca.ts`
+
+In the `/auto/monitor` route, find:
+
+```typescript
+if (shouldClose && !dryRun) {
+  await closePosition((pos as any).symbol).catch((e: any) =>
+    console.warn(`[Alpaca Monitor] Close ${(pos as any).symbol}:`, e?.message)
+  );
+}
+```
+
+Replace with:
+
+```typescript
+if (shouldClose && !dryRun) {
+  await closePosition((pos as any).symbol).catch((e: any) =>
+    console.warn(`[Alpaca Monitor] Close ${(pos as any).symbol}:`, e?.message)
+  );
+
+  try {
+    const exitPrice = current;
+    const marketVal = parseFloat((pos as any).market_value ?? '0');
+    const dollarPnl = (pnlPct / 100) * Math.abs(marketVal);
+    await prisma.autoTradeLog.updateMany({
+      where: { symbol: (pos as any).symbol, exchange: 'PAPER', status: 'FILLED', exitPrice: null },
+      data:  { exitPrice, pnl: dollarPnl, status: 'CLOSED' },
+    });
+  } catch (e: any) {
+    console.warn('[Alpaca Monitor] PnL writeback failed:', e?.message);
+  }
+}
+```
+
+---
+
+## FIX 6 — Circuit Breaker Doesn't Check Alpaca State for PAPER
+
+**File**: `server/src/services/autotrader/CircuitBreaker.ts`
+
+Add this import at the top alongside the other killswitch imports:
+
+```typescript
+import { isKillswitchActive as isAlpacaKillswitchActive, isPauseActive as isAlpacaPauseActive } from '../alpaca/alpacaConfig';
+```
+
+Inside `checkCircuitBreakers()`, after the existing `HYPERLIQUID` block and before the market hours check, add:
+
+```typescript
+if (config.exchange === 'PAPER') {
+  const ksActive = isAlpacaKillswitchActive();
+  const paused   = isAlpacaPauseActive();
+  checks.push({ name: 'Alpaca Killswitch', passed: !ksActive, detail: ksActive ? 'Alpaca killswitch active' : undefined });
+  checks.push({ name: 'Alpaca Pause',      passed: !paused,   detail: paused   ? 'Alpaca trading paused'   : undefined });
+  if (ksActive || paused) {
+    return { allowed: false, reason: ksActive ? 'Alpaca killswitch active' : 'Alpaca trading paused', checks };
+  }
+}
+```
+
+---
+
+## FIX 7 — Adaptive Engine Queries CLOSED Status Too
+
+**File**: `server/src/services/alpaca/AdaptiveParameterEngine.ts`
+
+Find:
+```typescript
+status: { in: ['FILLED'] },
+```
+
+Replace with:
+```typescript
+status: { in: ['FILLED', 'CLOSED'] },
+```
+
+---
+
+## ROI 1 — Bull Trend Aggression
+
+**File**: `server/src/services/alpaca/AdaptiveParameterEngine.ts`
+
+Find:
+```typescript
+} else if (regime.regime === 'BULL_TREND') {
+  takeProfit = Math.min(takeProfit * 1.1,  bounds.takeProfit.max);
+  reasoning.push('Bull trend → extended take-profit targets');
+}
+```
+
+Replace with:
+```typescript
+} else if (regime.regime === 'BULL_TREND') {
+  takeProfit = Math.min(takeProfit * 1.25, bounds.takeProfit.max);
+  sizeMult   = Math.min(sizeMult   * 1.15, bounds.positionPct.max);
+  conviction = Math.max(conviction - 3,    bounds.conviction.min);
+  reasoning.push('Bull trend → targets +25%, size +15%, conviction threshold -3');
+}
+```
+
+---
+
+## ROI 2 — Winning Streak Response
+
+**File**: `server/src/services/alpaca/AdaptiveParameterEngine.ts`
+
+Find:
+```typescript
+} else if (last3.every(l => (l.pnl ?? 0) > 0) && profitFactor > 1.8) {
+  takeProfit = Math.min(takeProfit * 1.1,  bounds.takeProfit.max);
+  sizeMult   = Math.min(sizeMult * 1.1,    bounds.positionPct.max);
+  reasoning.push('3 consecutive wins with strong profit factor → extended targets, slight size increase');
+}
+```
+
+Replace with:
+```typescript
+} else if (last3.every(l => (l.pnl ?? 0) > 0) && profitFactor > 1.5) {
+  takeProfit = Math.min(takeProfit * 1.20, bounds.takeProfit.max);
+  sizeMult   = Math.min(sizeMult   * 1.20, bounds.positionPct.max);
+  conviction = Math.max(conviction - 2,    bounds.conviction.min);
+  reasoning.push(`3 wins, profit factor ${profitFactor.toFixed(2)} → targets +20%, size +20%, conviction -2`);
+}
+```
+
+---
+
+## ROI 3 — Earlier Profit Factor Warning
+
+**File**: `server/src/services/alpaca/AdaptiveParameterEngine.ts`
+
+Find:
+```typescript
+if (profitFactor < 1.0 && withPnl.length >= 5) {
+  conviction = Math.min(conviction + 4, bounds.conviction.max);
+  reasoning.push(`Low profit factor (${profitFactor.toFixed(2)}) → raised conviction threshold`);
+}
+```
+
+Replace with:
+```typescript
+if (profitFactor < 1.3 && withPnl.length >= 4) {
+  const bump = profitFactor < 0.8 ? 7 : profitFactor < 1.0 ? 5 : 3;
+  conviction = Math.min(conviction + bump, bounds.conviction.max);
+  stopLoss   = Math.max(stopLoss   * 0.90, bounds.stopLoss.min);
+  reasoning.push(`Profit factor ${profitFactor.toFixed(2)} < 1.3 → conviction +${bump}, tighter stops`);
+} else if (profitFactor > 2.5 && withPnl.length >= 4) {
+  conviction = Math.max(conviction - 3, bounds.conviction.min);
+  reasoning.push(`Strong profit factor ${profitFactor.toFixed(2)} → conviction -3 to catch more setups`);
+}
+```
+
+---
+
+## ROI 4 — Bull Trend + Profitable Open Positions = Stack Aggression
+
+**File**: `server/src/services/alpaca/AdaptiveParameterEngine.ts`
+
+Add this block immediately before the `// ── 4. Time of Day` comment:
+
+```typescript
+// Stack: confirmed bull trend + profitable open book = maximum aggression within bounds
+if (regime.regime === 'BULL_TREND') {
+  try {
+    const openPositions = await getPositions();
+    if (openPositions.length > 0) {
+      const avgPnlPct = openPositions.reduce(
+        (sum, p) => sum + parseFloat((p as any).unrealized_plpc ?? '0') * 100, 0
+      ) / openPositions.length;
+      if (avgPnlPct > 2.0) {
+        sizeMult   = Math.min(sizeMult   * 1.10, bounds.positionPct.max);
+        takeProfit = Math.min(takeProfit * 1.10, bounds.takeProfit.max);
+        reasoning.push(`Bull trend + open positions +${avgPnlPct.toFixed(1)}% avg → stacking aggression`);
+      }
+    }
+  } catch { /* ignore */ }
+}
+```
+
+---
+
+## ROI 5 — Default Bounds and Better Candidate Selection
+
+**File**: `server/src/routes/alpaca.ts`
+
+Find:
+```typescript
+const effectiveBounds: ParameterBounds = bounds ?? {
+  stopLoss:    { min: 1.5, max: 8.0 },
+  takeProfit:  { min: 3.0, max: 20.0 },
+  conviction:  { min: 65,  max: 92   },
+  positionPct: { min: 0.3, max: 1.0  },
+};
+```
+
+Replace with:
+```typescript
+const effectiveBounds: ParameterBounds = bounds ?? {
+  stopLoss:    { min: 1.5, max: 7.0  },
+  takeProfit:  { min: 4.0, max: 25.0 },
+  conviction:  { min: 68,  max: 90   },
+  positionPct: { min: 0.5, max: 1.5  },
+};
+```
+
+Find:
+```typescript
+maxSymbols: maxPositions * 3,
+```
+
+Replace with:
+```typescript
+maxSymbols: maxPositions * 5,
+```
+
+Find:
+```typescript
+const signals = rawSignals.slice(0, maxPositions).map((s: any) => ({
+  ...s,
+  exchange:          'PAPER' as const,
+  fixedDollarAmount: adjustedPerTrade,
+}));
+```
+
+Replace with:
+```typescript
+const sortedSignals = [...rawSignals].sort((a: any, b: any) => {
+  const aScore = (a.thesisHealthScore ?? 0) * 0.4 + (a.convictionScore ?? 0) * 0.4 + (a.confidenceScore ?? 0) * 0.2;
+  const bScore = (b.thesisHealthScore ?? 0) * 0.4 + (b.convictionScore ?? 0) * 0.4 + (b.confidenceScore ?? 0) * 0.2;
+  return bScore - aScore;
+});
+
+const signals = sortedSignals.slice(0, maxPositions).map((s: any) => ({
+  ...s,
+  exchange:          'PAPER' as const,
+  fixedDollarAmount: adjustedPerTrade,
+}));
+```
+
+---
+
+## OPTIONS 1 — Add Options Order Placement to Alpaca Exchange Service
+
+**File**: `server/src/services/alpaca/alpacaExchangeService.ts`
+
+Add this new function at the bottom of the file, before the final export:
+
+```typescript
+export interface AlpacaOptionsOrderResult {
+  success: boolean;
+  isDryRun: boolean;
+  orders: Array<{
+    leg: 'BUY' | 'SELL';
+    contractSymbol: string;
+    orderId?: string;
+    clientOrderId?: string;
+    error?: string;
+  }>;
+  strategyName: string;
+  ticker: string;
+  totalCost: number;
+  error?: string;
+}
+
+export async function placeOptionsOrder(
+  ticker: string,
+  strategyName: string,
+  legs: Array<{
+    action: 'BUY' | 'SELL';
+    contractSymbol: string;
+    contracts: number;
+    limitPrice: number;
+  }>,
+  userId: string,
+  totalCost: number,
+): Promise<AlpacaOptionsOrderResult> {
+  assertSafe('options order');
+
+  const creds = getAlpacaCredentials();
+  if (!creds) throw new Error('Alpaca credentials not configured');
+
+  const orderResults: AlpacaOptionsOrderResult['orders'] = [];
+
+  // If dry run, log and return without hitting Alpaca
+  if (creds.dryRun) {
+    for (const leg of legs) {
+      const clientOrderId = `riabot-opt-${uuidv4().slice(0, 8)}`;
+      await prisma.alpacaOrderLog.create({
+        data: {
+          userId,
+          symbol:       leg.contractSymbol,
+          side:         leg.action.toLowerCase(),
+          orderType:    'limit',
+          qty:          String(leg.contracts),
+          limitPrice:   String(leg.limitPrice),
+          timeInForce:  'day',
+          clientOrderId,
+          status:       'dry_run',
+          isDryRun:     true,
+          submittedAt:  new Date(),
+        },
+      });
+      orderResults.push({ leg: leg.action, contractSymbol: leg.contractSymbol, clientOrderId });
+    }
+    return { success: true, isDryRun: true, orders: orderResults, strategyName, ticker, totalCost };
+  }
+
+  // Place each leg as a separate limit order
+  // Alpaca paper supports single-leg options orders on /v2/orders
+  for (const leg of legs) {
+    const clientOrderId = `riabot-opt-${uuidv4().slice(0, 8)}`;
+    try {
+      const body = {
+        symbol:         leg.contractSymbol,
+        qty:            String(leg.contracts),
+        side:           leg.action === 'BUY' ? 'buy' : 'sell',
+        type:           'limit',
+        limit_price:    leg.limitPrice.toFixed(2),
+        time_in_force:  'day',
+        client_order_id: clientOrderId,
+      };
+
+      const { data } = await axios.post(`${ALPACA_PAPER_URL}/v2/orders`, body, {
+        headers: authHeaders(),
+        timeout: 10_000,
+      });
+
+      await prisma.alpacaOrderLog.create({
+        data: {
+          userId,
+          symbol:        leg.contractSymbol,
+          side:          leg.action.toLowerCase(),
+          orderType:     'limit',
+          qty:           String(leg.contracts),
+          limitPrice:    String(leg.limitPrice),
+          timeInForce:   'day',
+          alpacaOrderId: data.id,
+          clientOrderId: data.client_order_id ?? clientOrderId,
+          status:        'submitted',
+          isDryRun:      false,
+          submittedAt:   new Date(),
+        },
+      });
+
+      orderResults.push({ leg: leg.action, contractSymbol: leg.contractSymbol, orderId: data.id, clientOrderId });
+    } catch (err: any) {
+      const errMsg = err?.response?.data?.message ?? err?.message ?? 'Order failed';
+      orderResults.push({ leg: leg.action, contractSymbol: leg.contractSymbol, error: errMsg });
+    }
+  }
+
+  const allSucceeded = orderResults.every(o => !o.error);
+  return {
+    success: allSucceeded,
+    isDryRun: false,
+    orders: orderResults,
+    strategyName,
+    ticker,
+    totalCost,
+    error: allSucceeded ? undefined : orderResults.find(o => o.error)?.error,
+  };
+}
+```
+
+---
+
+## OPTIONS 2 — Wire Options into the Auto/Start Route
+
+**File**: `server/src/routes/alpaca.ts`
+
+Add this import near the top of the file with the other service imports:
+
+```typescript
+import { getRecommendation } from '../services/options/OptionsAnalyzer';
+import { thesisEngine } from '../services/thesis/ThesisEngine';
+import { placeOptionsOrder } from '../services/alpaca/alpacaExchangeService';
+```
+
+In the `/auto/start` route, find the line that destructures `req.body`:
+
+```typescript
+const {
+  capitalTotal       = 500,
+  maxPositions       = 3,
+  capitalPerTrade,
+  stopLossPct        = 3.0,
+  takeProfitPct      = 6.0,
+  minConvictionScore = 75,
+  dryRun             = false,
+  useAdaptive        = true,
+  bounds,
+} = req.body;
+```
+
+Replace with:
+
+```typescript
+const {
+  capitalTotal       = 500,
+  maxPositions       = 3,
+  capitalPerTrade,
+  stopLossPct        = 3.0,
+  takeProfitPct      = 6.0,
+  minConvictionScore = 75,
+  dryRun             = false,
+  useAdaptive        = true,
+  bounds,
+  tradingMode        = 'stocks',   // 'stocks' | 'options' | 'both'
+  maxOptionsRiskPct  = 1.5,        // max % of per-trade capital for options premium
+} = req.body;
+```
+
+Then, after the existing `const results = await runTradingCycle(...)` and `const placed` / `const rejected` lines, add the options trading block:
+
+```typescript
+// ── Options Trading ────────────────────────────────────────────────────────
+const optionsPlaced:   Array<{ symbol: string; strategy: string; cost: number; legs: any[] }> = [];
+const optionsRejected: Array<{ symbol: string; reason: string }> = [];
+
+if ((tradingMode === 'options' || tradingMode === 'both') && process.env.FINNHUB_API_KEY) {
+  // For options: use the same top signals but try to get an options recommendation for each
+  const optionCandidates = tradingMode === 'options'
+    ? sortedSignals.slice(0, maxPositions)    // options-only: use same pool
+    : sortedSignals.slice(0, maxPositions * 2); // both: try extras for options
+
+  const maxOptionsRisk = Math.floor(adjustedPerTrade * (maxOptionsRiskPct / 100) * 100);
+
+  for (const candidate of optionCandidates) {
+    // Skip crypto — options only for stocks
+    if (candidate.assetClass === 'crypto' || candidate.assetClass === 'CRYPTO') continue;
+    // Skip if we already have a stock position in this symbol (mode=both)
+    if (tradingMode === 'both' && placed.some((p: any) => p.symbol === candidate.symbol)) continue;
+
+    try {
+      // Get fresh thesis for the symbol (needed for options recommendation)
+      const thesis = await thesisEngine.analyze(candidate.symbol, 'stock');
+      const accountEquity = parseFloat((await getAccount()).equity ?? '100000');
+      const maxRisk = Math.max(50, maxOptionsRisk); // minimum $50 to be worth placing
+
+      const recommendation = await getRecommendation(thesis, accountEquity, maxRisk);
+
+      if (!recommendation || recommendation.strategy === 'NONE') {
+        optionsRejected.push({ symbol: candidate.symbol, reason: 'No viable options strategy found' });
+        continue;
+      }
+
+      // Build leg orders from recommendation
+      const legOrders = recommendation.legs.map(leg => ({
+        action:         leg.action,
+        contractSymbol: leg.contract.contractSymbol,
+        contracts:      leg.contracts,
+        limitPrice:     leg.contract.mid,   // use mid price as limit
+      }));
+
+      if (legOrders.length === 0) {
+        optionsRejected.push({ symbol: candidate.symbol, reason: 'No valid legs in recommendation' });
+        continue;
+      }
+
+      const totalCost = recommendation.netDebit > 0
+        ? recommendation.netDebit * recommendation.legs[0]?.contracts * 100
+        : 0;
+
+      const optResult = await placeOptionsOrder(
+        candidate.symbol,
+        recommendation.strategy,
+        legOrders,
+        settings!.id,
+        totalCost,
+      );
+
+      if (optResult.success) {
+        optionsPlaced.push({
+          symbol:   candidate.symbol,
+          strategy: recommendation.strategy,
+          cost:     totalCost,
+          legs:     optResult.orders.map(o => ({
+            action:         o.leg,
+            contractSymbol: o.contractSymbol,
+            orderId:        o.orderId,
+          })),
+        });
+      } else {
+        optionsRejected.push({ symbol: candidate.symbol, reason: optResult.error ?? 'Options order failed' });
+      }
+
+      // Small delay between options orders to avoid rate limits
+      await new Promise(r => setTimeout(r, 300));
+
+    } catch (err: any) {
+      optionsRejected.push({ symbol: candidate.symbol, reason: err?.message ?? 'Options error' });
+    }
+  }
+}
+```
+
+Then update the final `return res.json(...)` to include options results. Find:
+
+```typescript
+return res.json({
+  success: true,
+  data: {
+    signalsEvaluated:  results.length,
+    ordersPlaced:      placed.length,
+    ordersRejected:    rejected.length,
+    dryRun,
+    adaptiveParams,
+    activeParams: { ... },
+    placed:   placed.map(...),
+    rejected: rejected.map(...),
+  },
+});
+```
+
+Replace with:
+
+```typescript
+return res.json({
+  success: true,
+  data: {
+    signalsEvaluated:      results.length,
+    ordersPlaced:          placed.length,
+    optionsPlaced:         optionsPlaced.length,
+    ordersRejected:        rejected.length,
+    optionsRejected:       optionsRejected.length,
+    dryRun,
+    tradingMode,
+    adaptiveParams,
+    activeParams: {
+      stopLossPct:            activeStop,
+      takeProfitPct:          activeTarget,
+      minConvictionScore:     activeConviction,
+      positionSizeMultiplier: activeSizeMult,
+      perTradeAmount:         adjustedPerTrade,
+    },
+    placed:          placed.map((r: any) => ({ symbol: r.symbol, status: r.status, dollarAmount: r.dollarAmount, entryPrice: r.entryPrice })),
+    rejected:        rejected.map((r: any) => ({ symbol: r.symbol, reason: r.reason })),
+    optionsResults:  optionsPlaced,
+    optionsSkipped:  optionsRejected,
+  },
+});
+```
+
+---
+
+## OPTIONS 3 — Options Exit Monitoring
+
+**File**: `server/src/routes/alpaca.ts`
+
+The `/auto/monitor` route currently only checks stock positions. Alpaca paper tracks options positions in the same `/v2/positions` endpoint — they just have a contract symbol like `AAPL240119C00185000`. Add options-specific exit logic after the existing position loop.
+
+In the `/auto/monitor` route, find the closing `return res.json(...)` and add the options monitoring block just before it:
+
+```typescript
+// ── Options position monitoring ────────────────────────────────────────────
+// Exit rules for options:
+// - Long options: exit if value dropped 50% (hard stop) or gained 100% (take profit)
+// - Short options (CSP): exit if premium eroded 80% (take profit) or position up 200% against us
+for (const pos of positions) {
+  const symbol = (pos as any).symbol ?? '';
+  // Detect options by symbol format (contains C or P with a date + strike)
+  const isOption = /\d{6}[CP]\d{8}/.test(symbol);
+  if (!isOption) continue;
+
+  const entry   = parseFloat((pos as any).avg_entry_price ?? '0');
+  const current = parseFloat((pos as any).current_price  ?? '0');
+  if (entry <= 0 || current <= 0) continue;
+
+  const pnlPct  = ((current - entry) / entry) * 100;
+  const isLong  = parseFloat((pos as any).qty ?? '0') > 0;
+
+  let shouldClose = false;
+  let closeReason = '';
+
+  if (isLong) {
+    if (pnlPct <= -50) { shouldClose = true; closeReason = `Option 50% stop: ${pnlPct.toFixed(1)}%`; }
+    else if (pnlPct >= 100) { shouldClose = true; closeReason = `Option 100% target: +${pnlPct.toFixed(1)}%`; }
+  } else {
+    // Short option (sold premium) — exit if losing badly or captured most of premium
+    if (pnlPct >= 200)  { shouldClose = true; closeReason = `Short option loss 200%: +${pnlPct.toFixed(1)}%`; }
+    else if (pnlPct <= -80) { shouldClose = true; closeReason = `Short option profit 80% captured`; }
+  }
+
+  if (shouldClose && !dryRun) {
+    // Close by placing opposite order
+    const closeSide = isLong ? 'sell' : 'buy';
+    try {
+      const { placeOrder: alpacaClose } = await import('../services/alpaca/alpacaExchangeService');
+      await alpacaClose({
+        symbol,
+        qty:         Math.abs(parseFloat((pos as any).qty ?? '1')),
+        side:        closeSide as 'buy' | 'sell',
+        type:        'market',
+        timeInForce: 'day',
+        userId:      userId,
+      });
+    } catch (e: any) {
+      console.warn(`[Options Monitor] Close ${symbol} failed:`, e?.message);
+    }
+  }
+
+  actions.push({ symbol, action: shouldClose ? (dryRun ? 'WOULD_CLOSE' : 'CLOSED') : 'HOLD', reason: closeReason || `Option holding at ${pnlPct.toFixed(1)}%`, pnlPct });
+}
+```
+
+---
+
+## OPTIONS 4 — Add tradingMode to API Client
+
+**File**: `client/src/api/client.ts`
+
+Find the `autoStart` method and add `tradingMode` and `maxOptionsRiskPct` to the params type:
+
+```typescript
+autoStart: (params: {
+  capitalTotal?: number;
+  maxPositions?: number;
+  capitalPerTrade?: number;
+  stopLossPct?: number;
+  takeProfitPct?: number;
+  minConvictionScore?: number;
+  dryRun?: boolean;
+  useAdaptive?: boolean;
+  bounds?: any;
+  tradingMode?: 'stocks' | 'options' | 'both';    // ADD
+  maxOptionsRiskPct?: number;                       // ADD
+}) => post('/alpaca/auto/start', params),
+```
+
+---
+
+## OPTIONS 5 — Trading Mode Toggle and Options Results in UI
+
+**File**: `client/src/pages/alpaca/AlpacaDashboard.tsx`
+
+### Step A — Add state and pass tradingMode to autoStart
+
+Inside `AutoTradingPanel`, add this state declaration alongside the others:
+
+```typescript
+const [tradingMode, setTradingMode] = useState<'stocks' | 'options' | 'both'>('stocks');
+const [maxOptionsRiskPct, setMaxOptionsRiskPct] = useState(1.5);
+```
+
+Update the `startMutation` to pass the new params:
+
+```typescript
+const startMutation = useMutation({
+  mutationFn: () => api.alpaca.autoStart({
+    capitalTotal, maxPositions,
+    stopLossPct: stopLossBase, takeProfitPct: takeProfitBase, minConvictionScore: convictionBase,
+    dryRun, useAdaptive, bounds,
+    tradingMode,           // ADD
+    maxOptionsRiskPct,     // ADD
+  }),
+  // ... rest unchanged
+});
+```
+
+### Step B — Add Trading Mode selector to the UI
+
+Find the toggles row (the `<div className="flex items-center gap-4 px-1 mb-3">` that contains Dry Run and AI Adapt toggles). Add a trading mode selector immediately before that div:
+
+```tsx
+{/* Trading Mode Selector */}
+<div className="flex gap-1.5 mb-3 p-1 bg-zinc-900/60 rounded-xl border border-zinc-800">
+  {([
+    { value: 'stocks',  label: 'Stocks Only',    icon: '📈' },
+    { value: 'both',    label: 'Stocks + Options', icon: '⚡' },
+    { value: 'options', label: 'Options Only',   icon: '🎯' },
+  ] as const).map(({ value, label, icon }) => (
+    <button
+      key={value}
+      onClick={() => setTradingMode(value)}
+      className={cn(
+        'flex-1 py-1.5 px-2 rounded-lg text-[11px] font-medium transition-all',
+        tradingMode === value
+          ? 'bg-violet-600 text-white shadow'
+          : 'text-zinc-500 hover:text-zinc-300',
+      )}
+    >
+      <span className="mr-1">{icon}</span>{label}
+    </button>
+  ))}
+</div>
+
+{(tradingMode === 'options' || tradingMode === 'both') && (
+  <div className="mb-3 p-2.5 bg-blue-500/10 border border-blue-500/20 rounded-lg">
+    <p className="text-[11px] text-blue-300 mb-2">
+      Options trades use a small % of your per-trade capital for premium. The AI picks the best strategy (calls, spreads, or cash-secured puts) based on IV rank and conviction.
+    </p>
+    <div className="flex items-center justify-between">
+      <span className="text-xs text-zinc-400">Max options risk per trade (%)</span>
+      <div className="flex items-center gap-2">
+        <input
+          type="range" min={0.5} max={5} step={0.5} value={maxOptionsRiskPct}
+          onChange={e => setMaxOptionsRiskPct(Number(e.target.value))}
+          className="w-24 accent-blue-500"
+        />
+        <span className="text-xs font-mono text-white w-8">{maxOptionsRiskPct}%</span>
+      </div>
+    </div>
+    <p className="text-[10px] text-zinc-600 mt-1">
+      At ${Math.floor((capitalTotal / maxPositions) * maxOptionsRiskPct / 100)} per trade with current settings. Requires FINNHUB_API_KEY.
+    </p>
+  </div>
+)}
+```
+
+### Step C — Show options results in the last-run panel
+
+In the last-run results section, after the existing `placed` and `rejected` lists, add:
+
+```tsx
+{/* Options results */}
+{(lastResult?.optionsResults ?? []).map((o: any) => (
+  <div key={o.symbol + o.strategy} className="flex items-center gap-2 text-xs bg-blue-900/20 border border-blue-500/20 rounded px-2 py-1.5 mb-1">
+    <span className="text-blue-400">🎯</span>
+    <span className="font-mono font-bold text-white w-16">{o.symbol}</span>
+    <span className="text-blue-300 text-[10px]">{(o.strategy ?? '').replace(/_/g, ' ')}</span>
+    {o.cost > 0 && <span className="text-zinc-400 ml-auto">${Number(o.cost).toFixed(0)} premium</span>}
+  </div>
+))}
+{(lastResult?.optionsSkipped ?? []).slice(0, 2).map((o: any) => (
+  <div key={o.symbol} className="flex items-center gap-2 text-xs opacity-40 rounded px-2 py-1 mb-1">
+    <span className="text-zinc-600">○</span>
+    <span className="font-mono text-zinc-500 w-16">{o.symbol}</span>
+    <span className="text-zinc-600 truncate text-[10px]">options: {o.reason}</span>
+  </div>
+))}
+```
+
+Also update the summary line in last-run results to show options count. Find the existing summary `<div className="flex items-center gap-3 text-xs mb-2 flex-wrap">` and add inside it:
+
+```tsx
+{(lastResult?.optionsPlaced ?? 0) > 0 && (
+  <span>Options <strong className="text-blue-400">{lastResult.optionsPlaced}</strong></span>
+)}
+```
+
+---
+
+## SUMMARY
+
+### Files Modified
+
+```
+server/src/services/scans/dynamicUniverseService.ts
+  → Order by rank (asc), pass thesisHealthScore through
+
+server/src/services/autotrader/AutoTradeExecutor.ts
+  → Add thesisHealthScore to AutoTradeSignal interface
+  → Fix resolveEntryPrice to use Alpaca data API for PAPER exchange
+
+server/src/services/alpaca/alpacaInfoService.ts
+  → Add getLatestQuote() using Alpaca data API
+
+server/src/services/alpaca/alpacaExchangeService.ts
+  → Add placeOptionsOrder() for multi-leg options execution
+
+server/src/routes/alpaca.ts
+  → PnL writeback on monitor close
+  → Default bounds tuned for ROI
+  → 5x candidate pool with thesisHealthScore re-ranking
+  → tradingMode param ('stocks' | 'options' | 'both')
+  → Full options trading block in /auto/start
+  → Options position monitoring in /auto/monitor
+
+server/src/services/autotrader/CircuitBreaker.ts
+  → Check Alpaca killswitch and pause for PAPER exchange
+
+server/src/services/alpaca/AdaptiveParameterEngine.ts
+  → CLOSED status in performance query
+  → Bull trend: +25% targets, +15% size, -3 conviction
+  → Winning streak triggers at 1.5 profit factor, +20% reward
+  → Profit factor warning at 1.3, rewards at 2.5
+  → Bull trend + profitable open positions = stack aggression
+
+client/src/api/client.ts
+  → Add tradingMode and maxOptionsRiskPct to autoStart params
+
+client/src/pages/alpaca/AlpacaDashboard.tsx
+  → tradingMode state + maxOptionsRiskPct state
+  → Three-way trading mode selector (Stocks / Both / Options)
+  → Options info panel with risk % slider
+  → Options results in last-run display
+```
+
+### How Options Trading Works
+
+When `tradingMode` is `options` or `both`, after running the normal stock scan the system:
+
+1. Takes the top candidates from the scan
+2. Runs a full thesis analysis on each (to get IV rank, bias, conviction, hold window)
+3. Passes the thesis to `OptionsAnalyzer.getRecommendation()` which selects the best strategy:
+   - High conviction + low IV → **Long Call** (directional, delta ~0.60, 25-50 DTE)
+   - High IV → **Cash-Secured Put** (sell premium, collect income)
+   - Moderate conviction → **Bull Call Spread** (defined risk, 1.5:1+ reward:risk required)
+   - Bearish setup → **Long Put** or **Bear Put Spread**
+4. Places each leg as a limit order at the mid price via Alpaca paper API
+5. Monitors options positions separately — long options exit at -50%/+100%, short options exit at -80% premium captured or +200% loss
+
+Requires `FINNHUB_API_KEY` to be set in Replit Secrets for live options chain data. Without it, options mode will skip all candidates.

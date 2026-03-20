@@ -229,3 +229,115 @@ export async function closeAllPositions(
     return { closed: 0, errors };
   }
 }
+
+export interface AlpacaOptionsOrderResult {
+  success: boolean;
+  isDryRun: boolean;
+  orders: Array<{
+    leg: 'BUY' | 'SELL';
+    contractSymbol: string;
+    orderId?: string;
+    clientOrderId?: string;
+    error?: string;
+  }>;
+  strategyName: string;
+  ticker: string;
+  totalCost: number;
+  error?: string;
+}
+
+export async function placeOptionsOrder(
+  ticker: string,
+  strategyName: string,
+  legs: Array<{
+    action: 'BUY' | 'SELL';
+    contractSymbol: string;
+    contracts: number;
+    limitPrice: number;
+  }>,
+  userId: string,
+  totalCost: number,
+): Promise<AlpacaOptionsOrderResult> {
+  assertSafe('options order');
+
+  const creds = getAlpacaCredentials();
+  if (!creds) throw new Error('Alpaca credentials not configured');
+
+  const orderResults: AlpacaOptionsOrderResult['orders'] = [];
+
+  if (creds.dryRun) {
+    for (const leg of legs) {
+      const clientOrderId = `riabot-opt-${uuidv4().slice(0, 8)}`;
+      await prisma.alpacaOrderLog.create({
+        data: {
+          userId,
+          symbol:       leg.contractSymbol,
+          side:         leg.action.toLowerCase(),
+          orderType:    'limit',
+          qty:          String(leg.contracts),
+          limitPrice:   String(leg.limitPrice),
+          timeInForce:  'day',
+          clientOrderId,
+          status:       'dry_run',
+          isDryRun:     true,
+          submittedAt:  new Date(),
+        },
+      });
+      orderResults.push({ leg: leg.action, contractSymbol: leg.contractSymbol, clientOrderId });
+    }
+    return { success: true, isDryRun: true, orders: orderResults, strategyName, ticker, totalCost };
+  }
+
+  for (const leg of legs) {
+    const clientOrderId = `riabot-opt-${uuidv4().slice(0, 8)}`;
+    try {
+      const body = {
+        symbol:          leg.contractSymbol,
+        qty:             String(leg.contracts),
+        side:            leg.action === 'BUY' ? 'buy' : 'sell',
+        type:            'limit',
+        limit_price:     leg.limitPrice.toFixed(2),
+        time_in_force:   'day',
+        client_order_id: clientOrderId,
+      };
+
+      const { data } = await axios.post(`${ALPACA_PAPER_URL}/v2/orders`, body, {
+        headers: authHeaders(),
+        timeout: 10_000,
+      });
+
+      await prisma.alpacaOrderLog.create({
+        data: {
+          userId,
+          symbol:        leg.contractSymbol,
+          side:          leg.action.toLowerCase(),
+          orderType:     'limit',
+          qty:           String(leg.contracts),
+          limitPrice:    String(leg.limitPrice),
+          timeInForce:   'day',
+          alpacaOrderId: data.id,
+          clientOrderId: data.client_order_id ?? clientOrderId,
+          status:        'submitted',
+          isDryRun:      false,
+          submittedAt:   new Date(),
+        },
+      });
+
+      orderResults.push({ leg: leg.action, contractSymbol: leg.contractSymbol, orderId: data.id, clientOrderId });
+    } catch (err: any) {
+      const errMsg = err?.response?.data?.message ?? err?.message ?? 'Order failed';
+      orderResults.push({ leg: leg.action, contractSymbol: leg.contractSymbol, error: errMsg });
+    }
+  }
+
+  const allSucceeded = orderResults.every(o => !o.error);
+  return {
+    success:     allSucceeded,
+    isDryRun:    false,
+    orders:      orderResults,
+    strategyName,
+    ticker,
+    totalCost,
+    error:       allSucceeded ? undefined : orderResults.find(o => o.error)?.error,
+  };
+}
