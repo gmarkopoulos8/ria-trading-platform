@@ -1,0 +1,123 @@
+# Replit Agent Prompt — Fix Deployed App (Server Never Starts)
+
+The deployed app at ria-bot.replit.app is broken because main.py is empty (0 bytes). The deployment runs it and immediately exits. The Node server never starts, so login and everything else fails.
+
+---
+
+## FIX 1 — Write main.py
+
+**File**: `main.py` (root)
+
+Replace the empty file:
+
+```python
+import subprocess
+import sys
+import os
+
+if __name__ == "__main__":
+    env = os.environ.copy()
+    env["NODE_ENV"] = "production"
+    result = subprocess.run(
+        ["npm", "run", "start"],
+        env=env,
+        cwd=os.path.dirname(os.path.abspath(__file__)) or "."
+    )
+    sys.exit(result.returncode)
+```
+
+---
+
+## FIX 2 — Fix .replit deployment config
+
+**File**: `.replit`
+
+Replace the `[deployment]` section:
+
+```toml
+[deployment]
+deploymentTarget = "cloudrun"
+build = ["sh", "-c", "npm install && npm run build --workspace=shared && cd server && npx prisma generate && cd .. && npm run build --workspace=server && npm run build --workspace=client"]
+run = ["sh", "-c", "NODE_ENV=production npm run start"]
+```
+
+---
+
+## FIX 3 — Express must serve the React build in production
+
+In dev, Vite runs on port 5000 and proxies /api to port 3001. In production there is no Vite — the Express server must serve the built React files AND handle API routes on the same port.
+
+**File**: `server/src/index.ts`
+
+Add imports near the top:
+```typescript
+import path from 'path';
+import fs   from 'fs';
+```
+
+Add this block AFTER all `app.use('/api/...')` registrations, BEFORE `app.use(errorHandler)`:
+
+```typescript
+// Serve React build in production
+const clientDist = path.resolve(__dirname, '../../client/dist');
+if (process.env.NODE_ENV === 'production' && fs.existsSync(clientDist)) {
+  app.use(express.static(clientDist));
+  app.get('*', (_req, res) => res.sendFile(path.join(clientDist, 'index.html')));
+  console.log('   Static      : Serving React build');
+}
+```
+
+---
+
+## FIX 4 — Root package.json: add build:full and fix start
+
+**File**: `package.json` (root)
+
+Replace `"scripts"`:
+```json
+"scripts": {
+  "dev":        "concurrently -n SERVER,CLIENT -c yellow,cyan \"npm run dev --workspace=server\" \"npm run dev --workspace=client\"",
+  "build":      "npm run build --workspace=shared && npm run build --workspace=server && npm run build --workspace=client",
+  "build:full": "npm install && npm run build --workspace=shared && cd server && npx prisma generate && cd .. && npm run build --workspace=server && npm run build --workspace=client",
+  "start":      "NODE_ENV=production npm run start --workspace=server",
+  "db:push":    "cd server && npx prisma db push",
+  "db:seed":    "cd server && npx tsx prisma/seed.ts"
+}
+```
+
+---
+
+## FIX 5 — Server build must run prisma generate first
+
+**File**: `server/package.json`
+
+Replace the `"build"` script:
+```json
+"build": "npx prisma generate && tsc",
+```
+
+---
+
+## Required Replit Secrets
+
+Check the lock icon in the Replit sidebar. These MUST be set:
+
+| Key | Value |
+|-----|-------|
+| `NODE_ENV` | `production` |
+| `SESSION_SECRET` | Any random 32+ char string |
+| `DATABASE_URL` | Your PostgreSQL connection string |
+
+If `NODE_ENV` is not `production`, the server uses insecure cookies that the browser rejects on HTTPS. If `SESSION_SECRET` is missing, the server exits immediately in prod.
+
+---
+
+## Deployment steps
+
+1. Apply this prompt
+2. Verify the 3 Replit Secrets above are set
+3. Click **Deploy**
+4. Build runs, server starts, React app served on same port
+5. Log in at ria-bot.replit.app with `dev@riabot.local / password123`
+
+The user account already exists in the DB (confirmed). This is purely a deployment wiring issue.

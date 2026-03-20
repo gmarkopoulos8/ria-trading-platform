@@ -1,5 +1,6 @@
 import 'dotenv/config';
 import path from 'path';
+import fs   from 'fs';
 import { execSync } from 'child_process';
 import express from 'express';
 import cors from 'cors';
@@ -137,12 +138,10 @@ app.use('/api/options', optionsRouter);
 app.use('/api/*', notFoundHandler);
 
 // In production: serve the built React app and handle client-side routing
-if (isProd) {
-  const clientDist = path.join(__dirname, '../../client/dist');
+const clientDist = path.resolve(__dirname, '../../client/dist');
+if (isProd && fs.existsSync(clientDist)) {
   app.use(express.static(clientDist));
-  app.get('*', (_req, res) => {
-    res.sendFile(path.join(clientDist, 'index.html'));
-  });
+  app.get('*', (_req, res) => res.sendFile(path.join(clientDist, 'index.html')));
 }
 
 app.use(errorHandler);

@@ -8,10 +8,13 @@
     "client"
   ],
   "scripts": {
-    "dev": "concurrently -n SERVER,CLIENT -c yellow,cyan \"npm run dev --workspace=server\" \"npm run dev --workspace=client\"",
-    "build": "npm run build --workspace=shared && npm run build --workspace=client",
-    "build:prod": "npx prisma generate --schema=server/prisma/schema.prisma && cd shared && npm run build && cd ../client && npx vite build",
-    "start": "npm run start --workspace=server"
+    "dev":        "concurrently -n SERVER,CLIENT -c yellow,cyan \"npm run dev --workspace=server\" \"npm run dev --workspace=client\"",
+    "build":      "npm run build --workspace=shared && npm run build --workspace=server && npm run build --workspace=client",
+    "build:full": "npm install && npm run build --workspace=shared && cd server && npx prisma generate && cd .. && npm run build --workspace=server && npm run build --workspace=client",
+    "build:prod": "npm run build --workspace=shared && npm run build --workspace=server && npm run build --workspace=client",
+    "start":      "npm run start --workspace=server",
+    "db:push":    "cd server && npx prisma db push",
+    "db:seed":    "cd server && npx tsx prisma/seed.ts"
   },
   "devDependencies": {
     "concurrently": "^8.2.2"
