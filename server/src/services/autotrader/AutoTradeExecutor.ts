@@ -87,11 +87,12 @@ async function resolveEntryPrice(signal: AutoTradeSignal): Promise<number> {
       if (price && price > 0) return price;
     }
 
-    // PAPER: use Yahoo Finance directly — never depends on TOS or Alpaca being connected
     if (exchange === 'PAPER') {
-      const { stocksService } = await import('../market/stocks/StocksService');
-      const quote = await stocksService.quote(signal.symbol);
-      if (quote?.price && quote.price > 0) return quote.price;
+      try {
+        const { getLatestQuote } = await import('../alpaca/alpacaInfoService');
+        const quote = await getLatestQuote(signal.symbol);
+        if (quote && quote > 0) return quote;
+      } catch { /* fall through */ }
     }
 
     // For TOS exchange, use TOS quotes

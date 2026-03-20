@@ -858,6 +858,8 @@ function AutoTradingPanel({ isDryRun: externalDryRun }: { isDryRun: boolean }) {
   const [showParams,     setShowParams]     = useState(false);
   const [showBounds,     setShowBounds]     = useState(false);
   const [lastResult,     setLastResult]     = useState<any>(null);
+  const [tradingMode,    setTradingMode]    = useState<'stocks' | 'options' | 'both'>('stocks');
+  const [maxOptionsRiskPct, setMaxOptionsRiskPct] = useState(1.5);
 
   // Scan progress state
   const [scanRunId,      setScanRunId]      = useState<string | null>(null);
@@ -915,6 +917,7 @@ function AutoTradingPanel({ isDryRun: externalDryRun }: { isDryRun: boolean }) {
       stopLossPct: stopLossBase, takeProfitPct: takeProfitBase,
       minConvictionScore: convictionBase,
       dryRun, useAdaptive, bounds,
+      tradingMode, maxOptionsRiskPct,
     }),
     onMutate: () => {
       setIsScanning(true);
@@ -1084,6 +1087,45 @@ function AutoTradingPanel({ isDryRun: externalDryRun }: { isDryRun: boolean }) {
         </button>
       </div>
 
+      {/* Trading Mode Selector */}
+      <div className="flex gap-1.5 mb-3 p-1 bg-zinc-900/60 rounded-xl border border-zinc-800">
+        {([
+          { value: 'stocks',  label: 'Stocks Only',      icon: '📈' },
+          { value: 'both',    label: 'Stocks + Options', icon: '⚡' },
+          { value: 'options', label: 'Options Only',     icon: '🎯' },
+        ] as const).map(({ value, label, icon }) => (
+          <button
+            key={value}
+            onClick={() => setTradingMode(value)}
+            className={cn(
+              'flex-1 py-1.5 px-2 rounded-lg text-[11px] font-medium transition-all',
+              tradingMode === value ? 'bg-violet-600 text-white shadow' : 'text-zinc-500 hover:text-zinc-300',
+            )}
+          >
+            <span className="mr-1">{icon}</span>{label}
+          </button>
+        ))}
+      </div>
+
+      {(tradingMode === 'options' || tradingMode === 'both') && (
+        <div className="mb-3 p-2.5 bg-blue-500/10 border border-blue-500/20 rounded-lg">
+          <p className="text-[11px] text-blue-300 mb-2">
+            Options trades use a small % of your per-trade capital for premium. The AI picks the best strategy based on IV rank and conviction.
+          </p>
+          <div className="flex items-center justify-between">
+            <span className="text-xs text-zinc-400">Max options risk per trade (%)</span>
+            <div className="flex items-center gap-2">
+              <input type="range" min={0.5} max={5} step={0.5} value={maxOptionsRiskPct}
+                onChange={e => setMaxOptionsRiskPct(Number(e.target.value))} className="w-24 accent-blue-500" />
+              <span className="text-xs font-mono text-white w-8">{maxOptionsRiskPct}%</span>
+            </div>
+          </div>
+          <p className="text-[10px] text-zinc-600 mt-1">
+            At ${Math.floor((capitalTotal / maxPositions) * maxOptionsRiskPct / 100)} per trade. Requires FINNHUB_API_KEY.
+          </p>
+        </div>
+      )}
+
       {/* Toggles */}
       <div className="flex items-center gap-4 px-1 mb-3">
         <div className="flex items-center gap-2 flex-1">
@@ -1192,6 +1234,7 @@ function AutoTradingPanel({ isDryRun: externalDryRun }: { isDryRun: boolean }) {
             <span>Scanned <strong className="text-white">{lastResult.signalsEvaluated ?? '—'}</strong></span>
             <span>Placed <strong className="text-violet-400">{lastResult.ordersPlaced ?? 0}</strong></span>
             {(lastResult.ordersRejected ?? 0) > 0 && <span>Skipped <strong className="text-zinc-500">{lastResult.ordersRejected}</strong></span>}
+            {(lastResult.optionsPlaced ?? 0) > 0 && <span>Options <strong className="text-blue-400">{lastResult.optionsPlaced}</strong></span>}
             {lastResult.autoScanned && <span className="text-[10px] text-blue-400 bg-blue-900/30 px-1.5 py-0.5 rounded">Auto-scanned</span>}
             {lastResult.dryRun && <span className="text-[10px] text-violet-400 bg-violet-900/40 px-1.5 py-0.5 rounded">DRY RUN</span>}
           </div>
@@ -1208,6 +1251,21 @@ function AutoTradingPanel({ isDryRun: externalDryRun }: { isDryRun: boolean }) {
               <XCircle className="w-3 h-3 text-zinc-500 flex-shrink-0" />
               <span className="font-mono text-zinc-400 w-16">{r.symbol}</span>
               <span className="text-zinc-600 truncate text-[10px]">{r.reason}</span>
+            </div>
+          ))}
+          {(lastResult.optionsResults ?? []).map((o: any) => (
+            <div key={o.symbol + o.strategy} className="flex items-center gap-2 text-xs bg-blue-900/20 border border-blue-500/20 rounded px-2 py-1.5 mb-1">
+              <span className="text-blue-400">🎯</span>
+              <span className="font-mono font-bold text-white w-16">{o.symbol}</span>
+              <span className="text-blue-300 text-[10px]">{(o.strategy ?? '').replace(/_/g, ' ')}</span>
+              {o.cost > 0 && <span className="text-zinc-400 ml-auto">${Number(o.cost).toFixed(0)} premium</span>}
+            </div>
+          ))}
+          {(lastResult.optionsSkipped ?? []).slice(0, 2).map((o: any) => (
+            <div key={o.symbol} className="flex items-center gap-2 text-xs opacity-40 rounded px-2 py-1 mb-1">
+              <span className="text-zinc-600">○</span>
+              <span className="font-mono text-zinc-500 w-16">{o.symbol}</span>
+              <span className="text-zinc-600 truncate text-[10px]">options: {o.reason}</span>
             </div>
           ))}
         </div>
