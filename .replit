@@ -11,9 +11,9 @@ language = "python3"
 requiredFiles = [".replit", "replit.nix"]
 
 [deployment]
-run = ["bash", "-c", "NODE_ENV=production tsx server/src/index.ts"]
+run = ["npm", "run", "start", "--workspace=server"]
 deploymentTarget = "vm"
-build = ["bash", "-c", "npm install && npx prisma generate --schema=server/prisma/schema.prisma && cd shared && npm run build && cd ../client && npx vite build"]
+build = ["npm", "run", "build:prod"]
 
 [agent]
 expertMode = true

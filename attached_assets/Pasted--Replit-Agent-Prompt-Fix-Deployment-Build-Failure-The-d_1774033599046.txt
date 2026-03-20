@@ -1,0 +1,79 @@
+# Replit Agent Prompt — Fix Deployment Build Failure
+
+The deployment is failing because the build command is broken. Fix it two ways: add a proper build script to `package.json`, and fix the `.replit` deployment config.
+
+---
+
+## FIX 1 — Add a build script to root package.json
+
+**File**: `package.json` (root level)
+
+Find the `"scripts"` section and replace it with:
+
+```json
+"scripts": {
+  "dev": "concurrently -n SERVER,CLIENT -c yellow,cyan \"npm run dev --workspace=server\" \"npm run dev --workspace=client\"",
+  "build": "npm run build --workspace=shared && npm run build --workspace=server && npm run build --workspace=client",
+  "build:full": "cd server && npx prisma generate && cd .. && npm run build --workspace=shared && npm run build --workspace=server && npm run build --workspace=client",
+  "start": "npm run start --workspace=server"
+}
+```
+
+The `build:full` script runs prisma generate first, then builds everything in the correct order as a single npm script — no `bash -c` needed.
+
+---
+
+## FIX 2 — Fix the .replit deployment config
+
+**File**: `.replit`
+
+Find the `[deployment]` section:
+```toml
+[deployment]
+run = ["python3", "main.py"]
+deploymentTarget = "cloudrun"
+```
+
+Replace it with:
+```toml
+[deployment]
+run = ["sh", "-c", "cd server && npx prisma generate && node dist/index.js"]
+build = ["sh", "-c", "npm install && npm run build:full"]
+deploymentTarget = "cloudrun"
+```
+
+---
+
+## FIX 3 — Make sure Prisma generates during server build
+
+**File**: `server/package.json`
+
+Find the `"scripts"` section and update the `"build"` script:
+
+```json
+"scripts": {
+  "dev": "tsx watch src/index.ts",
+  "build": "npx prisma generate && tsc",
+  "start": "node dist/index.js",
+  "seed": "tsx prisma/seed.ts",
+  "db:push": "prisma db push --schema=prisma/schema.prisma"
+}
+```
+
+This ensures `prisma generate` always runs before TypeScript compilation so the Prisma client types are available.
+
+---
+
+## After applying this
+
+In Replit's deployment settings, set the build command to:
+```
+npm run build:full
+```
+
+And the run command to:
+```
+npm run start
+```
+
+These are simple npm scripts with no quoting issues.
