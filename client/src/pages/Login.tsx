@@ -53,9 +53,7 @@ export default function Login() {
         <div className="space-y-8">
           <div>
             <h2 className="text-3xl font-bold text-white leading-tight">
-              AI-Powered<br />
-              <span className="text-accent-blue">Paper Trading</span><br />
-              Research Simulator
+              Trading RIA
             </h2>
             <p className="text-slate-400 mt-4 leading-relaxed">
               Discover high-velocity opportunities, score your thesis with AI, and track paper positions with professional-grade analytics.
@@ -86,7 +84,7 @@ export default function Login() {
           </div>
         </div>
 
-        <p className="text-xs text-slate-700 font-mono">© 2026 RIA BOT · Paper Trading Only · Not Financial Advice</p>
+        <p className="text-xs text-slate-700 font-mono">© 2026 RIA BOT</p>
       </div>
 
       <div className="flex-1 lg:max-w-md flex flex-col items-center justify-center p-8">

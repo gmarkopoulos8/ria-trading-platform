@@ -1107,7 +1107,7 @@ function AutoTradingPanel({ isDryRun: externalDryRun }: { isDryRun: boolean }) {
             disabled={toggleDryMutation.isPending}
             className={cn('relative w-10 h-5 rounded-full transition-colors flex-shrink-0', dryRun ? 'bg-violet-600' : 'bg-emerald-600')}
           >
-            <span className={cn('absolute top-0.5 w-4 h-4 bg-white rounded-full shadow transition-all', dryRun ? 'left-0.5' : 'left-5')} />
+            <span className={cn('absolute top-0.5 w-4 h-4 bg-white rounded-full shadow transition-all', dryRun ? 'left-5' : 'left-0.5')} />
           </button>
           <span className="text-xs text-zinc-400">Dry Run</span>
         </div>
