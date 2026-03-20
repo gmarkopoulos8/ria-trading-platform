@@ -353,19 +353,30 @@ router.post('/auto/start', requireAuth, requireAlpacaCredentials, async (req: Re
     }
 
     const { buildSignalsFromLatestScan } = await import('../services/scans/dynamicUniverseService');
-    const rawSignals = await buildSignalsFromLatestScan({
+    let rawSignals = await buildSignalsFromLatestScan({
       minConvictionScore:  activeConviction,
       minConfidenceScore:  60,
       allowedBiases:       ['BULLISH'],
       maxSymbols:          maxPositions * 5,
     });
 
+    // If AI raised conviction too high and nothing passes, retry with the base conviction
+    if ((!rawSignals || rawSignals.length === 0) && activeConviction > minConvictionScore) {
+      console.log(`[AutoStart] No signals at adaptive conviction ${activeConviction}, retrying with base ${minConvictionScore}`);
+      rawSignals = await buildSignalsFromLatestScan({
+        minConvictionScore:  minConvictionScore,
+        minConfidenceScore:  55,
+        allowedBiases:       ['BULLISH'],
+        maxSymbols:          maxPositions * 5,
+      });
+    }
+
     const isOptionsMode = tradingMode === 'options' || tradingMode === 'both';
 
     if ((!rawSignals || rawSignals.length === 0) && !isOptionsMode) {
       return res.status(400).json({
         success: false,
-        error: 'No qualifying signals. Run a Daily Scan first, or the AI raised conviction threshold too high — try widening your bounds.',
+        error: 'No qualifying signals found. Make sure you have run a Daily Scan today — go to the Daily Scan tab and click Run Scan, then try again.',
       });
     }
 

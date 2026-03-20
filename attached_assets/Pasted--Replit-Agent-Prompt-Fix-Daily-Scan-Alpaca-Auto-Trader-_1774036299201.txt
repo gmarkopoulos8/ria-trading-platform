@@ -1,0 +1,429 @@
+# Replit Agent Prompt — Fix Daily Scan + Alpaca Auto Trader
+
+This fixes all the bugs causing the daily scan to get stuck on "Initializing" and the Alpaca auto trader "Start Trading" to fail. Apply every change exactly as written.
+
+---
+
+## BUG 1 — Daily Scan Blocks HTTP Response (Times Out)
+
+The `/trigger` route does `await runDailyScan()` which runs the entire 2–10 minute scan inside one HTTP request. Replit kills HTTP connections after ~30 seconds. The scan ID is never returned, the UI has nothing to connect to, and it sits on "Initializing" forever.
+
+**File**: `server/src/routes/daily-scans.ts`
+
+Replace the entire `/trigger` route:
+
+```typescript
+router.post('/trigger', async (req: Request, res: Response) => {
+  try {
+    const {
+      runType        = 'MANUAL',
+      marketSession  = 'MARKET_OPEN',
+      assetScope     = 'ALL',
+      riskMode       = 'ALL',
+      force          = false,
+      fullUniverse   = false,
+      filterCriteria = {},
+    } = req.body ?? {};
+
+    // Check duplicate before creating anything
+    if (!(force === true || force === 'true')) {
+      const { hasDuplicateRunToday } = await import('../services/scans/scanPersistenceService');
+      const isDuplicate = await hasDuplicateRunToday(runType, marketSession);
+      if (isDuplicate) {
+        return res.status(400).json({
+          success: false,
+          error: 'A scan for this session already ran today. Enable Force to override.',
+        });
+      }
+    }
+
+    // Pre-create the DB record so we have an ID to return RIGHT NOW
+    const { createScanRun, markRunStarted } = await import('../services/scans/scanPersistenceService');
+    const scanRun = await createScanRun({
+      runType,
+      marketSession,
+      assetScope:         assetScope as any,
+      riskMode:           riskMode as any,
+      isFullUniverseScan: fullUniverse,
+    });
+    await markRunStarted(scanRun.id);
+
+    // Return immediately — UI can now connect SSE stream
+    res.json({ success: true, data: { scanRunId: scanRun.id } });
+
+    // Run the actual scan in the background (non-blocking)
+    const { runDailyScan } = await import('../services/scans/dailyScanOrchestrator');
+    runDailyScan({
+      runType,
+      marketSession,
+      assetScope:          assetScope as any,
+      riskMode:            riskMode as any,
+      skipDuplicateCheck:  true,
+      fullUniverse,
+      filterCriteria,
+      _existingScanRunId:  scanRun.id,
+    }).catch((err: any) => {
+      console.error('[Trigger] Background scan failed:', err?.message);
+    });
+
+  } catch (err) {
+    res.status(400).json({ success: false, error: err instanceof Error ? err.message : 'Scan trigger failed' });
+  }
+});
+```
+
+Also add the prisma import at the top of `daily-scans.ts` if not already there:
+```typescript
+import { prisma } from '../lib/prisma';
+```
+
+And add a reset-stuck route before `export default router`:
+```typescript
+router.post('/reset-stuck', async (req: Request, res: Response) => {
+  try {
+    const result = await prisma.dailyScanRun.updateMany({
+      where: { status: 'RUNNING' },
+      data:  { status: 'FAILED', errorMessage: 'Manually reset via API' },
+    });
+    res.json({ success: true, data: { reset: result.count } });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err instanceof Error ? err.message : 'Reset failed' });
+  }
+});
+```
+
+---
+
+## BUG 2 — Orchestrator Doesn't Accept Pre-Created Scan Run ID
+
+**File**: `server/src/services/scans/dailyScanOrchestrator.ts`
+
+Add `_existingScanRunId` to `RunScanOptions`:
+```typescript
+export interface RunScanOptions {
+  runType?:            string;
+  marketSession?:      string;
+  assetScope?:         AssetScope;
+  riskMode?:           RiskMode;
+  scheduledFor?:       Date;
+  skipDuplicateCheck?: boolean;
+  fullUniverse?:       boolean;
+  filterCriteria?:     Partial<FilterCriteria>;
+  _existingScanRunId?: string;
+}
+```
+
+At the top of `runDailyScan()`, replace:
+```typescript
+const scanRun = await createScanRun({ runType, marketSession, assetScope, riskMode, scheduledFor, isFullUniverseScan: fullUniverse });
+console.log(`[DailyScan] Starting scan run ${scanRun.id} (${runType}/${marketSession})`);
+await markRunStarted(scanRun.id);
+```
+
+With:
+```typescript
+const scanRun = opts._existingScanRunId
+  ? { id: opts._existingScanRunId }
+  : await createScanRun({ runType, marketSession, assetScope, riskMode, scheduledFor, isFullUniverseScan: fullUniverse ?? false });
+
+if (!opts._existingScanRunId) {
+  await markRunStarted(scanRun.id);
+}
+console.log(`[DailyScan] Starting scan run ${scanRun.id} (${runType}/${marketSession})`);
+```
+
+Also add `updateScanProgress` to the imports at the top:
+```typescript
+import { updateScanProgress } from './scanProgressStore';
+```
+
+Then in the static universe scan, update the progress callback to actually write to the SSE store. Find:
+```typescript
+const results = await rankCandidates(universe, 100, (done, total) => {
+  progressTick++;
+  if (progressTick % 5 === 0 || done === total) {
+    console.log(`[DailyScan] Progress: ${done}/${total} analyzed`);
+  }
+});
+```
+
+Replace with:
+```typescript
+const results = await rankCandidates(universe, 100, (done, total) => {
+  // Write to SSE progress store so the UI progress bar actually moves
+  updateScanProgress(scanRun.id, 'ANALYZING', done, total);
+  if (done % 5 === 0 || done === total) {
+    console.log(`[DailyScan] Progress: ${done}/${total} analyzed`);
+  }
+});
+```
+
+---
+
+## BUG 3 — Stuck RUNNING Scans Block All New Runs
+
+If a previous scan crashed or the server restarted mid-scan, it leaves a `RUNNING` record in the DB. The duplicate check blocks all new scans. Fix by resetting these on startup.
+
+**File**: `server/src/index.ts`
+
+Add this import near the top:
+```typescript
+import { prisma } from './lib/prisma';
+```
+
+Add this function and call it inside `app.listen`:
+```typescript
+async function resetStuckScans() {
+  try {
+    const result = await prisma.dailyScanRun.updateMany({
+      where: { status: 'RUNNING' },
+      data:  { status: 'FAILED', errorMessage: 'Reset on server startup — was stuck in RUNNING state' },
+    });
+    if (result.count > 0) {
+      console.log(`[Startup] Reset ${result.count} stuck RUNNING scan(s)`);
+    }
+  } catch (err: any) {
+    console.warn('[Startup] Could not reset stuck scans:', err?.message);
+  }
+}
+```
+
+Inside `app.listen`, call it before `startDailyScanScheduler()`:
+```typescript
+app.listen(PORT, async () => {
+  console.log(`✅ RIA BOT API running on port ${PORT}`);
+  // ... existing log lines ...
+
+  await resetStuckScans();      // ADD THIS LINE
+  await loadDefaultCredentials();
+  startDailyScanScheduler();
+  // ... rest unchanged
+});
+```
+
+---
+
+## BUG 4 — Alpaca Entry Price Uses TOS (Fails When TOS Not Connected)
+
+`resolveEntryPrice()` calls `tosInfoService.getQuotes()` for all stocks including PAPER exchange trades. If TOS isn't connected it returns 0 and the trade is rejected with "Could not resolve entry price."
+
+**File**: `server/src/services/autotrader/AutoTradeExecutor.ts`
+
+Replace the entire `resolveEntryPrice` function:
+
+```typescript
+async function resolveEntryPrice(signal: AutoTradeSignal): Promise<number> {
+  if (signal.entryPrice && signal.entryPrice > 0) return signal.entryPrice;
+
+  const exchange = signal.exchange ?? 'PAPER';
+
+  try {
+    if (signal.assetClass === 'crypto' || signal.assetClass === 'CRYPTO') {
+      const { getAssetPrice } = await import('../hyperliquid/hyperliquidInfoService');
+      const price = await getAssetPrice(signal.symbol);
+      if (price && price > 0) return price;
+    }
+
+    // For PAPER: use Yahoo Finance directly — never depends on TOS being connected
+    if (exchange === 'PAPER') {
+      try {
+        const { stocksService } = await import('../market/stocks/StocksService');
+        const quote = await stocksService.quote(signal.symbol);
+        if (quote?.price && quote.price > 0) return quote.price;
+      } catch { /* fall through */ }
+    }
+
+    // For TOS exchange only
+    if (exchange === 'TOS') {
+      try {
+        const { getQuotes } = await import('../tos/tosInfoService');
+        const quotes = await getQuotes([signal.symbol]);
+        const q = quotes[signal.symbol];
+        if (q) return q.lastPrice ?? q.mark ?? q.askPrice ?? 0;
+      } catch { /* fall through */ }
+    }
+
+    // Universal fallback — Yahoo Finance
+    const { stocksService } = await import('../market/stocks/StocksService');
+    const quote = await stocksService.quote(signal.symbol);
+    if (quote?.price && quote.price > 0) return quote.price;
+
+  } catch { /* ignore */ }
+
+  return 0;
+}
+```
+
+---
+
+## BUG 5 — No Qualifying Signals (Missing Scan or Conviction Too High)
+
+The adaptive engine can raise conviction to 88+ in choppy markets, meaning no signals pass. Add a fallback that lowers the threshold if the first attempt returns nothing.
+
+**File**: `server/src/routes/alpaca.ts`
+
+In the `/auto/start` route, find:
+```typescript
+const rawSignals = await buildSignalsFromLatestScan({
+  minConvictionScore:  activeConviction,
+  minConfidenceScore:  60,
+  allowedBiases:       ['BULLISH'],
+  maxSymbols:          maxPositions * 3,
+});
+
+if (!rawSignals || rawSignals.length === 0) {
+  return res.status(400).json({
+    success: false,
+    error: 'No qualifying signals. Run a Daily Scan first, or the AI raised conviction threshold too high — try widening your bounds.',
+  });
+}
+```
+
+Replace with:
+```typescript
+let rawSignals = await buildSignalsFromLatestScan({
+  minConvictionScore:  activeConviction,
+  minConfidenceScore:  60,
+  allowedBiases:       ['BULLISH'],
+  maxSymbols:          maxPositions * 5,
+});
+
+// If AI raised conviction too high and nothing passes, try with base conviction
+if ((!rawSignals || rawSignals.length === 0) && activeConviction > minConvictionScore) {
+  console.log(`[AutoStart] No signals at adaptive conviction ${activeConviction}, retrying with base ${minConvictionScore}`);
+  rawSignals = await buildSignalsFromLatestScan({
+    minConvictionScore:  minConvictionScore,
+    minConfidenceScore:  55,
+    allowedBiases:       ['BULLISH'],
+    maxSymbols:          maxPositions * 5,
+  });
+}
+
+if (!rawSignals || rawSignals.length === 0) {
+  return res.status(400).json({
+    success: false,
+    error: 'No qualifying signals found. Make sure you have run a Daily Scan today — go to the Daily Scan tab and click Run Scan, then try again.',
+  });
+}
+
+// Sort by quality: thesisHealthScore + conviction + confidence
+const sortedSignals = [...rawSignals].sort((a: any, b: any) => {
+  const aScore = (a.thesisHealthScore ?? 0) * 0.4 + (a.convictionScore ?? 0) * 0.4 + (a.confidenceScore ?? 0) * 0.2;
+  const bScore = (b.thesisHealthScore ?? 0) * 0.4 + (b.convictionScore ?? 0) * 0.4 + (b.confidenceScore ?? 0) * 0.2;
+  return bScore - aScore;
+});
+```
+
+Then change:
+```typescript
+const signals = rawSignals.slice(0, maxPositions).map((s: any) => ({
+```
+To:
+```typescript
+const signals = sortedSignals.slice(0, maxPositions).map((s: any) => ({
+```
+
+---
+
+## BUG 6 — UI Shows Static "INITIALIZING" With No Feedback
+
+**File**: `client/src/pages/DailyScan.tsx`
+
+Find the `ProgressPanel` component. Add startup message state and a cycling effect.
+
+Find this line:
+```typescript
+const [progress, setProgress] = useState<ScanProgress | null>(null);
+```
+
+Add immediately after:
+```typescript
+const [startupMsg, setStartupMsg] = useState('Starting scan engine…');
+
+useEffect(() => {
+  const msgs = ['Starting scan engine…', 'Connecting to market data…', 'Loading universe…', 'Analyzing first symbols…'];
+  let i = 0;
+  const t = setInterval(() => { i = Math.min(i + 1, msgs.length - 1); setStartupMsg(msgs[i]); }, 4000);
+  return () => clearInterval(t);
+}, []);
+```
+
+Find:
+```tsx
+{progress ? phaseLabel(progress.phase) : 'INITIALIZING'}
+```
+
+Replace with:
+```tsx
+{progress ? phaseLabel(progress.phase) : startupMsg}
+```
+
+---
+
+## BUG 7 — No Way to Reset Stuck Scan From UI
+
+**File**: `client/src/api/client.ts`
+
+In the `scans` section, add:
+```typescript
+resetStuck: () => post('/daily-scans/reset-stuck', {}),
+```
+
+**File**: `client/src/pages/DailyScan.tsx`
+
+Add a mutation near the other mutations:
+```typescript
+const resetStuckMut = useMutation({
+  mutationFn: () => (api.scans as any).resetStuck(),
+  onSuccess: () => {
+    toast.success('Stuck scan reset — you can now run a new scan');
+    qc.invalidateQueries({ queryKey: ['daily-scan-runs'] });
+    qc.invalidateQueries({ queryKey: ['daily-scan-latest'] });
+  },
+  onError: (e: any) => toast.error(e?.response?.data?.error ?? 'Reset failed'),
+});
+```
+
+Find the Run Scan button and add a "Stuck? Reset" link next to it:
+```tsx
+{isRunning && (
+  <button
+    onClick={() => {
+      resetStuckMut.mutate();
+      // Reset local running state
+      setActiveScanId?.(null);
+      setIsFullScanRunning?.(false);
+    }}
+    className="text-xs text-slate-500 hover:text-red-400 underline transition-colors ml-3"
+    title="Click if scan is stuck on Initializing"
+  >
+    Stuck? Reset
+  </button>
+)}
+```
+
+---
+
+## SUMMARY
+
+### Files Modified
+```
+server/src/index.ts                                  → resetStuckScans() on startup
+server/src/routes/daily-scans.ts                    → non-blocking trigger, reset-stuck endpoint
+server/src/services/scans/dailyScanOrchestrator.ts  → _existingScanRunId param, fix SSE progress
+server/src/services/autotrader/AutoTradeExecutor.ts → fix resolveEntryPrice for PAPER exchange
+server/src/routes/alpaca.ts                         → fallback conviction, better signal sorting
+client/src/pages/DailyScan.tsx                      → startup messages, Stuck? Reset button
+client/src/api/client.ts                            → scans.resetStuck()
+```
+
+### Root Causes Summary
+
+| Problem | Root Cause | Fix |
+|---------|-----------|-----|
+| Daily scan stuck "Initializing" | HTTP request times out (30s), scan takes 2–10 min | Return scan ID immediately, run scan in background |
+| Progress bar never moves | Static scan never calls `updateScanProgress()` | Add one `updateScanProgress()` call in progress callback |
+| Can't run new scan after crash | Stuck `RUNNING` DB record blocks duplicate check | Reset on startup + manual reset button |
+| Start Trading fails with entry price error | TOS not connected, PAPER trades use TOS price feed | Route PAPER to Yahoo Finance directly |
+| No qualifying signals | Adaptive engine raises conviction above all scan results | Fallback to base conviction if adaptive returns nothing |
+| "INITIALIZING" shown forever | No feedback while waiting for first progress event | Cycle through helpful startup messages |
