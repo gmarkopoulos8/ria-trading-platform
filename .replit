@@ -31,6 +31,10 @@ author = "agent"
 task = "workflow.run"
 args = "Start application"
 
+[[workflows.workflow.tasks]]
+task = "workflow.run"
+args = "Auto-push to GitHub"
+
 [[workflows.workflow]]
 name = "Start application"
 author = "agent"
@@ -42,6 +46,17 @@ waitForPort = 5000
 
 [workflows.workflow.metadata]
 outputType = "webview"
+
+[[workflows.workflow]]
+name = "Auto-push to GitHub"
+author = "agent"
+
+[[workflows.workflow.tasks]]
+task = "shell.exec"
+args = "bash -c 'chmod +x scripts/push-to-github.sh && while true; do bash scripts/push-to-github.sh; sleep 60; done'"
+
+[workflows.workflow.metadata]
+outputType = "console"
 
 [[ports]]
 localPort = 3001
