@@ -424,6 +424,60 @@ export async function executeAutoTrade(
     perScanTradeCount.set(exchange, (perScanTradeCount.get(exchange) ?? 0) + 1);
   }
 
+  // ─── Phase 9b: Premium-selling mode for PAPER (Alpaca) ─────────────────
+  // When regime is BEAR_CRISIS or ELEVATED_VOLATILITY and the signal is flagged
+  // for premium selling, route to options analysis instead of a directional buy.
+  if ((signal as any)._premiumSelling && exchange === 'PAPER') {
+    try {
+      const targetStrategy: string = (signal as any)._targetStrategy ?? 'IRON_CONDOR';
+      console.info(`[Executor] Premium-selling signal: ${signal.symbol} → ${targetStrategy}`);
+
+      const { getRecommendation } = await import('../options/OptionsAnalyzer');
+      const fullThesis = {
+        ticker: signal.symbol,
+        marketStructure: { currentPrice: entryPrice },
+        thesis: {
+          bias:                signal.bias,
+          convictionScore:     signal.convictionScore,
+          suggestedHoldWindow: '2-4 WEEKS',
+          invalidationZone:    { level: signal.stopLoss ?? 0, description: '' },
+        },
+      } as any;
+
+      const optionsRec = await getRecommendation(
+        fullThesis,
+        portfolioState.totalEquity,
+        portfolioState.totalEquity * (config.maxPositionPct / 100),
+        true,
+      ).catch(() => null);
+
+      if (optionsRec && optionsRec.strategy !== 'NONE') {
+        console.info(`[Executor] Options rec: ${optionsRec.strategy} on ${signal.symbol} | Premium: $${optionsRec.netCredit?.toFixed(2) ?? '?'}`);
+        await prisma.autoTradeLog.update({
+          where: { id: log.id },
+          data: {
+            status:   'DRY_RUN',
+            reason:   `PREMIUM SELL (${optionsRec.strategy}): ${optionsRec.reasoning?.[0] ?? targetStrategy}`,
+            metadata: JSON.parse(JSON.stringify({ signal, sized, optionsRecommendation: optionsRec, premiumSelling: true })),
+          },
+        });
+        return {
+          success:     true,
+          status:      'DRY_RUN',
+          symbol:      signal.symbol,
+          exchange,
+          logId:       log.id,
+          quantity:    optionsRec.legs?.[0]?.contracts ?? 1,
+          entryPrice,
+          dollarAmount: optionsRec.maxRisk,
+        };
+      }
+      // If no options rec available, fall through to standard stock execution
+    } catch (premiumErr: any) {
+      console.warn('[Phase9b] Premium-selling options error:', premiumErr?.message);
+    }
+  }
+
   // ─── Phase 9: Options execution path (TOS only) ─────────────────────────
   if (exchange === 'TOS' && exchangeKey) {
     try {

@@ -32,36 +32,61 @@ async function selectStrategy(
 
   try {
     const regime = await detectRegime();
-    if (regime.regime === 'BEAR_CRISIS') return 'NONE';
+
+    // BEAR_CRISIS: VIX 30+ = maximum premium. Sell Iron Condors aggressively.
+    // This is the BEST time to sell options, not a time to avoid.
+    if (regime.regime === 'BEAR_CRISIS') {
+      if (ivRank > 40) return 'IRON_CONDOR';
+      if (ivRank > 20) return 'CASH_SECURED_PUT';
+      return 'IRON_CONDOR'; // still better than not trading
+    }
 
     if (regime.regime === 'ELEVATED_VOLATILITY') {
+      // High IV = sell premium. Always find something to sell.
+      if (bias === 'NEUTRAL' || forPremiumSelling) return 'IRON_CONDOR';
+      if (bias === 'BULLISH') return ivRank > 65 ? 'COVERED_CALL' : 'CASH_SECURED_PUT';
+      if (bias === 'BEARISH') return ivRank > 65 ? 'IRON_CONDOR' : 'BEAR_PUT_SPREAD';
+      return 'IRON_CONDOR'; // fallback — always sell premium in elevated vol
+    }
+
+    if (regime.regime === 'CHOPPY') {
       if (ivRank > 50) {
         if (bias === 'NEUTRAL' || forPremiumSelling) return 'IRON_CONDOR';
-        if (bias === 'BULLISH') return ivRank > 65 ? 'COVERED_CALL' : 'CASH_SECURED_PUT';
-        if (bias === 'BEARISH') return ivRank > 65 ? 'IRON_CONDOR' : 'BEAR_PUT_SPREAD';
+        if (bias === 'BULLISH') return 'CASH_SECURED_PUT';
+      }
+      if (conviction < 72 && !forPremiumSelling) {
+        return ivRank > 45 ? 'IRON_CONDOR' : 'NONE';
       }
     }
   } catch {
-    // non-fatal regime check
+    // non-fatal — fall through to default logic
   }
 
+  // BULL_TREND or unknown regime
   if (bias === 'NEUTRAL' || forPremiumSelling) {
     if (ivRank > 50) return 'IRON_CONDOR';
+    if (ivRank > 35) return 'CASH_SECURED_PUT';
     return 'NONE';
   }
 
-  if (conviction < 70 && !forPremiumSelling) return 'NONE';
+  if (conviction < 68 && !forPremiumSelling) {
+    if (ivRank > 55) return 'IRON_CONDOR';
+    return 'NONE';
+  }
 
   if (bias === 'BULLISH') {
+    if (holdDays <= 3) return 'LONG_CALL';
     if (ivRank > 65 && conviction >= 72) return 'COVERED_CALL';
     if (ivRank > 50 && conviction >= 72) return 'CASH_SECURED_PUT';
-    if (conviction >= 82 && holdDays <= 30) return 'LONG_CALL';
-    if (conviction >= 70) return 'BULL_CALL_SPREAD';
+    if (conviction >= 75) return 'BULL_CALL_SPREAD';
+    return 'LONG_CALL';
   }
+
   if (bias === 'BEARISH') {
     if (ivRank > 55 && conviction >= 70) return 'IRON_CONDOR';
-    if (conviction >= 82 && holdDays <= 30) return 'LONG_PUT';
-    if (conviction >= 70) return 'BEAR_PUT_SPREAD';
+    if (conviction >= 72) return 'BEAR_PUT_SPREAD';
+    if (ivRank > 45) return 'IRON_CONDOR';
+    return 'BEAR_PUT_SPREAD';
   }
 
   return 'NONE';

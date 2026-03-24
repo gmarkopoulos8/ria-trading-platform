@@ -33,6 +33,20 @@ export async function runAutonomousCycle(
     return results;
   }
 
+  // Detect regime once for all users
+  let regime: Awaited<ReturnType<typeof import('../market/RegimeDetector').detectRegime>> | null = null;
+  try {
+    const { detectRegime } = await import('../market/RegimeDetector');
+    regime = await detectRegime();
+  } catch { /* non-fatal */ }
+
+  const regimeName = regime?.regime ?? 'UNKNOWN';
+  const isBearish  = regimeName === 'BEAR_CRISIS';
+  const isVolatile = regimeName === 'ELEVATED_VOLATILITY';
+  const isPremiumSellingRegime = isBearish || isVolatile;
+
+  console.info(`[Autonomous] Regime: ${regimeName} | Premium-selling mode: ${isPremiumSellingRegime}`);
+
   for (const settings of users) {
     const result: AutonomousRunResult = {
       userId:              settings.userId,
@@ -41,7 +55,7 @@ export async function runAutonomousCycle(
       tradesPlaced:        0,
       tradesRejected:      0,
       dryRun:              true,
-      adaptiveRegime:      'UNKNOWN',
+      adaptiveRegime:      regimeName,
       effectiveConviction: (settings as any).autonomousMinConviction ?? 75,
       errors:              [],
       ranAt:               new Date(),
@@ -49,9 +63,20 @@ export async function runAutonomousCycle(
 
     try {
       if (!hasAlpacaCredentials()) {
-        result.errors.push('Alpaca not connected — skipping autonomous cycle');
-        results.push(result);
-        continue;
+        try {
+          const { credentialService } = await import('../credentials/CredentialService');
+          const creds = await credentialService.getAlpacaCredentials(settings.userId);
+          if (creds) {
+            const { setAlpacaRuntimeCredentials } = await import('../alpaca/alpacaConfig');
+            setAlpacaRuntimeCredentials(creds);
+          }
+        } catch { /* non-fatal */ }
+
+        if (!hasAlpacaCredentials()) {
+          result.errors.push('Alpaca not connected');
+          results.push(result);
+          continue;
+        }
       }
 
       const creds = getAlpacaCredentials();
@@ -94,7 +119,7 @@ export async function runAutonomousCycle(
         }
       }
 
-      result.adaptiveRegime = adaptiveParams?.regime ?? 'UNKNOWN';
+      result.adaptiveRegime = adaptiveParams?.regime ?? regimeName;
 
       const effectiveConviction = adaptiveParams
         ? Math.max(baseConfig.minConvictionScore, adaptiveParams.minConvictionScore)
@@ -103,36 +128,89 @@ export async function runAutonomousCycle(
       result.effectiveConviction = effectiveConviction;
 
       if (adaptiveParams) {
-        if (adaptiveParams.stopLossPct < baseConfig.stopLossPct) {
-          baseConfig.stopLossPct = adaptiveParams.stopLossPct;
-        }
-        if (adaptiveParams.takeProfitPct > baseConfig.takeProfitPct) {
-          baseConfig.takeProfitPct = adaptiveParams.takeProfitPct;
-        }
+        if (adaptiveParams.stopLossPct < baseConfig.stopLossPct) baseConfig.stopLossPct = adaptiveParams.stopLossPct;
+        if (adaptiveParams.takeProfitPct > baseConfig.takeProfitPct) baseConfig.takeProfitPct = adaptiveParams.takeProfitPct;
       }
 
-      const rawSignals = await buildSignalsFromLatestScan({
-        minConvictionScore: effectiveConviction,
-        minConfidenceScore: 60,
-        allowedBiases:      ['BULLISH'],
-        maxSymbols:         ((settings as any).autonomousMaxPositions ?? 3) * 5,
-      });
+      // ── Strategy selection based on regime ──────────────────────────────
+      let signals: Awaited<ReturnType<typeof buildSignalsFromLatestScan>> = [];
 
-      const signals = [...rawSignals]
-        .sort((a: any, b: any) => {
-          const aScore = (a.thesisHealthScore ?? 0) * 0.4 + (a.convictionScore ?? 0) * 0.4 + (a.confidenceScore ?? 0) * 0.2;
-          const bScore = (b.thesisHealthScore ?? 0) * 0.4 + (b.convictionScore ?? 0) * 0.4 + (b.confidenceScore ?? 0) * 0.2;
-          return bScore - aScore;
-        })
-        .slice(0, (settings as any).autonomousMaxPositions ?? 3)
-        .map((s: any) => ({ ...s, exchange: 'PAPER' as const }));
+      if (isPremiumSellingRegime) {
+        // ELEVATED_VOLATILITY or BEAR_CRISIS: switch to premium-selling
+        // High VIX = fat premiums. NEUTRAL/BEARISH signals are best for Iron Condors.
+        console.info(`[Autonomous] ${regimeName} — switching to premium-selling strategy`);
+
+        const premiumCandidates = await buildSignalsFromLatestScan({
+          minConvictionScore: Math.max(55, effectiveConviction - 20),
+          minConfidenceScore: 50,
+          allowedBiases:      ['NEUTRAL', 'BEARISH', 'BULLISH'],
+          maxSymbols:         ((settings as any).autonomousMaxPositions ?? 3) * 8,
+        });
+
+        signals = premiumCandidates
+          .sort((a: any, b: any) => {
+            const aBias = a.bias === 'NEUTRAL' ? 3 : a.bias === 'BEARISH' ? 2 : 1;
+            const bBias = b.bias === 'NEUTRAL' ? 3 : b.bias === 'BEARISH' ? 2 : 1;
+            const aScore = aBias * 10 + (a.convictionScore ?? 0) * 0.5 + (a.riskScore ?? 50) * 0.3;
+            const bScore = bBias * 10 + (b.convictionScore ?? 0) * 0.5 + (b.riskScore ?? 50) * 0.3;
+            return bScore - aScore;
+          })
+          .slice(0, (settings as any).autonomousMaxPositions ?? 3)
+          .map((s: any) => ({
+            ...s,
+            exchange:        'PAPER' as const,
+            _premiumSelling: true,
+            _targetStrategy: isBearish ? 'IRON_CONDOR' : 'CASH_SECURED_PUT',
+          }));
+
+      } else {
+        // BULL_TREND or CHOPPY: normal directional trading
+        const allowedBiases = regimeName === 'CHOPPY' ? ['BULLISH', 'NEUTRAL'] : ['BULLISH'];
+
+        const rawSignals = await buildSignalsFromLatestScan({
+          minConvictionScore: effectiveConviction,
+          minConfidenceScore: 60,
+          allowedBiases,
+          maxSymbols:         ((settings as any).autonomousMaxPositions ?? 3) * 5,
+        });
+
+        signals = [...rawSignals]
+          .sort((a: any, b: any) => {
+            const aScore = (a.thesisHealthScore ?? 0) * 0.4 + (a.convictionScore ?? 0) * 0.4 + (a.confidenceScore ?? 0) * 0.2;
+            const bScore = (b.thesisHealthScore ?? 0) * 0.4 + (b.convictionScore ?? 0) * 0.4 + (b.confidenceScore ?? 0) * 0.2;
+            return bScore - aScore;
+          })
+          .slice(0, (settings as any).autonomousMaxPositions ?? 3)
+          .map((s: any) => ({ ...s, exchange: 'PAPER' as const }));
+      }
 
       result.signalsFound = signals.length;
 
       if (signals.length === 0) {
-        console.info(`[Autonomous] No qualifying signals for ${settings.userId} (conviction >= ${effectiveConviction}, regime: ${result.adaptiveRegime})`);
-        results.push(result);
-        continue;
+        console.info(`[Autonomous] No qualifying signals for ${settings.userId} (regime: ${regimeName}, conviction >= ${effectiveConviction})`);
+
+        // Last resort: widen thresholds to any bias
+        const lastResort = await buildSignalsFromLatestScan({
+          minConvictionScore: 55,
+          minConfidenceScore: 45,
+          allowedBiases:      ['BULLISH', 'NEUTRAL', 'BEARISH'],
+          maxSymbols:         5,
+        });
+
+        if (lastResort.length > 0) {
+          console.info(`[Autonomous] Last-resort: ${lastResort.length} signals found with relaxed thresholds`);
+          signals = lastResort.map((s: any) => ({
+            ...s,
+            exchange:        'PAPER' as const,
+            _lastResort:     true,
+            _premiumSelling: isPremiumSellingRegime,
+          }));
+          result.signalsFound = signals.length;
+        } else {
+          console.info('[Autonomous] No signals even at minimum thresholds — scan may be stale, skipping');
+          results.push(result);
+          continue;
+        }
       }
 
       const cycleResults = await runTradingCycle(settings.id, baseConfig, signals);
@@ -146,29 +224,28 @@ export async function runAutonomousCycle(
       });
 
       if (result.tradesPlaced > 0) {
-        const placed   = cycleResults.filter(r => ['FILLED', 'DRY_RUN'].includes(r.status));
-        const topTrade = placed[0];
+        const placed = cycleResults.filter(r => ['FILLED', 'DRY_RUN'].includes(r.status));
         await telegramService.notify({
-          type:     'TRADE_PLACED',
-          exchange: 'hyperliquid',
-          ticker:   topTrade?.symbol,
+          type:   'TRADE_PLACED',
+          ticker: placed[0]?.symbol,
           data: {
             ticker:     placed.map(r => r.symbol).join(', '),
-            side:       'LONG',
+            side:       isPremiumSellingRegime ? 'SELL PREMIUM' : 'LONG',
             quantity:   placed.length,
-            entryPrice: topTrade?.entryPrice?.toFixed(2) ?? '?',
+            entryPrice: placed[0]?.entryPrice?.toFixed(2) ?? '?',
             stop:       'adaptive',
             target:     'adaptive',
             conviction: result.effectiveConviction,
             rr:         (baseConfig.takeProfitPct / baseConfig.stopLossPct).toFixed(1),
             dryRun:     result.dryRun,
-            regime:     result.adaptiveRegime,
+            regime:     regimeName,
+            strategy:   isPremiumSellingRegime ? 'PREMIUM SELLING' : 'DIRECTIONAL',
             trigger,
           },
-        }).catch(() => { /* Telegram non-fatal */ });
+        }).catch(() => {});
       }
 
-      console.info(`[Autonomous] ${trigger} cycle for ${settings.userId}: ${result.tradesPlaced} placed, ${result.tradesRejected} rejected, regime: ${result.adaptiveRegime}`);
+      console.info(`[Autonomous] ${trigger} | ${regimeName} | ${settings.userId}: ${result.tradesPlaced} placed, ${result.tradesRejected} rejected`);
 
     } catch (err: any) {
       result.errors.push(err?.message ?? 'Unknown error');

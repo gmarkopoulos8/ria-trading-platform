@@ -1,0 +1,638 @@
+# Replit Agent Prompt — Always-On Trading: Strategy For Every Market Condition
+
+The platform currently says "no trades to run" in bad markets. This is wrong. Real ROI maximization means having a profitable strategy regardless of market conditions. In a bull market we buy. In a bear market we sell options premium — high VIX means fat premiums. This patch makes the platform always find something to trade.
+
+---
+
+## THE STRATEGY MAP
+
+```
+BULL_TREND         → Buy high-conviction stocks + crypto long positions
+CHOPPY             → Smaller directional trades + Iron Condors on high-IV names
+ELEVATED_VOLATILITY → Stop buying. Sell Iron Condors + Cash-Secured Puts (high premium)
+BEAR_CRISIS        → No longs. Sell Iron Condors aggressively (VIX 30+ = maximum premium)
+```
+
+In ELEVATED_VOLATILITY and BEAR_CRISIS, the BEARISH and NEUTRAL scan results are the best candidates for options premium selling — the market is stressed, IV is elevated, and options sellers get paid the most.
+
+---
+
+## FIX 1 — AutonomousExecutor: Always Find Trades
+
+**File**: `server/src/services/autotrader/AutonomousExecutor.ts`
+
+Replace the entire `runAutonomousCycle` function:
+
+```typescript
+export async function runAutonomousCycle(
+  trigger: 'MARKET_OPEN' | 'SCAN_COMPLETE' | 'REENTRY' | 'MANUAL',
+  scanRunId?: string,
+): Promise<AutonomousRunResult[]> {
+  const results: AutonomousRunResult[] = [];
+
+  const users = await prisma.userSettings.findMany({
+    where: { autonomousMode: true, autoTradeEnabled: true },
+  });
+
+  if (users.length === 0) {
+    console.info('[Autonomous] No users with autonomous mode enabled — skipping');
+    return results;
+  }
+
+  // Detect regime once for all users
+  let regime: Awaited<ReturnType<typeof import('../market/RegimeDetector').detectRegime>> | null = null;
+  try {
+    const { detectRegime } = await import('../market/RegimeDetector');
+    regime = await detectRegime();
+  } catch { /* non-fatal */ }
+
+  const regimeName = regime?.regime ?? 'UNKNOWN';
+  const isBearish  = regimeName === 'BEAR_CRISIS';
+  const isVolatile = regimeName === 'ELEVATED_VOLATILITY';
+  const isPremiumSellingRegime = isBearish || isVolatile;
+
+  console.info(`[Autonomous] Regime: ${regimeName} | Premium-selling mode: ${isPremiumSellingRegime}`);
+
+  for (const settings of users) {
+    const result: AutonomousRunResult = {
+      userId:              settings.userId,
+      scanRunId,
+      signalsFound:        0,
+      tradesPlaced:        0,
+      tradesRejected:      0,
+      dryRun:              true,
+      adaptiveRegime:      regimeName,
+      effectiveConviction: (settings as any).autonomousMinConviction ?? 75,
+      errors:              [],
+      ranAt:               new Date(),
+    };
+
+    try {
+      if (!hasAlpacaCredentials()) {
+        // Try to reload credentials from DB
+        try {
+          const { credentialService } = await import('../credentials/CredentialService');
+          const creds = await credentialService.getAlpacaCredentials(settings.userId);
+          if (creds) {
+            const { setAlpacaRuntimeCredentials } = await import('../alpaca/alpacaConfig');
+            setAlpacaRuntimeCredentials(creds);
+          }
+        } catch { /* non-fatal */ }
+
+        if (!hasAlpacaCredentials()) {
+          result.errors.push('Alpaca not connected');
+          results.push(result);
+          continue;
+        }
+      }
+
+      const creds = getAlpacaCredentials();
+      result.dryRun = creds?.dryRun ?? true;
+
+      const rawConfig = typeof settings.autoTradeConfig === 'object' && settings.autoTradeConfig !== null
+        ? (settings.autoTradeConfig as Partial<AutoTradeConfig>)
+        : {};
+
+      const baseConfig: AutoTradeConfig = {
+        ...DEFAULT_AUTO_TRADE_CONFIG,
+        ...rawConfig,
+        enabled:            true,
+        exchange:           'PAPER',
+        dryRun:             result.dryRun,
+        maxOpenPositions:   (settings as any).autonomousMaxPositions ?? 3,
+        maxPositionPct:     (settings as any).autonomousCapitalPct ?? 5.0,
+        minConvictionScore: (settings as any).autonomousMinConviction ?? 75,
+      };
+
+      // Compute adaptive parameters
+      let adaptiveParams = getCachedAdaptive(settings.userId, 'PAPER');
+      if (!adaptiveParams) {
+        adaptiveParams = await computeAdaptive(
+          settings.userId,
+          'PAPER',
+          {
+            stopLossPct:        baseConfig.stopLossPct,
+            takeProfitPct:      baseConfig.takeProfitPct,
+            minConvictionScore: baseConfig.minConvictionScore,
+          },
+          DEFAULT_BOUNDS['PAPER'],
+        ).catch(() => null);
+
+        if (adaptiveParams) {
+          registerForAdaptation(settings.userId, 'PAPER', {
+            stopLossPct:        baseConfig.stopLossPct,
+            takeProfitPct:      baseConfig.takeProfitPct,
+            minConvictionScore: baseConfig.minConvictionScore,
+          });
+        }
+      }
+
+      result.adaptiveRegime = adaptiveParams?.regime ?? regimeName;
+
+      const effectiveConviction = adaptiveParams
+        ? Math.max(baseConfig.minConvictionScore, adaptiveParams.minConvictionScore)
+        : baseConfig.minConvictionScore;
+
+      result.effectiveConviction = effectiveConviction;
+
+      if (adaptiveParams) {
+        if (adaptiveParams.stopLossPct < baseConfig.stopLossPct) baseConfig.stopLossPct = adaptiveParams.stopLossPct;
+        if (adaptiveParams.takeProfitPct > baseConfig.takeProfitPct) baseConfig.takeProfitPct = adaptiveParams.takeProfitPct;
+      }
+
+      // ── Strategy selection based on regime ────────────────────────────────
+
+      let signals: Awaited<ReturnType<typeof buildSignalsFromLatestScan>> = [];
+
+      if (isPremiumSellingRegime) {
+        // ELEVATED_VOLATILITY or BEAR_CRISIS:
+        // Don't look for directional longs. Look for premium-selling candidates.
+        // NEUTRAL and BEARISH signals from the scan are best for Iron Condors.
+        // Lower conviction threshold because we're selling premium, not buying direction.
+        console.info(`[Autonomous] ${regimeName} — switching to premium-selling strategy`);
+
+        const premiumCandidates = await buildSignalsFromLatestScan({
+          minConvictionScore: Math.max(55, effectiveConviction - 20), // wider net for premium selling
+          minConfidenceScore: 50,
+          allowedBiases:      ['NEUTRAL', 'BEARISH', 'BULLISH'], // include all — we're selling premium, not direction
+          maxSymbols:         ((settings as any).autonomousMaxPositions ?? 3) * 8,
+        });
+
+        // Mark signals as premium-selling mode so Claude and the executor know
+        signals = premiumCandidates
+          .sort((a: any, b: any) => {
+            // Prefer NEUTRAL and BEARISH for premium selling — they confirm the options thesis
+            const aBias = a.bias === 'NEUTRAL' ? 3 : a.bias === 'BEARISH' ? 2 : 1;
+            const bBias = b.bias === 'NEUTRAL' ? 3 : b.bias === 'BEARISH' ? 2 : 1;
+            const aScore = aBias * 10 + (a.convictionScore ?? 0) * 0.5 + (a.riskScore ?? 50) * 0.3;
+            const bScore = bBias * 10 + (b.convictionScore ?? 0) * 0.5 + (b.riskScore ?? 50) * 0.3;
+            return bScore - aScore;
+          })
+          .slice(0, (settings as any).autonomousMaxPositions ?? 3)
+          .map((s: any) => ({
+            ...s,
+            exchange:          'PAPER' as const,
+            _premiumSelling:   true,  // flag for Claude and executor
+            _targetStrategy:   isBearish ? 'IRON_CONDOR' : 'CASH_SECURED_PUT',
+          }));
+
+      } else {
+        // BULL_TREND or CHOPPY:
+        // Normal directional trading — look for high-conviction BULLISH signals
+        const allowedBiases = regimeName === 'CHOPPY'
+          ? ['BULLISH', 'NEUTRAL']  // In choppy markets also consider NEUTRAL for covered calls
+          : ['BULLISH'];
+
+        const rawSignals = await buildSignalsFromLatestScan({
+          minConvictionScore: effectiveConviction,
+          minConfidenceScore: 60,
+          allowedBiases,
+          maxSymbols:         ((settings as any).autonomousMaxPositions ?? 3) * 5,
+        });
+
+        signals = [...rawSignals]
+          .sort((a: any, b: any) => {
+            const aScore = (a.thesisHealthScore ?? 0) * 0.4 + (a.convictionScore ?? 0) * 0.4 + (a.confidenceScore ?? 0) * 0.2;
+            const bScore = (b.thesisHealthScore ?? 0) * 0.4 + (b.convictionScore ?? 0) * 0.4 + (b.confidenceScore ?? 0) * 0.2;
+            return bScore - aScore;
+          })
+          .slice(0, (settings as any).autonomousMaxPositions ?? 3)
+          .map((s: any) => ({ ...s, exchange: 'PAPER' as const }));
+      }
+
+      result.signalsFound = signals.length;
+
+      if (signals.length === 0) {
+        console.info(`[Autonomous] No qualifying signals for ${settings.userId} (regime: ${regimeName}, conviction >= ${effectiveConviction})`);
+
+        // Last resort: if STILL no signals, try with very low threshold on any bias
+        const lastResort = await buildSignalsFromLatestScan({
+          minConvictionScore: 55,
+          minConfidenceScore: 45,
+          allowedBiases:      ['BULLISH', 'NEUTRAL', 'BEARISH'],
+          maxSymbols:         5,
+        });
+
+        if (lastResort.length > 0) {
+          console.info(`[Autonomous] Last-resort: ${lastResort.length} signals found with relaxed thresholds`);
+          signals = lastResort.map((s: any) => ({
+            ...s,
+            exchange: 'PAPER' as const,
+            _lastResort: true,
+            _premiumSelling: isPremiumSellingRegime,
+          }));
+          result.signalsFound = signals.length;
+        } else {
+          console.info(`[Autonomous] No signals even at minimum thresholds — scan may be stale, skipping`);
+          results.push(result);
+          continue;
+        }
+      }
+
+      const cycleResults = await runTradingCycle(settings.id, baseConfig, signals);
+
+      result.tradesPlaced   = cycleResults.filter(r => ['FILLED', 'DRY_RUN'].includes(r.status)).length;
+      result.tradesRejected = cycleResults.filter(r => !['FILLED', 'DRY_RUN'].includes(r.status)).length;
+
+      await prisma.userSettings.update({
+        where: { id: settings.id },
+        data:  { lastAutonomousRun: new Date() },
+      });
+
+      if (result.tradesPlaced > 0) {
+        const placed = cycleResults.filter(r => ['FILLED', 'DRY_RUN'].includes(r.status));
+        await telegramService.notify({
+          type:   'TRADE_PLACED',
+          ticker: placed[0]?.symbol,
+          data: {
+            ticker:     placed.map(r => r.symbol).join(', '),
+            side:       isPremiumSellingRegime ? 'SELL PREMIUM' : 'LONG',
+            quantity:   placed.length,
+            entryPrice: placed[0]?.entryPrice?.toFixed(2) ?? '?',
+            stop:       'adaptive',
+            target:     'adaptive',
+            conviction: result.effectiveConviction,
+            rr:         (baseConfig.takeProfitPct / baseConfig.stopLossPct).toFixed(1),
+            dryRun:     result.dryRun,
+            regime:     regimeName,
+            strategy:   isPremiumSellingRegime ? 'PREMIUM SELLING' : 'DIRECTIONAL',
+            trigger,
+          },
+        }).catch(() => {});
+      }
+
+      console.info(`[Autonomous] ${trigger} | ${regimeName} | ${settings.userId}: ${result.tradesPlaced} placed, ${result.tradesRejected} rejected`);
+
+    } catch (err: any) {
+      result.errors.push(err?.message ?? 'Unknown error');
+      console.error('[Autonomous] Cycle error:', err?.message);
+    }
+
+    results.push(result);
+  }
+
+  return results;
+}
+```
+
+---
+
+## FIX 2 — Options Analyzer: Enable Premium Selling in ALL Bad Regimes
+
+**File**: `server/src/services/options/OptionsAnalyzer.ts`
+
+Find and replace the `selectStrategy` function:
+
+```typescript
+async function selectStrategy(
+  bias: string,
+  conviction: number,
+  ivRank: number,
+  holdWindow: string,
+  forPremiumSelling = false,
+): Promise<OptionsStrategy> {
+  const holdDays = parseHoldWindowDays(holdWindow);
+
+  try {
+    const regime = await detectRegime();
+
+    // BEAR_CRISIS: Maximum VIX = maximum premium. Sell Iron Condors.
+    // This is the most profitable time to sell options — NOT a time to avoid.
+    if (regime.regime === 'BEAR_CRISIS') {
+      if (ivRank > 40) return 'IRON_CONDOR'; // VIX 30+ always gives good premium
+      if (ivRank > 20) return 'CASH_SECURED_PUT'; // at minimum sell puts
+      return 'IRON_CONDOR'; // still better than nothing
+    }
+
+    if (regime.regime === 'ELEVATED_VOLATILITY') {
+      // High IV = sell premium. Never return NONE in elevated volatility.
+      if (bias === 'NEUTRAL' || forPremiumSelling) return 'IRON_CONDOR';
+      if (bias === 'BULLISH') return ivRank > 65 ? 'COVERED_CALL' : 'CASH_SECURED_PUT';
+      if (bias === 'BEARISH') return ivRank > 65 ? 'IRON_CONDOR' : 'BEAR_PUT_SPREAD';
+      return 'IRON_CONDOR'; // fallback — always sell premium in elevated vol
+    }
+
+    if (regime.regime === 'CHOPPY') {
+      if (ivRank > 50) {
+        if (bias === 'NEUTRAL' || forPremiumSelling) return 'IRON_CONDOR';
+        if (bias === 'BULLISH') return 'CASH_SECURED_PUT';
+      }
+      // In choppy markets, directional options need higher conviction
+      if (conviction < 72 && !forPremiumSelling) {
+        return ivRank > 45 ? 'IRON_CONDOR' : 'NONE';
+      }
+    }
+  } catch {
+    // non-fatal — fall through to default logic
+  }
+
+  // BULL_TREND or unknown regime
+  if (bias === 'NEUTRAL' || forPremiumSelling) {
+    if (ivRank > 50) return 'IRON_CONDOR';
+    if (ivRank > 35) return 'CASH_SECURED_PUT';
+    return 'NONE';
+  }
+
+  if (conviction < 68 && !forPremiumSelling) {
+    // Low conviction but high IV? Sell premium instead of taking directional risk
+    if (ivRank > 55) return 'IRON_CONDOR';
+    return 'NONE';
+  }
+
+  if (bias === 'BULLISH') {
+    if (holdDays <= 3) return 'LONG_CALL';
+    if (ivRank > 65 && conviction >= 72) return 'COVERED_CALL';
+    if (ivRank > 50 && conviction >= 72) return 'CASH_SECURED_PUT';
+    if (conviction >= 75) return 'BULL_CALL_SPREAD';
+    return 'LONG_CALL';
+  }
+
+  if (bias === 'BEARISH') {
+    if (ivRank > 55 && conviction >= 70) return 'IRON_CONDOR';
+    if (conviction >= 72) return 'BEAR_PUT_SPREAD';
+    if (ivRank > 45) return 'IRON_CONDOR'; // sell premium rather than buy direction
+    return 'BEAR_PUT_SPREAD';
+  }
+
+  return 'NONE';
+}
+```
+
+---
+
+## FIX 3 — AutoTradeExecutor: Route Premium-Selling Signals to Options
+
+When `_premiumSelling` flag is on the signal, route it to options immediately rather than a stock buy.
+
+**File**: `server/src/services/autotrader/AutoTradeExecutor.ts`
+
+Find Phase 9 (the TOS options check section). It currently only runs for TOS and only when `exCfg.optionsEnabled`. Add a new phase before the dry-run check that handles premium-selling signals on PAPER exchange:
+
+Find:
+```typescript
+  try {
+    // Dry run — simulate only, no exchange calls
+    if (config.dryRun) {
+```
+
+Add BEFORE that block:
+
+```typescript
+  // ── Phase 9b: Premium-selling mode for PAPER (Alpaca) ───────────────────
+  // When regime is BEAR_CRISIS or ELEVATED_VOLATILITY, execute options
+  // strategies on Alpaca instead of directional stock trades.
+  if ((signal as any)._premiumSelling && exchange === 'PAPER') {
+    try {
+      const targetStrategy: string = (signal as any)._targetStrategy ?? 'IRON_CONDOR';
+      console.info(`[Executor] Premium-selling signal: ${signal.symbol} → ${targetStrategy}`);
+
+      // Try to get an options recommendation
+      const { getRecommendation } = await import('../options/OptionsAnalyzer');
+      const fullThesis = {
+        ticker: signal.symbol,
+        marketStructure: { currentPrice: entryPrice },
+        thesis: {
+          bias:                signal.bias,
+          convictionScore:     signal.convictionScore,
+          suggestedHoldWindow: '2-4 WEEKS',
+          invalidationZone:    { level: signal.stopLoss ?? 0, description: '' },
+        },
+      } as any;
+
+      const optionsRec = await getRecommendation(
+        fullThesis,
+        portfolioState.totalEquity,
+        portfolioState.totalEquity * (config.maxPositionPct / 100),
+        true, // forPremiumSelling = true
+      ).catch(() => null);
+
+      if (optionsRec && optionsRec.strategy !== 'NONE') {
+        console.info(`[Executor] Options recommendation: ${optionsRec.strategy} on ${signal.symbol} | Premium: $${optionsRec.netCredit?.toFixed(2) ?? '?'}`);
+
+        if (config.dryRun) {
+          await prisma.autoTradeLog.update({
+            where: { id: log.id },
+            data: {
+              status: 'DRY_RUN',
+              reason: `[DRY RUN] ${optionsRec.strategy} on ${signal.symbol} — ${optionsRec.reasoning?.[0] ?? 'premium selling'} | Max profit: $${optionsRec.netCredit?.toFixed(2) ?? '?'} | Max risk: $${optionsRec.maxRisk?.toFixed(2) ?? '?'}`,
+            },
+          });
+          return {
+            success: true, status: 'DRY_RUN', symbol: signal.symbol, exchange,
+            logId: log.id, quantity: 1, entryPrice,
+            dollarAmount: optionsRec.maxRisk ?? sized.dollarAmount,
+          };
+        }
+
+        // Live: place on Alpaca options
+        const { placeOptionsOrder } = await import('../alpaca/alpacaExchangeService');
+        const alpacaOptResult = await placeOptionsOrder(
+          signal.symbol,
+          optionsRec.strategy,
+          optionsRec.legs.map(leg => ({
+            action:         leg.action,
+            contractSymbol: leg.contract.contractSymbol,
+            contracts:      leg.contracts,
+            limitPrice:     Math.abs(leg.contract.mid ?? leg.contract.bid ?? 0),
+          })),
+          userSettingsId,
+          optionsRec.maxRisk ?? 0,
+        );
+
+        if (alpacaOptResult.success) {
+          await prisma.autoTradeLog.update({
+            where: { id: log.id },
+            data: {
+              status:      'FILLED',
+              entryPrice,
+              dollarAmount: optionsRec.maxRisk,
+              reason:      `${optionsRec.strategy}: ${optionsRec.reasoning?.[0] ?? 'premium selling'}`,
+            },
+          });
+          return {
+            success: true, status: 'FILLED', symbol: signal.symbol, exchange,
+            logId: log.id, quantity: 1, entryPrice,
+            dollarAmount: optionsRec.maxRisk,
+          };
+        }
+      } else {
+        // Options data unavailable or no good setup — fall through to stock buy
+        // (In dry run this is fine; in live, log and skip)
+        console.info(`[Executor] No options recommendation for ${signal.symbol} — falling back to stock`);
+        await prisma.autoTradeLog.update({
+          where: { id: log.id },
+          data: { reason: `Premium-selling fallback: no options setup found for ${signal.symbol}, executing as stock` },
+        });
+      }
+    } catch (optErr: any) {
+      console.warn('[Executor] Premium-selling options path failed:', optErr?.message, '— falling back to stock');
+    }
+  }
+```
+
+---
+
+## FIX 4 — Claude Trading Brain: Know About Every Strategy
+
+**File**: `server/src/services/autotrader/ClaudeTradingBrain.ts`
+
+In the `buildContext` function, update the prompt to include premium-selling context. Find the section:
+
+```typescript
+  return `You are the autonomous trading brain for RIA BOT, an AI trading platform. You make final trade decisions with full accountability.
+```
+
+Replace the entire system instruction paragraph:
+
+```typescript
+  const isPremiumSelling = signals.some(s => (s as any)._premiumSelling);
+
+  return `You are the autonomous trading brain for RIA BOT. You maximize ROI in ALL market conditions.
+
+## YOUR STRATEGY BY REGIME
+- BULL_TREND: Buy high-conviction longs. Maximize position size on best setups.
+- CHOPPY: Smaller directional trades. Prefer covered calls and cash-secured puts over naked longs.  
+- ELEVATED_VOLATILITY: STOP buying directional. Sell options premium — Iron Condors, Cash-Secured Puts. High VIX = high premium = edge is with the SELLER.
+- BEAR_CRISIS: Aggressive premium selling only. VIX 30+ means options are extremely expensive. Sell Iron Condors on high-liquidity names. This is the BEST time to collect premium.
+
+## CURRENT MODE: ${isPremiumSelling ? '🔴 PREMIUM SELLING (bad market — sell options, collect premium)' : '🟢 DIRECTIONAL (good market — buy longs)'}
+```
+
+Also update the per-signal task description to include options instructions. Find:
+
+```typescript
+**Rules:**
+- Approve at most ${Math.min(signals.length, config.maxOpenPositions ?? 3)} signals
+- Reject if: conviction < 68, regime is BEAR_CRISIS and bias is BULLISH
+```
+
+Replace with:
+
+```typescript
+**Rules:**
+- Approve at most ${Math.min(signals.length, config.maxOpenPositions ?? 3)} signals
+- In BEAR_CRISIS or ELEVATED_VOLATILITY: APPROVE premium-selling setups even at conviction 55+. We are SELLING options, not buying direction. Lower conviction is fine because we profit from TIME DECAY not price movement.
+- In BULL_TREND: reject conviction < 68. Be selective.
+- In CHOPPY: approve NEUTRAL bias signals for iron condors. Reduce directional size 25%.
+- NEVER return an empty approved list if there are signals — find the best available opportunity in any regime
+- If all signals are weak, approve the 1-2 best ones at reduced size. Doing nothing = 0% ROI.
+```
+
+---
+
+## FIX 5 — Mission Control: Show Current Strategy Mode
+
+**File**: `client/src/pages/MissionControl.tsx`
+
+Add a strategy mode banner below the GO button. Find:
+
+```tsx
+{/* Advanced settings */}
+<button
+  onClick={() => setShowAdvanced(!showAdvanced)}
+```
+
+Add immediately BEFORE that:
+
+```tsx
+{/* Strategy mode indicator */}
+{d?.regime && (
+  <div className={cn(
+    'flex items-center gap-2 px-4 py-2 rounded-xl text-xs font-semibold border',
+    ['BEAR_CRISIS', 'ELEVATED_VOLATILITY'].includes(d.regime.regime)
+      ? 'bg-orange-500/10 border-orange-500/30 text-orange-300'
+      : d.regime.regime === 'CHOPPY'
+      ? 'bg-amber-500/10 border-amber-500/30 text-amber-300'
+      : 'bg-emerald-500/10 border-emerald-500/30 text-emerald-300',
+  )}>
+    <span className="text-base">
+      {['BEAR_CRISIS', 'ELEVATED_VOLATILITY'].includes(d.regime.regime) ? '💰' :
+       d.regime.regime === 'CHOPPY' ? '⚖️' : '📈'}
+    </span>
+    <span>
+      {d.regime.regime === 'BEAR_CRISIS'
+        ? 'Bear market — selling options premium (Iron Condors)'
+        : d.regime.regime === 'ELEVATED_VOLATILITY'
+        ? 'Volatile market — premium selling mode (high VIX = high premiums)'
+        : d.regime.regime === 'CHOPPY'
+        ? 'Choppy market — mixed: small longs + covered calls'
+        : 'Bull market — buying high-conviction longs'}
+    </span>
+    {d.regime.vix && (
+      <span className="ml-auto text-slate-500 font-normal">VIX {d.regime.vix.toFixed(1)}</span>
+    )}
+  </div>
+)}
+```
+
+---
+
+## FIX 6 — Remove the "No signals" Dead End
+
+**File**: `server/src/routes/autotrader.ts`
+
+In the `/autonomous/run` route, update to also trigger a scan if no scan results exist:
+
+Find in `/autonomous/run`:
+```typescript
+const rawSignals = await buildSignalsFromLatestScan({
+  minConvictionScore: minConviction,
+  minConfidenceScore: 60,
+  allowedBiases:      ['BULLISH', 'NEUTRAL'],
+  maxSymbols:         maxPositions * 5,
+});
+
+if (rawSignals.length === 0) {
+  return res.json({ success: true, data: { message: 'No qualifying signals', tradesPlaced: 0 } });
+}
+```
+
+Replace with:
+
+```typescript
+let rawSignals = await buildSignalsFromLatestScan({
+  minConvictionScore: 55,               // low floor — Claude will filter
+  minConfidenceScore: 45,
+  allowedBiases:      ['BULLISH', 'BEARISH', 'NEUTRAL'],  // all biases
+  maxSymbols:         maxPositions * 8,
+});
+
+if (rawSignals.length === 0) {
+  // No scan results — trigger a fresh scan and wait for it
+  console.info('[AutoTrader/run] No signals — triggering fresh scan');
+  try {
+    const { runDailyScan } = await import('../services/scans/dailyScanOrchestrator');
+    const scanId = await runDailyScan({ runType: 'MANUAL', marketSession: 'MARKET_OPEN', skipDuplicateCheck: true });
+    // Re-fetch signals after scan
+    rawSignals = await buildSignalsFromLatestScan({
+      minConvictionScore: 55,
+      minConfidenceScore: 45,
+      allowedBiases:      ['BULLISH', 'BEARISH', 'NEUTRAL'],
+      maxSymbols:         maxPositions * 8,
+    });
+    if (rawSignals.length === 0) {
+      return res.json({ success: true, data: { message: 'Scan complete — no qualifying signals found', tradesPlaced: 0, scanId } });
+    }
+  } catch (scanErr: any) {
+    return res.json({ success: true, data: { message: `No signals available. Trigger a scan first.`, tradesPlaced: 0 } });
+  }
+}
+```
+
+---
+
+## SUMMARY
+
+### What changes
+
+| Condition | Before | After |
+|-----------|--------|-------|
+| BULL_TREND | Buy longs ✅ | Buy longs ✅ |
+| CHOPPY | Small longs only | Small longs + Iron Condors on high-IV names |
+| ELEVATED_VOLATILITY | Blocked — no trades | **Sell Iron Condors + Cash-Secured Puts** |
+| BEAR_CRISIS | Completely blocked — "no trades" | **Aggressive premium selling — VIX 30+ = maximum premium** |
+| No scan results | "No qualifying signals" | Triggers fresh scan automatically, then executes |
+| Conviction too low | Rejected | Routes to premium-selling instead (conviction doesn't matter for time decay) |
+
+### Why this works
+When VIX is high (ELEVATED_VOLATILITY = VIX 22–30, BEAR_CRISIS = VIX 30+), options are **expensive to buy but extremely profitable to sell**. An iron condor on SPY with VIX at 35 might collect $4–6 in premium on a 10-point wide spread — that's 40–60% max return if the stock stays in range. The sellers make money every day through theta (time decay), regardless of small price moves. The platform was avoiding the best premium-selling environment by treating high VIX as a "stop trading" signal instead of a "sell premium aggressively" signal.
