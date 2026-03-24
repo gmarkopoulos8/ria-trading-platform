@@ -1,42 +1,31 @@
+import { useState } from 'react';
 import { NavLink, useLocation } from 'react-router-dom';
-import { useQuery } from '@tanstack/react-query';
 import {
-  LayoutDashboard,
-  ScanSearch,
-  LineChart,
-  Briefcase,
-  Zap,
-  ShieldAlert,
+  Bot,
+  TrendingUp,
+  Settings2,
   FlaskConical,
-  ChevronRight,
-  Bell,
-  X,
-  Radar,
-  HeartPulse,
   Activity,
   BarChart2,
-  Bot,
+  Radar,
+  ChevronRight,
+  ChevronDown,
+  X,
 } from 'lucide-react';
 import { cn } from '../../lib/utils';
-import { api } from '../../api/client';
 import { useAuth } from '../../contexts/AuthContext';
 
-const navItems = [
-  { path: '/mission-control', label: 'Mission Control', icon: Bot, description: 'One-button autonomous trading' },
-  { path: '/dashboard', label: 'Dashboard', icon: LayoutDashboard, description: 'Market overview' },
-  { path: '/daily-scan', label: 'Daily Scan', icon: Radar, description: 'Ranked universe · top 100' },
-  { path: '/stock-health', label: 'Stock Health', icon: HeartPulse, description: 'NYSE health analyzer' },
-  { path: '/hyperliquid', label: 'Hyperliquid', icon: Activity, description: 'Perpetual DEX · live trading' },
-  { path: '/tos', label: 'Thinkorswim', icon: BarChart2, description: 'Schwab API · equities · options · futures' },
-  { path: '/autotrader', label: 'Auto Trader', icon: Bot, description: 'Autonomous AI order execution' },
-  { path: '/alpaca', label: 'Alpaca Paper', icon: FlaskConical, description: 'Paper trading · test suite · replay' },
-  { path: '/scanner', label: 'Opportunity Scanner', icon: ScanSearch, description: 'AI-scored picks' },
-  { path: '/symbol', label: 'Symbol Intelligence', icon: LineChart, description: 'Deep dive' },
-  { path: '/portfolio', label: 'Paper Portfolio', icon: Briefcase, description: 'Active positions' },
-  { path: '/alerts', label: 'Alert Center', icon: Bell, description: 'Position monitoring', badge: true },
-  { path: '/catalysts', label: 'Catalyst Intelligence', icon: Zap, description: 'News & events' },
-  { path: '/risk', label: 'Risk Console', icon: ShieldAlert, description: 'Exposure & limits' },
-  { path: '/performance', label: 'Performance Lab', icon: FlaskConical, description: 'Analytics & stats' },
+const mainNav = [
+  { path: '/trade',       label: 'Mission Control', icon: Bot,       description: 'Autonomous trading' },
+  { path: '/performance', label: 'Performance',     icon: TrendingUp, description: 'P&L · trade log' },
+  { path: '/settings',   label: 'Settings',         icon: Settings2,  description: 'Connections · risk' },
+];
+
+const advancedNav = [
+  { path: '/hyperliquid', label: 'Hyperliquid', icon: Activity,     description: 'Perp DEX · live crypto' },
+  { path: '/tos',         label: 'Thinkorswim', icon: BarChart2,    description: 'Schwab API · options' },
+  { path: '/alpaca',      label: 'Alpaca',      icon: FlaskConical, description: 'Paper trading dashboard' },
+  { path: '/daily-scan',  label: 'Daily Scan',  icon: Radar,        description: 'Universe scan results' },
 ];
 
 interface SidebarProps {
@@ -47,18 +36,11 @@ interface SidebarProps {
 export default function Sidebar({ collapsed, onClose }: SidebarProps) {
   const location = useLocation();
   const { user } = useAuth();
-
-  const { data: unreadData } = useQuery({
-    queryKey: ['alert-unread-count'],
-    queryFn: () => api.alerts.unreadCount(),
-    refetchInterval: 30_000,
-    staleTime: 15_000,
-  });
-  const unreadCount = (unreadData as any)?.data?.count ?? 0;
+  const [advancedOpen, setAdvancedOpen] = useState(false);
 
   const initials = user?.displayName
     ?.split(' ')
-    .map((w) => w[0])
+    .map((w: string) => w[0])
     .slice(0, 2)
     .join('')
     .toUpperCase() ?? 'U';
@@ -80,7 +62,7 @@ export default function Sidebar({ collapsed, onClose }: SidebarProps) {
         {!collapsed && (
           <div className="flex-1 min-w-0">
             <p className="text-sm font-bold text-white tracking-wide">RIA BOT</p>
-            <p className="text-xs text-slate-500 font-mono">v1.0.0</p>
+            <p className="text-xs text-slate-500 font-mono">v2.0</p>
           </div>
         )}
         {!collapsed && onClose && (
@@ -90,18 +72,10 @@ export default function Sidebar({ collapsed, onClose }: SidebarProps) {
         )}
       </div>
 
-      {!collapsed && (
-        <div className="px-3 py-2">
-          <p className="text-xs text-slate-600 uppercase tracking-widest font-mono px-2 mb-1">Terminal</p>
-        </div>
-      )}
-
-      <nav className="flex-1 overflow-y-auto px-2 py-2 space-y-0.5">
-        {navItems.map((item) => {
-          const Icon = item.icon;
-          const isActive = location.pathname.startsWith(item.path);
-          const showBadge = item.badge && unreadCount > 0;
-
+      <nav className="flex-1 overflow-y-auto px-2 py-3 space-y-0.5">
+        {mainNav.map((item) => {
+          const Icon     = item.icon;
+          const isActive = location.pathname === item.path || location.pathname.startsWith(item.path + '/');
           return (
             <NavLink
               key={item.path}
@@ -109,26 +83,62 @@ export default function Sidebar({ collapsed, onClose }: SidebarProps) {
               onClick={onClose}
               className={cn('nav-item group', isActive ? 'nav-item-active' : 'nav-item-inactive')}
             >
-              <div className="relative flex-shrink-0">
-                <Icon className="h-4 w-4" />
-                {showBadge && collapsed && (
-                  <span className="absolute -top-1 -right-1 w-2 h-2 bg-red-500 rounded-full" />
-                )}
-              </div>
+              <Icon className="h-4 w-4 flex-shrink-0" />
               {!collapsed && (
                 <>
                   <div className="flex-1 min-w-0">
                     <p className="text-xs font-semibold truncate">{item.label}</p>
                     <p className="text-xs text-slate-600 truncate">{item.description}</p>
                   </div>
-                  {showBadge && (
-                    <span className="flex-shrink-0 min-w-[18px] h-[18px] bg-red-500 text-white text-[10px] font-bold rounded-full flex items-center justify-center px-1">
-                      {unreadCount > 99 ? '99+' : unreadCount}
-                    </span>
-                  )}
-                  {!showBadge && isActive && <ChevronRight className="h-3 w-3 opacity-50 flex-shrink-0" />}
+                  {isActive && <ChevronRight className="h-3 w-3 opacity-50 flex-shrink-0" />}
                 </>
               )}
+            </NavLink>
+          );
+        })}
+
+        {!collapsed && (
+          <div className="pt-3">
+            <button
+              onClick={() => setAdvancedOpen(!advancedOpen)}
+              className="w-full flex items-center gap-2 px-2 py-1.5 text-[10px] text-slate-600 hover:text-slate-400 uppercase tracking-widest font-mono transition-colors"
+            >
+              {advancedOpen ? <ChevronDown className="h-3 w-3" /> : <ChevronRight className="h-3 w-3" />}
+              Advanced
+            </button>
+            {advancedOpen && advancedNav.map((item) => {
+              const Icon     = item.icon;
+              const isActive = location.pathname === item.path || location.pathname.startsWith(item.path + '/');
+              return (
+                <NavLink
+                  key={item.path}
+                  to={item.path}
+                  onClick={onClose}
+                  className={cn('nav-item group', isActive ? 'nav-item-active' : 'nav-item-inactive')}
+                >
+                  <Icon className="h-4 w-4 flex-shrink-0" />
+                  <div className="flex-1 min-w-0">
+                    <p className="text-xs font-semibold truncate">{item.label}</p>
+                    <p className="text-xs text-slate-600 truncate">{item.description}</p>
+                  </div>
+                  {isActive && <ChevronRight className="h-3 w-3 opacity-50 flex-shrink-0" />}
+                </NavLink>
+              );
+            })}
+          </div>
+        )}
+
+        {collapsed && advancedNav.map((item) => {
+          const Icon     = item.icon;
+          const isActive = location.pathname === item.path || location.pathname.startsWith(item.path + '/');
+          return (
+            <NavLink
+              key={item.path}
+              to={item.path}
+              onClick={onClose}
+              className={cn('nav-item group', isActive ? 'nav-item-active' : 'nav-item-inactive')}
+            >
+              <Icon className="h-4 w-4 flex-shrink-0" />
             </NavLink>
           );
         })}
@@ -146,7 +156,7 @@ export default function Sidebar({ collapsed, onClose }: SidebarProps) {
             </div>
             <div className="flex-1 min-w-0">
               <p className="text-xs font-medium text-slate-300 truncate">{user?.displayName ?? user?.username ?? 'Trader'}</p>
-              <p className="text-xs text-slate-600 truncate font-mono">paper mode</p>
+              <p className="text-xs text-slate-600 truncate font-mono">autonomous</p>
             </div>
           </div>
         )}

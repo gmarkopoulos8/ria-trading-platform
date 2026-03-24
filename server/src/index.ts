@@ -8,15 +8,10 @@ import helmet from 'helmet';
 import session from 'express-session';
 import connectPgSimple from 'connect-pg-simple';
 import authRouter from './routes/auth';
-import symbolsRouter from './routes/symbols';
 import marketRouter from './routes/market';
-import paperPositionsRouter from './routes/paper-positions';
-import alertsRouter from './routes/alerts';
 import newsRouter from './routes/news';
-import performanceRouter from './routes/performance';
 import settingsRouter from './routes/settings';
 import dailyScansRouter from './routes/daily-scans';
-import stocksRouter from './routes/stocks';
 import hyperliquidRouter from './routes/hyperliquid';
 import tosRouter from './routes/tos';
 import autotraderRouter from './routes/autotrader';
@@ -24,6 +19,7 @@ import credentialRouter from './routes/credentials';
 import alpacaRouter from './routes/alpaca';
 import optionsRouter from './routes/options';
 import telegramRouter from './routes/telegram';
+import tradeRouter from './routes/trades';
 import { errorHandler, notFoundHandler } from './middleware/errorHandler';
 import { monitorAllOpenPositions } from './services/monitoring/PositionMonitor';
 import { startDailyScanScheduler } from './services/scans/dailyScanScheduler';
@@ -120,15 +116,10 @@ app.get('/api/health', (req, res) => {
 });
 
 app.use('/api/auth', authRouter);
-app.use('/api/symbols', symbolsRouter);
 app.use('/api/market', marketRouter);
-app.use('/api/paper-positions', paperPositionsRouter);
-app.use('/api/alerts', alertsRouter);
 app.use('/api/news', newsRouter);
-app.use('/api/performance', performanceRouter);
 app.use('/api/settings', settingsRouter);
 app.use('/api/daily-scans', dailyScansRouter);
-app.use('/api/stocks', stocksRouter);
 app.use('/api/hyperliquid', hyperliquidRouter);
 app.use('/api/tos', tosRouter);
 app.use('/api/autotrader', autotraderRouter);
@@ -136,6 +127,7 @@ app.use('/api/credentials', credentialRouter);
 app.use('/api/alpaca', alpacaRouter);
 app.use('/api/options', optionsRouter);
 app.use('/api/telegram', telegramRouter);
+app.use('/api/trades', tradeRouter);
 
 app.use('/api/*', notFoundHandler);
 

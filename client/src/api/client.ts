@@ -226,7 +226,14 @@ export const api = {
     resume:           ()                         => post('/hyperliquid/controls/resume', {}),
   },
 
+  trades: {
+    list:    (params?: Record<string, unknown>) => get('/trades', params),
+    summary: (days?: number) => get('/trades/summary', days ? { days } : {}),
+  },
   autotrader: {
+    riaStatus: () => get('/autotrader/ria-status'),
+    riaMode:   (body: { mode: string; riskProfile?: string; maxPositionPct?: number; maxDailyDrawdownPct?: number }) =>
+      post('/autotrader/ria-mode', body),
     status: () => get('/autotrader/status'),
     enable: () => post('/autotrader/enable'),
     disable: () => post('/autotrader/disable'),

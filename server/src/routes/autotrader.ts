@@ -790,4 +790,113 @@ router.get('/mission-control', async (req: Request, res: Response) => {
   }
 });
 
+// ── RIA Status (new unified endpoint) ────────────────────────────────────────
+router.get('/ria-status', async (req: Request, res: Response) => {
+  try {
+    const userId   = req.session!.userId as string;
+    const settings = await getUserSettings(userId);
+
+    let alpacaConnected = hasAlpacaCredentials();
+    if (!alpacaConnected) {
+      try {
+        const { credentialService } = await import('../services/credentials/CredentialService');
+        const creds = await credentialService.getAlpacaCredentials(userId);
+        if (creds) { setAlpacaRuntimeCredentials(creds); alpacaConnected = true; }
+      } catch { /* non-fatal */ }
+    }
+
+    const { hasCredentials: hlConnected }  = await import('../services/hyperliquid/hyperliquidConfig');
+    const { hasCredentials: tosConnected } = await import('../services/tos/tosConfig');
+
+    const regime    = await import('../services/market/RegimeDetector').then(m => m.detectRegime()).catch(() => null);
+    const portfolio = await import('../services/portfolio/PortfolioStateService').then(m => m.getPortfolioState()).catch(() => null);
+
+    const todayStart = new Date(); todayStart.setHours(0, 0, 0, 0);
+
+    const [openTrades, recentTrades, todayStats] = await Promise.allSettled([
+      prisma.trade.findMany({ where: { userId, status: 'OPEN' }, orderBy: { entryTime: 'desc' }, take: 20 }).catch(() => []),
+      prisma.trade.findMany({ where: { userId }, orderBy: { entryTime: 'desc' }, take: 8 }).catch(() => []),
+      prisma.trade.aggregate({ where: { userId, entryTime: { gte: todayStart } }, _sum: { realizedPnl: true, unrealizedPnl: true }, _count: { id: true } }).catch(() => ({ _sum: {}, _count: { id: 0 } })),
+    ]);
+
+    const signals = await buildSignalsFromLatestScan({
+      minConvictionScore: 55,
+      minConfidenceScore: 45,
+      allowedBiases:      ['BULLISH', 'BEARISH', 'NEUTRAL'],
+      maxSymbols:         6,
+    }).catch(() => []);
+
+    const latestScan = await prisma.dailyScanRun.findFirst({
+      where:   { status: 'COMPLETED' },
+      orderBy: { completedAt: 'desc' },
+      select:  { id: true, completedAt: true, totalRankedCount: true },
+    }).catch(() => null);
+
+    const openTradesVal  = openTrades.status  === 'fulfilled' ? openTrades.value  : [];
+    const recentVal      = recentTrades.status === 'fulfilled' ? recentTrades.value : [];
+    const todayVal       = todayStats.status  === 'fulfilled' ? todayStats.value  : { _sum: { realizedPnl: 0, unrealizedPnl: 0 }, _count: { id: 0 } };
+
+    res.json({
+      success: true,
+      data: {
+        riaMode:          (settings as any).riaMode        ?? 'OFF',
+        autonomousMode:   (settings as any).autonomousMode ?? false,
+        autoTradeEnabled: settings.autoTradeEnabled,
+        riskProfile:      (settings as any).riskProfile    ?? 'MODERATE',
+        maxPositionPct:   settings.maxPositionPct,
+        maxDailyDrawdownPct: (settings as any).maxDailyDrawdownPct ?? 3.0,
+        lastRun:          (settings as any).lastAutonomousRun ?? null,
+        dryRun:           getAlpacaCredentials()?.dryRun ?? true,
+
+        connections: {
+          alpaca:      alpacaConnected,
+          hyperliquid: hlConnected(),
+          tos:         tosConnected(),
+        },
+
+        regime,
+        portfolio,
+        signals,
+        latestScan,
+
+        today: {
+          pnl:    ((todayVal as any)._sum?.realizedPnl ?? 0) + ((todayVal as any)._sum?.unrealizedPnl ?? 0),
+          trades: (todayVal as any)._count?.id ?? 0,
+        },
+        openTrades:   openTradesVal,
+        recentTrades: recentVal,
+      },
+    });
+  } catch (err: any) {
+    res.status(500).json({ success: false, error: err?.message ?? 'RIA status failed' });
+  }
+});
+
+// POST — start/stop RIA
+router.post('/ria-mode', async (req: Request, res: Response) => {
+  try {
+    const userId = req.session!.userId as string;
+    const { mode, riskProfile, maxPositionPct, maxDailyDrawdownPct } = req.body;
+
+    const settings = await getUserSettings(userId);
+    const isOn = mode !== 'OFF';
+
+    await prisma.userSettings.update({
+      where: { id: settings.id },
+      data: {
+        riaMode:          mode,
+        autoTradeEnabled: isOn,
+        autonomousMode:   isOn,
+        ...(riskProfile         !== undefined && { riskProfile }),
+        ...(maxPositionPct      !== undefined && { maxPositionPct }),
+        ...(maxDailyDrawdownPct !== undefined && { maxDailyDrawdownPct }),
+      } as any,
+    });
+
+    res.json({ success: true, data: { riaMode: mode, active: isOn } });
+  } catch (err: any) {
+    res.status(500).json({ success: false, error: err?.message ?? 'Mode change failed' });
+  }
+});
+
 export default router;

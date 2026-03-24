@@ -62,6 +62,12 @@ model UserSettings {
   autonomousCapitalPct    Float    @default(5.0)
   lastAutonomousRun       DateTime?
 
+  riaMode             String   @default("OFF")
+  riskProfile         String   @default("MODERATE")
+  maxDailyDrawdownPct Float    @default(3.0)
+  maxTotalDrawdownPct Float    @default(8.0)
+  tradingHoursOnly    Boolean  @default(true)
+
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
@@ -69,6 +75,52 @@ model UserSettings {
   autoTradeLogs AutoTradeLog[]
 
   @@map("user_settings")
+}
+
+model Trade {
+  id           String   @id @default(cuid())
+  userId       String
+  exchange     String
+  symbol       String
+  assetClass   String
+  strategy     String
+  side         String
+  status       String
+
+  entryPrice   Float
+  quantity     Float
+  dollarSize   Float
+  entryTime    DateTime @default(now())
+
+  exitPrice    Float?
+  exitTime     DateTime?
+  exitReason   String?
+
+  realizedPnl  Float?
+  unrealizedPnl Float?
+  pnlPct       Float?
+
+  claudeApproved      Boolean @default(false)
+  claudeConviction    Int?
+  claudeReasoning     String?
+  claudeRiskWarning   String?
+  claudeExitCondition String?
+
+  regimeAtEntry String?
+  vixAtEntry    Float?
+
+  optionExpiry  String?
+  optionStrike  Float?
+  optionType    String?
+  maxProfit     Float?
+  maxRisk       Float?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([userId, entryTime])
+  @@index([userId, status])
+  @@map("trades")
 }
 
 // ─── Watchlists ───────────────────────────────────────────────────

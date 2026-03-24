@@ -1,7 +1,31 @@
 # RIA BOT — Project Architecture
 
 ## Overview
-Full-stack AI paper trading research simulator. Premium dark-mode terminal UI for market intelligence, opportunity discovery, paper portfolio management, and exchange credential management.
+Multi-agent AI trading platform with autonomous execution across Thinkorswim, Hyperliquid, and Alpaca (Paper). V2 UI: 3-page simplified layout (MissionControl `/trade`, Performance `/performance`, Settings `/settings`) replacing the previous 13-page design.
+
+## V2 Architecture (Current)
+
+### Pages (client/src/pages/v2/)
+- **MissionControl.tsx** (`/trade`) — One-button START/STOP for full autonomous trading. Shows Go button, regime card, account stats, Claude's signal candidates, recent trades, and daily schedule. Calls `/api/autotrader/ria-status` (12s polling) and `/api/autotrader/ria-mode`.
+- **Performance.tsx** (`/performance`) — P&L summary, win rate, exchange breakdown, trade log table. Calls `/api/trades` and `/api/trades/summary`.
+- **Settings.tsx** (`/settings`) — Alpaca connection form (connect/disconnect/dry-run toggle), Telegram alert linking, account profile. Calls existing credentials and auth endpoints.
+
+### Navigation (Sidebar.tsx)
+- **Main**: Mission Control, Performance, Settings
+- **Advanced** (collapsed by default): Hyperliquid, Thinkorswim, Alpaca, Daily Scan
+
+### New API Routes
+- `GET /api/autotrader/ria-status` — unified status (regime, portfolio, signals, trades, connections, settings)
+- `POST /api/autotrader/ria-mode` — start/stop autonomous mode (updates riaMode, autoTradeEnabled, autonomousMode)
+- `GET /api/trades` — paginated trade log (days, status, exchange, assetClass filters)
+- `GET /api/trades/summary` — aggregate P&L, win rate, by-exchange breakdown
+
+### New Prisma Models
+- **Trade** — stores every RIA trade (exchange, symbol, assetClass, strategy, side, status, entry/exit prices, P&L, Claude fields, regime/VIX at entry, option fields). Table: `trades`.
+- **UserSettings** additions: `riaMode`, `riskProfile`, `maxDailyDrawdownPct`, `maxTotalDrawdownPct`, `tradingHoursOnly`
+
+### Removed Routers (from index.ts)
+`/api/symbols`, `/api/paper-positions`, `/api/alerts`, `/api/performance`, `/api/stocks` — all removed in V2 simplification.
 
 ## Major Features (Recently Added)
 
