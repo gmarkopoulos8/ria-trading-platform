@@ -36,3 +36,9 @@ id = "NUo-Z8F4n0aLNvwmznSc4"
 uri = "file://ria-trading-platform.tar.gz"
 type = "unspecified"
 title = "ria-trading-platform.tar.gz"
+
+[[outputs]]
+id = "cF1SBG0xCsP4BVEB4bVni"
+uri = "file://ria-src.tar.gz"
+type = "unspecified"
+title = "ria-src.tar.gz"
