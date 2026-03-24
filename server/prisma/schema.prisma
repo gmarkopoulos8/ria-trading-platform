@@ -54,6 +54,8 @@ model UserSettings {
   telegramConsentAt     DateTime?
   telegramConnectToken  String?
   telegramConnectExpiry DateTime?
+  telegramBotToken      String?
+  telegramBotUsername   String?
   autoTradeEnabled        Boolean  @default(false)
   autoTradeConfig         Json?
   autonomousMode          Boolean  @default(false)

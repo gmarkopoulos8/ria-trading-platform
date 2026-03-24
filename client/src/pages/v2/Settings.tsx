@@ -27,6 +27,192 @@ function ConnectionCard({ title, icon, connected, children }: {
   );
 }
 
+function TelegramSetupFlow({ notif, onConnect, connectUrl, isPending, onClearUrl }: {
+  notif: any;
+  onConnect: (token: string, username: string) => void;
+  connectUrl: string | null;
+  isPending: boolean;
+  onClearUrl: () => void;
+}) {
+  const [step, setStep]               = useState<'intro' | 'form' | 'link'>('intro');
+  const [botToken, setBotToken]       = useState('');
+  const [botUsername, setBotUsername] = useState('');
+  const [showToken, setShowToken]     = useState(false);
+  const [verifying, setVerifying]     = useState(false);
+  const [verifyError, setVerifyError] = useState<string | null>(null);
+  const [copied, setCopied]           = useState(false);
+
+  if (connectUrl && step !== 'link') setStep('link');
+
+  const handleVerifyAndConnect = async () => {
+    if (!botToken.trim() || !botUsername.trim()) return;
+    setVerifyError(null);
+    setVerifying(true);
+    try {
+      if (!botToken.includes(':')) {
+        setVerifyError('Bot token format looks wrong — it should contain a colon (:)');
+        setVerifying(false);
+        return;
+      }
+      const cleanUsername = botUsername.replace('@', '').trim();
+      onConnect(botToken.trim(), cleanUsername);
+    } catch {
+      setVerifyError('Something went wrong');
+    }
+    setVerifying(false);
+  };
+
+  const copyLink = () => {
+    if (!connectUrl) return;
+    navigator.clipboard.writeText(connectUrl);
+    setCopied(true);
+    setTimeout(() => setCopied(false), 2000);
+  };
+
+  if (step === 'intro') {
+    return (
+      <div className="space-y-4">
+        <div className="space-y-2">
+          {[
+            { n: '1', text: 'Create your personal bot on Telegram (takes 60 seconds)' },
+            { n: '2', text: 'Paste your bot token here' },
+            { n: '3', text: 'Click a link to connect your chat' },
+          ].map(({ n, text }) => (
+            <div key={n} className="flex items-start gap-3 text-xs">
+              <span className="w-5 h-5 rounded-full bg-violet-500/30 text-violet-300 flex items-center justify-center font-bold text-[10px] flex-shrink-0 mt-0.5">{n}</span>
+              <span className="text-slate-400">{text}</span>
+            </div>
+          ))}
+        </div>
+
+        <div className="bg-surface-3 border border-surface-border rounded-xl p-4 space-y-3">
+          <p className="text-xs font-semibold text-white">Step 1 — Create your bot</p>
+          <ol className="space-y-2 text-xs text-slate-400 list-decimal list-inside">
+            <li>Open Telegram and search <span className="text-violet-400 font-semibold">@BotFather</span></li>
+            <li>Send <span className="font-mono bg-black/30 px-1.5 py-0.5 rounded text-violet-300">/newbot</span></li>
+            <li>Choose any name (e.g. <span className="font-mono text-slate-300">My RIA Alerts</span>)</li>
+            <li>Choose a username ending in <span className="font-mono text-slate-300">bot</span></li>
+            <li>BotFather sends you a <span className="text-emerald-400 font-semibold">bot token</span> — copy it</li>
+          </ol>
+          <a
+            href="https://t.me/BotFather"
+            target="_blank"
+            rel="noreferrer"
+            className="flex items-center justify-center gap-2 w-full py-2.5 bg-[#2AABEE] hover:bg-[#229ED9] text-white text-xs font-bold rounded-xl transition-colors"
+          >
+            <svg className="w-4 h-4" viewBox="0 0 24 24" fill="currentColor">
+              <path d="M12 0C5.373 0 0 5.373 0 12s5.373 12 12 12 12-5.373 12-12S18.627 0 12 0zm5.894 8.221l-1.97 9.28c-.145.658-.537.818-1.084.508l-3-2.21-1.447 1.394c-.16.16-.295.295-.605.295l.213-3.053 5.56-5.023c.242-.213-.054-.333-.373-.12l-6.871 4.326-2.962-.924c-.643-.204-.657-.643.136-.953l11.57-4.461c.537-.194 1.006.131.833.94z"/>
+            </svg>
+            Open @BotFather on Telegram
+          </a>
+        </div>
+
+        <button
+          onClick={() => setStep('form')}
+          className="w-full py-2.5 bg-violet-600 hover:bg-violet-700 text-white text-xs font-bold rounded-xl transition-colors"
+        >
+          I have my bot token →
+        </button>
+      </div>
+    );
+  }
+
+  if (step === 'form') {
+    return (
+      <div className="space-y-4">
+        <button onClick={() => setStep('intro')} className="text-xs text-slate-500 hover:text-slate-300">← Back</button>
+
+        <div className="bg-surface-3 border border-surface-border rounded-xl p-4 space-y-3">
+          <p className="text-xs font-semibold text-white">Step 2 — Enter your bot details</p>
+
+          <div>
+            <label className="block text-[10px] text-slate-500 uppercase tracking-wider mb-1.5">Bot Token</label>
+            <div className="relative">
+              <input
+                type={showToken ? 'text' : 'password'}
+                value={botToken}
+                onChange={e => setBotToken(e.target.value)}
+                placeholder="1234567890:ABCdef..."
+                className="input-field w-full text-sm font-mono pr-16"
+              />
+              <button
+                type="button"
+                onClick={() => setShowToken(!showToken)}
+                className="absolute right-3 top-1/2 -translate-y-1/2 text-[10px] text-slate-500 hover:text-white"
+              >
+                {showToken ? 'Hide' : 'Show'}
+              </button>
+            </div>
+            <p className="text-[10px] text-slate-600 mt-1">Looks like: 1234567890:ABCdefGHIjkl...</p>
+          </div>
+
+          <div>
+            <label className="block text-[10px] text-slate-500 uppercase tracking-wider mb-1.5">Bot Username</label>
+            <div className="relative">
+              <span className="absolute left-3 top-1/2 -translate-y-1/2 text-slate-500 text-sm">@</span>
+              <input
+                type="text"
+                value={botUsername}
+                onChange={e => setBotUsername(e.target.value.replace('@', ''))}
+                placeholder="myria_alerts_bot"
+                className="input-field w-full text-sm pl-7"
+              />
+            </div>
+            <p className="text-[10px] text-slate-600 mt-1">The username you chose in BotFather</p>
+          </div>
+
+          {verifyError && (
+            <p className="text-xs text-red-400 bg-red-500/10 border border-red-500/20 rounded-lg px-3 py-2">
+              ❌ {verifyError}
+            </p>
+          )}
+        </div>
+
+        <button
+          onClick={handleVerifyAndConnect}
+          disabled={verifying || isPending || !botToken.trim() || !botUsername.trim()}
+          className="w-full py-2.5 bg-violet-600 hover:bg-violet-700 disabled:opacity-50 text-white text-xs font-bold rounded-xl transition-colors"
+        >
+          {verifying || isPending ? 'Verifying bot token…' : 'Save & continue →'}
+        </button>
+      </div>
+    );
+  }
+
+  if (step === 'link') {
+    return (
+      <div className="space-y-4">
+        <div className="bg-surface-3 border border-surface-border rounded-xl p-4 space-y-3">
+          <p className="text-xs font-semibold text-white">Step 3 — Connect your chat</p>
+          <ol className="space-y-1.5 text-xs text-slate-400 list-decimal list-inside">
+            <li>Click the button below to open your bot in Telegram</li>
+            <li>Press <strong className="text-white">Start</strong></li>
+            <li>Come back — this page updates automatically</li>
+          </ol>
+          <a
+            href={connectUrl!}
+            target="_blank"
+            rel="noreferrer"
+            className="flex items-center justify-center gap-2 w-full py-2.5 bg-[#2AABEE] hover:bg-[#229ED9] text-white text-xs font-bold rounded-xl transition-colors"
+          >
+            <svg className="w-4 h-4" viewBox="0 0 24 24" fill="currentColor">
+              <path d="M12 0C5.373 0 0 5.373 0 12s5.373 12 12 12 12-5.373 12-12S18.627 0 12 0zm5.894 8.221l-1.97 9.28c-.145.658-.537.818-1.084.508l-3-2.21-1.447 1.394c-.16.16-.295.295-.605.295l.213-3.053 5.56-5.023c.242-.213-.054-.333-.373-.12l-6.871 4.326-2.962-.924c-.643-.204-.657-.643.136-.953l11.57-4.461c.537-.194 1.006.131.833.94z"/>
+            </svg>
+            Open your bot in Telegram
+          </a>
+          <button onClick={copyLink} className="w-full py-1.5 text-[10px] text-slate-500 hover:text-slate-300 border border-surface-border rounded-lg transition-colors">
+            {copied ? '✓ Copied!' : "Copy link (if Telegram doesn't open)"}
+          </button>
+          <p className="text-[10px] text-slate-600 text-center">Link expires in 10 minutes</p>
+        </div>
+        <button onClick={onClearUrl} className="w-full text-xs text-slate-600 hover:text-slate-400">← Start over</button>
+      </div>
+    );
+  }
+
+  return null;
+}
+
 export default function Settings() {
   const qc = useQueryClient();
   const { user } = useAuth() as any;
@@ -36,10 +222,11 @@ export default function Settings() {
     queryFn:   () => api.credentials.alpacaStatus().then((r: any) => r.data),
     staleTime: 30_000,
   });
-  const { data: notifRaw } = useQuery({
-    queryKey:  ['notif-settings'],
-    queryFn:   () => (api.auth as any).notificationSettings().then((r: any) => r.data),
-    staleTime: 30_000,
+  const { data: notifRaw, refetch: refetchNotif } = useQuery({
+    queryKey:        ['notif-settings'],
+    queryFn:         () => (api.auth as any).notificationSettings().then((r: any) => r.data),
+    staleTime:       15_000,
+    refetchInterval: 8_000,
   });
 
   const alpaca = alpacaRaw as any;
@@ -67,14 +254,21 @@ export default function Settings() {
   });
 
   const telegramConnect = useMutation({
-    mutationFn: () => (api.auth as any).telegramConnect(),
-    onSuccess: (r: any) => setConnectUrl(r.data?.connectUrl ?? null),
-    onError:   (e: any) => toast.error(e?.response?.data?.error ?? 'Failed'),
+    mutationFn: (params: { botToken: string; botUsername: string }) =>
+      (api.auth as any).telegramConnect(params),
+    onSuccess: (r: any) => {
+      setConnectUrl(r.data?.connectUrl ?? null);
+    },
+    onError: (e: any) => toast.error(e?.response?.data?.error ?? 'Failed'),
   });
 
   const telegramDisconnect = useMutation({
     mutationFn: () => (api.auth as any).telegramDisconnect(),
-    onSuccess: () => { toast.info('Telegram disconnected'); qc.invalidateQueries({ queryKey: ['notif-settings'] }); },
+    onSuccess: () => {
+      toast.info('Telegram disconnected');
+      setConnectUrl(null);
+      qc.invalidateQueries({ queryKey: ['notif-settings'] });
+    },
   });
 
   return (
@@ -162,12 +356,20 @@ export default function Settings() {
       {/* Telegram */}
       <ConnectionCard title="Telegram Alerts" icon="📱" connected={!!(notif?.telegramLinked && notif?.telegramEnabled)}>
         <div className="text-xs text-slate-500 mb-4">
-          Receive trade alerts and daily P&L summary in Telegram. Get notified every time a trade executes and at 4 PM ET with the day's results.
+          Each account has its own private Telegram bot. Your trades and P&L go to your bot only — completely isolated from other users.
         </div>
+
         {notif?.telegramLinked ? (
           <div className="space-y-3">
             <div className="p-3 bg-emerald-500/10 border border-emerald-500/20 rounded-xl text-xs text-emerald-400">
-              Your Telegram is connected. Send /status to your bot anytime.
+              <p className="font-semibold mb-1">✓ Your personal bot is connected</p>
+              {notif.telegramBotUsername && (
+                <p className="text-emerald-400/70">Bot: @{notif.telegramBotUsername}</p>
+              )}
+            </div>
+            <div className="text-[10px] text-slate-500 space-y-1">
+              <p><span className="font-mono text-slate-400">/stop</span> — pause alerts</p>
+              <p><span className="font-mono text-slate-400">/status</span> — check connection</p>
             </div>
             <button
               onClick={() => telegramDisconnect.mutate()}
@@ -176,32 +378,14 @@ export default function Settings() {
               Disconnect Telegram
             </button>
           </div>
-        ) : !notif?.botConfigured ? (
-          <div className="p-3 bg-amber-500/10 border border-amber-500/20 rounded-xl text-xs text-amber-400">
-            <p className="font-semibold mb-1">Bot not configured</p>
-            <p className="text-amber-400/70">Add TELEGRAM_BOT_TOKEN and TELEGRAM_BOT_USERNAME to Replit Secrets</p>
-          </div>
-        ) : connectUrl ? (
-          <div className="space-y-3">
-            <ol className="text-xs text-slate-400 list-decimal list-inside space-y-1">
-              <li>Click the button below to open Telegram</li>
-              <li>Press <strong className="text-white">Start</strong></li>
-              <li>Come back — this page updates automatically</li>
-            </ol>
-            <a href={connectUrl} target="_blank" rel="noreferrer"
-              className="flex items-center justify-center gap-2 w-full py-2.5 bg-[#2AABEE] hover:bg-[#229ED9] text-white text-sm font-bold rounded-xl transition-colors">
-              Open in Telegram
-            </a>
-            <button onClick={() => setConnectUrl(null)} className="w-full text-xs text-slate-600 hover:text-slate-400">Cancel</button>
-          </div>
         ) : (
-          <button
-            onClick={() => telegramConnect.mutate()}
-            disabled={telegramConnect.isPending}
-            className="w-full py-2.5 bg-violet-600 hover:bg-violet-700 disabled:opacity-50 text-white text-sm font-bold rounded-xl transition-colors"
-          >
-            {telegramConnect.isPending ? 'Generating link…' : 'Connect Telegram'}
-          </button>
+          <TelegramSetupFlow
+            notif={notif}
+            onConnect={(token, username) => telegramConnect.mutate({ botToken: token, botUsername: username })}
+            connectUrl={connectUrl}
+            isPending={telegramConnect.isPending}
+            onClearUrl={() => setConnectUrl(null)}
+          />
         )}
       </ConnectionCard>
 

@@ -1,0 +1,591 @@
+# Replit Agent Prompt — Smart Position Management: Hold Multi-Day, Trail Stops, Close Only Intraday
+
+The platform currently closes EVERY position at 3:45 PM regardless of whether it should be held. This destroys value on multi-day setups and makes options premium selling impossible. This patch fixes that.
+
+---
+
+## THE NEW RULES
+
+```
+3:45 PM — only close positions where:
+  - holdWindowDays == 1 (pure intraday)  
+  - assetClass == 'crypto' on Hyperliquid (funding costs)
+  - position is down >50% of max stop distance (thesis broken)
+
+All other positions — trail the stop to lock in gains, hold until:
+  - Claude's holdWindowDays elapsed
+  - Stop hit during market hours
+  - Claude's exitCondition triggered
+  - Manual override
+
+Options (Iron Condor, CSP, Covered Call) — NEVER close EOD.
+Theta decay happens every day. Closing on day 1 captures ~5% of available premium.
+```
+
+---
+
+## PART A — Schema: Add Hold Fields to AutoTradeLog
+
+**File**: `server/prisma/schema.prisma`
+
+In `AutoTradeLog`, add these fields after `convictionScore`:
+
+```prisma
+holdWindowDays     Int?      // Claude's suggested hold in days
+holdUntil          DateTime? // computed: entryTime + holdWindowDays
+exitCondition      String?   // Claude's plain-English exit rule
+isIntraday         Boolean   @default(false) // true = close same day
+trailingStopPct    Float?    // % below high water mark to trail
+highWaterMark      Float?    // highest price seen since entry
+dollarAmount       Float?    // position dollar size
+```
+
+Run migration:
+```
+cd server && npx prisma migrate dev --name smart_position_management
+```
+
+---
+
+## PART B — Store Claude's Hold Data When Creating Trade Logs
+
+**File**: `server/src/services/autotrader/AutoTradeExecutor.ts`
+
+Find the `prisma.autoTradeLog.create` call (the main entry log creation). Add the new fields to the `data` object:
+
+```typescript
+const claudeDecision = (signal as any)._claudeDecision as ClaudeTradeDecision | undefined;
+
+// Determine if this is an intraday trade
+const isIntraday = (
+  claudeDecision?.holdWindowDays === 1 ||
+  (signal as any)._premiumSelling === false &&
+  (signal.setupType?.toLowerCase().includes('momentum') ||
+   signal.setupType?.toLowerCase().includes('intraday') ||
+   (signal.assetClass === 'crypto' && exchange === 'HYPERLIQUID'))
+);
+
+const holdWindowDays = claudeDecision?.holdWindowDays ?? (isIntraday ? 1 : 5);
+const holdUntil = new Date(Date.now() + holdWindowDays * 24 * 60 * 60 * 1000);
+
+// Trailing stop: 40% of initial stop distance, minimum 1.5%
+const stopDist = entryPrice > 0 && stopLoss > 0
+  ? Math.abs((entryPrice - stopLoss) / entryPrice) * 100
+  : config.stopLossPct;
+const trailingStopPct = Math.max(1.5, stopDist * 0.4);
+
+const log = await prisma.autoTradeLog.create({
+  data: {
+    userSettingsId,
+    sessionId,
+    phase:         'ENTRY',
+    exchange,
+    symbol:        signal.symbol,
+    assetClass:    signal.assetClass,
+    action:        'BUY',
+    status:        'PENDING',
+    dryRun:        config.dryRun,
+    quantity:      sized.quantity,
+    entryPrice,
+    stopLoss,
+    takeProfit,
+    positionSizePct:   sized.positionPct,
+    convictionScore:   signal.convictionScore,
+    holdWindowDays,
+    holdUntil,
+    exitCondition:     claudeDecision?.exitCondition ?? null,
+    isIntraday,
+    trailingStopPct,
+    highWaterMark:     entryPrice,
+    dollarAmount:      sized.dollarAmount,
+    reason:            claudeDecision
+      ? `[Claude] ${claudeDecision.reasoning.slice(0, 200)}`
+      : signal.reason ?? `Conviction ${signal.convictionScore} | Setup: ${signal.setupType ?? 'scan'}`,
+    metadata: JSON.parse(JSON.stringify({
+      signal, sized, cbChecks: cb.checks,
+      claudeDecision: claudeDecision ?? null,
+    })),
+  } as any,
+});
+```
+
+---
+
+## PART C — Smart EOD: Only Close Intraday Positions
+
+**File**: `server/src/services/scans/dailyScanScheduler.ts`
+
+Replace the entire `runEndOfDay` function:
+
+```typescript
+async function runEndOfDay(): Promise<void> {
+  console.log('[Scheduler] Smart EOD — closing intraday positions only');
+
+  if (!hasAlpacaCredentials()) {
+    console.log('[Scheduler] EOD: Alpaca not connected — skipping');
+    return;
+  }
+
+  try {
+    // Get all open positions from Alpaca
+    const { getPositions } = await import('../alpaca/alpacaInfoService');
+    const { closePosition } = await import('../alpaca/alpacaExchangeService');
+    const alpacaPositions = await getPositions();
+
+    if (!alpacaPositions || alpacaPositions.length === 0) {
+      console.log('[Scheduler] EOD: No open positions');
+    } else {
+      let closedCount   = 0;
+      let heldCount     = 0;
+
+      for (const pos of alpacaPositions) {
+        const symbol = (pos as any).symbol;
+
+        // Find the trade log entry for this position
+        const tradeLog = await prisma.autoTradeLog.findFirst({
+          where: {
+            symbol,
+            exchange: 'PAPER',
+            status:   { in: ['FILLED', 'DRY_RUN'] },
+            phase:    'ENTRY',
+          },
+          orderBy: { executedAt: 'desc' },
+        });
+
+        const currentPrice = parseFloat((pos as any).current_price ?? '0');
+        const entryPrice   = parseFloat((pos as any).avg_entry_price ?? '0');
+        const pnlPct       = entryPrice > 0 ? ((currentPrice - entryPrice) / entryPrice) * 100 : 0;
+
+        // Determine if we should close this position
+        const shouldClose = determineEODClose(tradeLog, pos, pnlPct);
+
+        if (shouldClose.close) {
+          console.log(`[EOD] Closing ${symbol}: ${shouldClose.reason}`);
+          try {
+            await closePosition(symbol);
+            closedCount++;
+
+            if (tradeLog) {
+              const dollarPnl = pnlPct / 100 * parseFloat((pos as any).market_value ?? '0');
+              await prisma.autoTradeLog.update({
+                where: { id: tradeLog.id },
+                data: {
+                  status:    'CLOSED',
+                  exitPrice: currentPrice,
+                  pnl:       dollarPnl,
+                  reason:    shouldClose.reason,
+                },
+              });
+            }
+          } catch (err: any) {
+            console.warn(`[EOD] Failed to close ${symbol}:`, err?.message);
+          }
+        } else {
+          console.log(`[EOD] Holding ${symbol}: ${shouldClose.reason} | P&L: ${pnlPct.toFixed(2)}%`);
+          heldCount++;
+
+          // Update high water mark for held positions
+          if (tradeLog && currentPrice > (tradeLog as any).highWaterMark) {
+            await prisma.autoTradeLog.update({
+              where: { id: tradeLog.id },
+              data:  { highWaterMark: currentPrice } as any,
+            });
+          }
+        }
+      }
+
+      console.log(`[Scheduler] EOD complete: ${closedCount} closed, ${heldCount} held overnight`);
+    }
+  } catch (err: any) {
+    console.error('[Scheduler] EOD error:', err?.message);
+  }
+
+  await telegramService.sendDailySummary().catch(() => {});
+  console.log('[Scheduler] End-of-day routine complete');
+}
+
+function determineEODClose(
+  tradeLog: any,
+  position: any,
+  pnlPct: number,
+): { close: boolean; reason: string } {
+  const symbol     = (position as any).symbol;
+  const assetClass = (tradeLog?.assetClass ?? 'stock').toLowerCase();
+
+  // Always close Hyperliquid crypto — funding costs
+  if (tradeLog?.exchange === 'HYPERLIQUID') {
+    return { close: true, reason: 'EOD_INTRADAY: Hyperliquid funding cost' };
+  }
+
+  // Always close explicit intraday trades
+  if (tradeLog?.isIntraday === true) {
+    return { close: true, reason: 'EOD_INTRADAY: marked as intraday setup' };
+  }
+
+  // Always close if holdWindowDays = 1 or not set
+  if (!tradeLog || (tradeLog as any).holdWindowDays === 1) {
+    return { close: true, reason: 'EOD_INTRADAY: 1-day hold window' };
+  }
+
+  // Close if position is down more than 60% of max stop distance (thesis broken)
+  if (tradeLog?.stopLoss && tradeLog?.entryPrice) {
+    const maxStopDist = Math.abs(tradeLog.entryPrice - tradeLog.stopLoss);
+    const currentDist = Math.abs(tradeLog.entryPrice * (1 + pnlPct / 100) - tradeLog.entryPrice);
+    const stopUsed    = maxStopDist > 0 ? (currentDist / maxStopDist) : 0;
+
+    if (pnlPct < 0 && stopUsed > 0.6) {
+      return { close: true, reason: `EOD_THESIS_BROKEN: down ${Math.abs(pnlPct).toFixed(1)}% (>60% of stop used)` };
+    }
+  }
+
+  // Check if holdUntil has passed
+  if ((tradeLog as any).holdUntil) {
+    const holdUntil = new Date((tradeLog as any).holdUntil);
+    if (new Date() > holdUntil) {
+      return { close: true, reason: `EOD_HOLD_EXPIRED: hold window of ${(tradeLog as any).holdWindowDays} days elapsed` };
+    }
+  }
+
+  // Options strategies — NEVER close EOD (theta decay needs time)
+  const strategy = tradeLog?.metadata?.claudeDecision?.strategy
+    ?? tradeLog?.metadata?.optionsRecommendation?.strategy;
+  if (['IRON_CONDOR', 'CASH_SECURED_PUT', 'COVERED_CALL', 'BEAR_PUT_SPREAD'].includes(strategy)) {
+    return { close: false, reason: `HOLD: options strategy ${strategy} — theta decay needs time` };
+  }
+
+  // Multi-day hold — keep it
+  const holdDays = (tradeLog as any).holdWindowDays ?? 5;
+  const daysHeld = Math.floor((Date.now() - new Date(tradeLog.executedAt).getTime()) / 86_400_000);
+  return {
+    close:  false,
+    reason: `HOLD: ${holdDays}-day setup, day ${daysHeld + 1} of ${holdDays}`,
+  };
+}
+```
+
+---
+
+## PART D — Intraday Monitor: Trail Stops on Winners
+
+**File**: `server/src/services/autotrader/IntradayMonitorLoop.ts`
+
+Replace the `monitorOpenAutoTrades` function with a smarter version that trails stops:
+
+```typescript
+async function monitorOpenAutoTrades(userSettingsId: string, config: AutoTradeConfig): Promise<void> {
+  const activeLogs = await prisma.autoTradeLog.findMany({
+    where:   { userSettingsId, status: { in: ['FILLED', 'DRY_RUN'] }, phase: 'ENTRY' },
+    orderBy: { executedAt: 'desc' },
+    take:    20,
+  });
+
+  if (activeLogs.length === 0) return;
+
+  // Get live prices from Alpaca for all stock positions at once
+  let alpacaPositions: Record<string, number> = {};
+  try {
+    const { hasAlpacaCredentials } = await import('../alpaca/alpacaConfig');
+    if (hasAlpacaCredentials()) {
+      const { getPositions } = await import('../alpaca/alpacaInfoService');
+      const positions = await getPositions();
+      for (const p of (positions ?? [])) {
+        alpacaPositions[(p as any).symbol] = parseFloat((p as any).current_price ?? '0');
+      }
+    }
+  } catch { /* non-fatal */ }
+
+  for (const log of activeLogs) {
+    if (!log.entryPrice || !log.stopLoss) continue;
+
+    try {
+      // Resolve current price
+      let currentPrice: number | null = null;
+
+      if (log.exchange === 'PAPER') {
+        currentPrice = alpacaPositions[log.symbol] ?? null;
+        if (!currentPrice) {
+          // Fall back to Alpaca market data quote
+          try {
+            const { getAlpacaLatestQuote } = await import('../alpaca/alpacaMarketDataService');
+            const q = await getAlpacaLatestQuote(log.symbol);
+            currentPrice = q?.price ?? null;
+          } catch { /* non-fatal */ }
+        }
+      } else if (log.assetClass === 'crypto') {
+        const { getAssetPrice } = await import('../hyperliquid/hyperliquidInfoService');
+        currentPrice = await getAssetPrice(log.symbol);
+      } else {
+        const { getQuotes } = await import('../tos/tosInfoService');
+        const quotes = await getQuotes([log.symbol]);
+        const q = quotes[log.symbol];
+        currentPrice = q?.lastPrice ?? q?.mark ?? null;
+      }
+
+      if (!currentPrice || currentPrice <= 0) continue;
+
+      const entryPrice      = log.entryPrice;
+      const currentStop     = log.stopLoss;
+      const currentTarget   = log.takeProfit ?? entryPrice * 1.06;
+      const highWaterMark   = (log as any).highWaterMark ?? entryPrice;
+      const trailingStopPct = (log as any).trailingStopPct ?? 2.5;
+      const pnlPct          = ((currentPrice - entryPrice) / entryPrice) * 100;
+
+      // ── Update high water mark ─────────────────────────────────────────
+      let newHighWater = highWaterMark;
+      if (currentPrice > highWaterMark) {
+        newHighWater = currentPrice;
+        await prisma.autoTradeLog.update({
+          where: { id: log.id },
+          data:  { highWaterMark: newHighWater } as any,
+        });
+      }
+
+      // ── Compute trailing stop ──────────────────────────────────────────
+      // Only trail when position is profitable (above entry + 1%)
+      let effectiveStop = currentStop;
+      if (currentPrice > entryPrice * 1.01 && newHighWater > entryPrice) {
+        const trailedStop = newHighWater * (1 - trailingStopPct / 100);
+        // Only move stop UP, never down
+        if (trailedStop > currentStop) {
+          effectiveStop = trailedStop;
+          await prisma.autoTradeLog.update({
+            where: { id: log.id },
+            data:  { stopLoss: effectiveStop },
+          });
+          console.info(
+            `[Monitor] ${log.symbol} trailing stop raised: $${currentStop.toFixed(2)} → $${effectiveStop.toFixed(2)}` +
+            ` (high: $${newHighWater.toFixed(2)}, current: $${currentPrice.toFixed(2)})`
+          );
+        }
+      }
+
+      // ── Check exit conditions ──────────────────────────────────────────
+      const hitTP  = currentPrice >= currentTarget;
+      const hitSL  = currentPrice <= effectiveStop;
+      const isHardStopped = log.exchange === 'HYPERLIQUID'
+        ? (await import('../hyperliquid/hyperliquidConfig')).isKillswitchActive()
+        : (await import('../tos/tosConfig')).isKillswitchActive();
+
+      if (isHardStopped) continue;
+
+      // Check Claude's exit condition (plain English — ask Claude if it's triggered)
+      const exitCondition = (log as any).exitCondition;
+      let claudeExitTriggered = false;
+
+      if (exitCondition && pnlPct < -1 && process.env.ANTHROPIC_API_KEY) {
+        try {
+          const axios = (await import('axios')).default;
+          const checkPrompt = `Position: ${log.symbol} at $${currentPrice.toFixed(2)} (entered $${entryPrice.toFixed(2)}, P&L: ${pnlPct.toFixed(2)}%)
+Exit condition: "${exitCondition}"
+Does this exit condition apply right now? Reply with only YES or NO.`;
+
+          const resp = await axios.post(
+            'https://api.anthropic.com/v1/messages',
+            { model: 'claude-haiku-4-5-20251001', max_tokens: 5, messages: [{ role: 'user', content: checkPrompt }] },
+            { headers: { 'x-api-key': process.env.ANTHROPIC_API_KEY, 'anthropic-version': '2023-06-01', 'content-type': 'application/json' }, timeout: 8000 },
+          );
+          const answer = resp.data?.content?.[0]?.text?.trim().toUpperCase();
+          claudeExitTriggered = answer === 'YES';
+          if (claudeExitTriggered) {
+            console.info(`[Monitor] ${log.symbol} Claude exit condition triggered: "${exitCondition}"`);
+          }
+        } catch { /* non-fatal — skip exit condition check */ }
+      }
+
+      if (hitTP || hitSL || claudeExitTriggered) {
+        const exitReason = claudeExitTriggered
+          ? 'CLAUDE_EXIT_CONDITION'
+          : hitTP ? 'TAKE_PROFIT' : 'STOP_LOSS';
+
+        const dollarPnl = (currentPrice - entryPrice) * (log.quantity ?? 0);
+
+        // Close on exchange
+        if (log.exchange === 'PAPER' && log.status === 'FILLED') {
+          try {
+            const { closePosition } = await import('../alpaca/alpacaExchangeService');
+            await closePosition(log.symbol);
+          } catch (closeErr: any) {
+            console.warn(`[Monitor] Failed to close ${log.symbol} on Alpaca:`, closeErr?.message);
+          }
+        }
+
+        // Log the exit
+        await prisma.autoTradeLog.create({
+          data: {
+            userSettingsId,
+            sessionId:   log.sessionId ?? '',
+            phase:       'EXIT',
+            exchange:    log.exchange,
+            symbol:      log.symbol,
+            assetClass:  log.assetClass,
+            action:      'SELL',
+            status:      log.status === 'DRY_RUN' ? 'DRY_RUN' : 'FILLED',
+            dryRun:      log.dryRun,
+            quantity:    log.quantity,
+            entryPrice:  log.entryPrice,
+            exitPrice:   currentPrice,
+            pnl:         dollarPnl,
+            stopLoss:    effectiveStop,
+            reason:      exitReason,
+          },
+        });
+
+        await prisma.autoTradeLog.update({
+          where: { id: log.id },
+          data: {
+            status:    'CLOSED',
+            exitPrice: currentPrice,
+            pnl:       dollarPnl,
+            reason:    exitReason,
+          },
+        });
+
+        // Telegram notification
+        const { default: telegramService } = await import('../notifications/TelegramService');
+        telegramService.notify({
+          type:   'TRADE_CLOSED',
+          ticker: log.symbol,
+          data: {
+            ticker:      log.symbol,
+            closeReason: exitReason,
+            pnl:         dollarPnl.toFixed(2),
+            pnlPct:      pnlPct.toFixed(2),
+            holdDays:    Math.floor((Date.now() - new Date(log.executedAt).getTime()) / 86_400_000),
+            exchange:    log.exchange,
+          },
+        }, userSettingsId).catch(() => {});
+
+        console.info(`[Monitor] ${exitReason}: ${log.symbol} @ $${currentPrice.toFixed(2)} | P&L: ${pnlPct.toFixed(2)}% ($${dollarPnl.toFixed(2)})`);
+      }
+    } catch (err: any) {
+      console.warn(`[Monitor] Error checking ${log.symbol}:`, err?.message);
+    }
+  }
+}
+```
+
+---
+
+## PART E — ClaudeTradingBrain: Hold Window in Context
+
+**File**: `server/src/services/autotrader/ClaudeTradingBrain.ts`
+
+In `buildContext`, add currently held positions with their hold windows so Claude knows what's already running. Find the `openPositions` query and update to include hold data:
+
+```typescript
+const openPositions = await prisma.autoTradeLog.findMany({
+  where:  { phase: 'ENTRY', status: { in: ['FILLED', 'DRY_RUN'] } },
+  select: {
+    symbol: true, entryPrice: true, convictionScore: true,
+    holdWindowDays: true, holdUntil: true, exitCondition: true,
+    executedAt: true, highWaterMark: true,
+  } as any,
+  take: 20,
+});
+
+const openSymbols = openPositions.map((p: any) => p.symbol);
+```
+
+Update the open positions context in the prompt:
+
+```typescript
+Currently holding:
+${openPositions.length > 0
+  ? openPositions.map((p: any) => {
+      const daysHeld = Math.floor((Date.now() - new Date(p.executedAt).getTime()) / 86_400_000);
+      const daysLeft = p.holdWindowDays ? p.holdWindowDays - daysHeld : '?';
+      return `  ${p.symbol} — day ${daysHeld + 1} of ${p.holdWindowDays ?? '?'} | ${daysLeft} days remaining`;
+    }).join('\n')
+  : '  nothing open'}
+```
+
+---
+
+## PART F — Mission Control: Show Held Positions Clearly
+
+**File**: `client/src/pages/v2/MissionControl.tsx`
+
+In the `AccountPanel` component, update the position display to show hold window progress:
+
+```tsx
+{alpacaPositions.map((p: any) => {
+  const daysHeld = p.executedAt
+    ? Math.floor((Date.now() - new Date(p.executedAt).getTime()) / 86_400_000)
+    : 0;
+  const holdDays  = p.holdWindowDays ?? 1;
+  const progress  = Math.min(100, (daysHeld / holdDays) * 100);
+  const isOvernight = holdDays > 1;
+
+  return (
+    <div key={p.id} className={cn(
+      'px-3 py-2.5 rounded-xl border text-xs space-y-1.5',
+      (p.unrealizedPnl ?? 0) >= 0 ? 'bg-emerald-500/5 border-emerald-500/15' : 'bg-red-500/5 border-red-500/15',
+    )}>
+      <div className="flex items-center gap-2">
+        <span className={cn('text-[10px] font-bold px-1.5 py-0.5 rounded',
+          isOvernight ? 'bg-violet-500/20 text-violet-300' : 'bg-blue-500/20 text-blue-300')}>
+          {isOvernight ? `${holdDays}D` : 'INTRADAY'}
+        </span>
+        <span className="font-mono font-bold text-white">{p.symbol}</span>
+        <span className="text-slate-500 flex-1">{p.entryPrice ? `@$${p.entryPrice.toFixed(2)}` : ''}</span>
+        <span className={cn('font-mono font-bold', (p.unrealizedPnl ?? 0) >= 0 ? 'text-emerald-400' : 'text-red-400')}>
+          {p.unrealizedPnl != null ? (p.unrealizedPnl >= 0 ? '+' : '') + '$' + Math.abs(p.unrealizedPnl).toFixed(2) : '—'}
+        </span>
+      </div>
+      {isOvernight && (
+        <div className="flex items-center gap-2">
+          <div className="flex-1 h-1 bg-surface-3 rounded-full overflow-hidden">
+            <div className="h-full bg-violet-500/60 rounded-full" style={{ width: `${progress}%` }} />
+          </div>
+          <span className="text-[10px] text-slate-500">Day {daysHeld + 1}/{holdDays}</span>
+          {p.stopLoss && (
+            <span className="text-[10px] text-red-400/70">Stop ${p.stopLoss.toFixed(2)}</span>
+          )}
+        </div>
+      )}
+      {p.exitCondition && (
+        <p className="text-[10px] text-slate-600 truncate">Exit if: {p.exitCondition}</p>
+      )}
+    </div>
+  );
+})}
+```
+
+---
+
+## SUMMARY
+
+### What changes
+
+| Before | After |
+|--------|-------|
+| All positions close at 3:45 PM | Only intraday + thesis-broken positions close |
+| Fixed stop loss | Trailing stop rises with the position — locks in gains |
+| Claude's `holdWindowDays` ignored | Stored on entry, drives hold/close decision |
+| Claude's `exitCondition` ignored | Checked every 60s against current price via Claude Haiku |
+| Options closed on day 1 | Never closed EOD — theta decay runs its course |
+| Can't see hold progress in UI | Progress bar shows day X of Y on each position |
+
+### The trailing stop logic
+
+```
+Position enters at $100, stop at $95 (5% stop), trailingStopPct = 2% (40% of 5%)
+
+Day 1: price rises to $108 → trailing stop = $108 × 0.98 = $105.84 (raised from $95)
+Day 2: price rises to $115 → trailing stop = $115 × 0.98 = $112.70 (raised again)
+Day 3: price falls to $111 → trailing stop = $112.70 (not lowered — only moves up)
+       price continues to $112 → stop hit → exit with 12% gain instead of original 6% target
+```
+
+The trailing stop only moves UP, never down. Once the position has moved in your favor, you can't lose more than the trail distance from the peak.
+
+### EOD close logic (in order of priority)
+
+1. **Always close** — Hyperliquid positions (funding), explicit intraday flags, holdWindowDays = 1
+2. **Always hold** — Options strategies (IRON_CONDOR, CSP, COVERED_CALL, BEAR_PUT_SPREAD)
+3. **Close if thesis broken** — down >60% of max stop distance
+4. **Close if hold window expired** — holdUntil date passed
+5. **Hold everything else** — multi-day setups continue overnight
+
+### Cost of Claude exit condition checks
+Uses `claude-haiku-4-5-20251001` (cheapest model) — ~$0.001 per check. At 60-second intervals with 10 positions, that's $0.60/day maximum. Only runs when the position is down >1% (don't bother checking exit conditions on winners — the trailing stop handles those).

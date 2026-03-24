@@ -177,20 +177,30 @@ router.get('/notification-settings', requireAuth, async (req: Request, res: Resp
     const userId = req.session.userId!;
     const [settings, user] = await Promise.all([
       prisma.userSettings.findUnique({
-        where: { userId },
-        select: { telegramChatId: true, telegramEnabled: true, telegramConsent: true, telegramConsentAt: true },
+        where:  { userId },
+        select: {
+          telegramChatId:      true,
+          telegramEnabled:     true,
+          telegramConsent:     true,
+          telegramConsentAt:   true,
+          telegramBotToken:    true,
+          telegramBotUsername: true,
+        } as any,
       }),
       prisma.user.findUnique({ where: { id: userId }, select: { phoneNumber: true } }),
     ]);
+    const s = settings as any;
     res.json({
       success: true,
       data: {
-        phoneNumber:       user?.phoneNumber ?? null,
-        telegramLinked:    !!settings?.telegramChatId,
-        telegramEnabled:   settings?.telegramEnabled  ?? false,
-        telegramConsent:   settings?.telegramConsent  ?? false,
-        telegramConsentAt: settings?.telegramConsentAt ?? null,
-        botConfigured:     !!(process.env.TELEGRAM_BOT_TOKEN && process.env.TELEGRAM_BOT_USERNAME),
+        phoneNumber:         user?.phoneNumber ?? null,
+        telegramLinked:      !!s?.telegramChatId,
+        telegramEnabled:     s?.telegramEnabled  ?? false,
+        telegramConsent:     s?.telegramConsent  ?? false,
+        telegramConsentAt:   s?.telegramConsentAt ?? null,
+        hasBotToken:         !!(s?.telegramBotToken || process.env.TELEGRAM_BOT_TOKEN),
+        telegramBotUsername: s?.telegramBotUsername ?? process.env.TELEGRAM_BOT_USERNAME ?? null,
+        botConfigured:       !!(s?.telegramBotToken || (process.env.TELEGRAM_BOT_TOKEN && process.env.TELEGRAM_BOT_USERNAME)),
       },
     });
   } catch {
@@ -201,18 +211,74 @@ router.get('/notification-settings', requireAuth, async (req: Request, res: Resp
 router.post('/notification-settings/telegram-connect', requireAuth, async (req: Request, res: Response) => {
   try {
     const userId = req.session.userId!;
-    if (!process.env.TELEGRAM_BOT_TOKEN || !process.env.TELEGRAM_BOT_USERNAME) {
-      return res.status(400).json({ success: false, error: 'Telegram bot not configured. Set TELEGRAM_BOT_TOKEN and TELEGRAM_BOT_USERNAME in Replit Secrets.' });
+    const { botToken, botUsername } = req.body;
+
+    const resolvedToken    = botToken    || process.env.TELEGRAM_BOT_TOKEN;
+    const resolvedUsername = botUsername || process.env.TELEGRAM_BOT_USERNAME;
+
+    if (!resolvedToken || !resolvedUsername) {
+      return res.status(400).json({
+        success: false,
+        error:   'Please provide your bot token and username. Create a bot at @BotFather on Telegram.',
+        needsSetup: true,
+      });
     }
-    const token  = crypto.randomBytes(20).toString('hex');
-    const expiry = new Date(Date.now() + 10 * 60_000);
+
+    // Verify the bot token works before saving
+    try {
+      const axiosLib = (await import('axios')).default;
+      const { data } = await axiosLib.get(
+        `https://api.telegram.org/bot${resolvedToken}/getMe`,
+        { timeout: 8000 },
+      );
+      if (!data.ok) throw new Error('Invalid bot token');
+    } catch (verifyErr: any) {
+      return res.status(400).json({
+        success: false,
+        error: `Bot token invalid: ${verifyErr?.message ?? 'verification failed'}`,
+      });
+    }
+
+    const connectTok = crypto.randomBytes(20).toString('hex');
+    const expiry     = new Date(Date.now() + 10 * 60_000);
+
     const existing = await prisma.userSettings.findUnique({ where: { userId } });
     if (!existing) {
-      await prisma.userSettings.create({ data: { userId, telegramConnectToken: token, telegramConnectExpiry: expiry } });
+      await prisma.userSettings.create({
+        data: {
+          userId,
+          telegramBotToken:      resolvedToken,
+          telegramBotUsername:   resolvedUsername,
+          telegramConnectToken:  connectTok,
+          telegramConnectExpiry: expiry,
+        } as any,
+      });
     } else {
-      await prisma.userSettings.update({ where: { userId }, data: { telegramConnectToken: token, telegramConnectExpiry: expiry } });
+      await prisma.userSettings.update({
+        where: { userId },
+        data: {
+          telegramBotToken:      resolvedToken,
+          telegramBotUsername:   resolvedUsername,
+          telegramConnectToken:  connectTok,
+          telegramConnectExpiry: expiry,
+        } as any,
+      });
     }
-    const connectUrl = `https://t.me/${process.env.TELEGRAM_BOT_USERNAME}?start=${token}`;
+
+    // Register webhook for this user's bot (non-fatal)
+    try {
+      const axiosLib = (await import('axios')).default;
+      const appUrl   = process.env.APP_URL ?? process.env.REPLIT_DEV_DOMAIN
+        ? `https://${process.env.REPLIT_DEV_DOMAIN}`
+        : 'https://ria-bot.replit.app';
+      await axiosLib.post(
+        `https://api.telegram.org/bot${resolvedToken}/setWebhook`,
+        { url: `${appUrl}/api/telegram/webhook`, allowed_updates: ['message'] },
+        { timeout: 10_000 },
+      );
+    } catch { /* non-fatal */ }
+
+    const connectUrl = `https://t.me/${resolvedUsername}?start=${connectTok}`;
     res.json({ success: true, data: { connectUrl, expiresAt: expiry } });
   } catch {
     res.status(500).json({ success: false, error: 'Failed to generate connect link' });

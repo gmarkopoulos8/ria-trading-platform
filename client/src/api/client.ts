@@ -87,7 +87,8 @@ export const api = {
     updateProfile: (body: unknown) => put('/auth/profile', body),
     changePassword: (body: unknown) => put('/auth/password', body),
     notificationSettings: () => get('/auth/notification-settings'),
-    telegramConnect: () => post('/auth/notification-settings/telegram-connect', {}),
+    telegramConnect: (body?: { botToken?: string; botUsername?: string }) =>
+      post('/auth/notification-settings/telegram-connect', body ?? {}),
     telegramDisconnect: () => post('/auth/notification-settings/telegram-disconnect', {}),
   },
 
