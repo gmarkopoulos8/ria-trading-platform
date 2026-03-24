@@ -710,7 +710,7 @@ router.get('/mission-control', async (req: Request, res: Response) => {
       prisma.dailyScanRun.findFirst({
         where: { status: 'COMPLETED' },
         orderBy: { completedAt: 'desc' },
-        select: { id: true, completedAt: true, resultCount: true, runType: true },
+        select: { id: true, completedAt: true, totalRankedCount: true, runType: true },
       }),
       prisma.autoTradeLog.findMany({
         where:   { userSettingsId: settings.id },
@@ -749,7 +749,10 @@ router.get('/mission-control', async (req: Request, res: Response) => {
               lastEquity:  parseFloat(account.last_equity ?? account.equity ?? '0'),
             },
           };
-        } catch { return { positions: [], account: null }; }
+        } catch (e: any) {
+          console.error('[MissionControl] Alpaca fetch error:', e?.response?.data ?? e?.message ?? e);
+          return { positions: [], account: null };
+        }
       })(),
     ]);
 
