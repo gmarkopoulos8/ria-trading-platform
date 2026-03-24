@@ -302,75 +302,132 @@ function AlpacaCommandPanel() {
   );
 }
 
-// ── Claude AI Decision Panel ──────────────────────────────────────────────────
+// ── Claude Brain Panel ────────────────────────────────────────────────────────
 
-function AIDecisionPanel({ signals, regime, portfolioState }: { signals: any[]; regime: any; portfolioState: any }) {
-  const [decisions, setDecisions] = useState<any[] | null>(null);
-  const [modelUsed, setModelUsed] = useState<string | null>(null);
+function ClaudeBrainPanel() {
+  const [result, setResult] = useState<any | null>(null);
 
-  const reviewMut = useMutation({
-    mutationFn: () => api.autotrader.aiDecision({ signals: signals.slice(0, 6), regime, portfolioState, exchange: 'PAPER' }),
-    onSuccess: (r: any) => {
-      setDecisions(r.data?.decisions ?? []);
-      setModelUsed(r.data?.modelUsed ?? null);
-      toast.success(`AI reviewed ${r.data?.decisions?.length ?? 0} signals`);
+  const brainMut = useMutation({
+    mutationFn: () => api.autotrader.brainPreview(),
+    onSuccess:  (r: any) => {
+      setResult(r.data ?? null);
+      const approved = (r.data?.decisions ?? []).filter((d: any) => d.approved).length;
+      toast.success(`Claude reviewed ${r.data?.signalCount ?? 0} signals → ${approved} approved`);
     },
-    onError: (e: any) => toast.error(e?.response?.data?.error ?? 'AI review failed'),
+    onError: (e: any) => toast.error(e?.response?.data?.error ?? 'Claude Brain failed'),
   });
 
-  if (signals.length === 0) return null;
+  const decisions: any[] = result?.decisions ?? [];
+  const approved = decisions.filter(d => d.approved);
+  const rejected = decisions.filter(d => !d.approved);
 
   return (
     <Card className="p-4 border border-violet-500/20 bg-violet-950/10">
       <div className="flex items-center gap-2 mb-3">
         <Brain className="h-4 w-4 text-violet-400" />
-        <h3 className="text-sm font-bold text-white">Claude AI Trade Review</h3>
-        {modelUsed && <span className="text-[10px] text-slate-500 ml-auto">{modelUsed}</span>}
+        <h3 className="text-sm font-bold text-white">Claude Trading Brain</h3>
+        {result && (
+          <div className="flex items-center gap-2 ml-auto text-[10px] text-slate-500 font-mono">
+            <span>{result.modelUsed}</span>
+            {result.tokensUsed > 0 && <span>{result.tokensUsed} tok</span>}
+            <span>{result.processingMs}ms</span>
+          </div>
+        )}
         <button
-          onClick={() => reviewMut.mutate()}
-          disabled={reviewMut.isPending}
-          className="flex items-center gap-1.5 px-2.5 py-1.5 bg-violet-600/20 border border-violet-500/30 text-violet-300 text-xs rounded-lg hover:bg-violet-600/30 disabled:opacity-40 transition-colors ml-auto"
+          onClick={() => brainMut.mutate()}
+          disabled={brainMut.isPending}
+          className="flex items-center gap-1.5 px-2.5 py-1.5 bg-violet-600/20 border border-violet-500/30 text-violet-300 text-xs rounded-lg hover:bg-violet-600/30 disabled:opacity-40 transition-colors ml-2"
         >
-          {reviewMut.isPending ? <RefreshCw className="h-3 w-3 animate-spin" /> : <Brain className="h-3 w-3" />}
-          {reviewMut.isPending ? 'Reviewing…' : 'Ask Claude'}
+          {brainMut.isPending ? <RefreshCw className="h-3 w-3 animate-spin" /> : <Brain className="h-3 w-3" />}
+          {brainMut.isPending ? 'Analyzing…' : 'Run Claude Brain'}
         </button>
       </div>
 
-      {!decisions && !reviewMut.isPending && (
-        <p className="text-xs text-slate-500 py-2">
-          Click <strong className="text-violet-400">Ask Claude</strong> — Claude will review each signal for regime fit, earnings risk, correlated positions, and return a go/no-go decision with reasoning.
+      {!result && !brainMut.isPending && (
+        <p className="text-xs text-slate-500 py-2 leading-relaxed">
+          Claude analyzes the latest scan signals with full context — regime, portfolio state, open positions, recent history — and returns adjusted trading decisions with position size overrides, stop/target refinements, and plain-English exit rules.
         </p>
       )}
 
-      {reviewMut.isPending && (
+      {brainMut.isPending && (
         <div className="flex items-center gap-2 py-3 text-xs text-slate-400">
           <RefreshCw className="h-3.5 w-3.5 animate-spin text-violet-400" />
-          Claude is reviewing {signals.length} signal{signals.length !== 1 ? 's' : ''}…
+          Claude is evaluating signals with full market context…
         </div>
       )}
 
-      {decisions && (
-        <div className="space-y-1.5">
-          {decisions.map((d: any) => (
+      {result && decisions.length === 0 && (
+        <p className="text-xs text-slate-500 py-2">{result.message ?? 'No signals from latest scan to evaluate.'}</p>
+      )}
+
+      {decisions.length > 0 && (
+        <div className="space-y-2">
+          {/* Summary bar */}
+          <div className="flex items-center gap-3 text-xs mb-1">
+            <span className="text-emerald-400 font-mono font-bold">{approved.length} APPROVED</span>
+            <span className="text-slate-600">·</span>
+            <span className="text-slate-500 font-mono">{rejected.length} rejected</span>
+            <span className="text-slate-600">·</span>
+            <span className="text-slate-500">{result.signalCount} signals evaluated</span>
+            {result.fallback && <span className="text-amber-400 text-[10px]">⚠ fallback mode</span>}
+          </div>
+
+          {/* Decision cards — approved first */}
+          {[...approved, ...rejected].map((d: any) => (
             <div key={d.symbol} className={cn(
-              'rounded-lg px-3 py-2 border text-xs',
-              d.approved ? 'bg-emerald-500/5 border-emerald-500/20' : 'bg-surface-2 border-surface-border opacity-60',
+              'rounded-lg px-3 py-2.5 border text-xs',
+              d.approved
+                ? 'bg-emerald-500/5 border-emerald-500/20'
+                : 'bg-surface-2 border-surface-border opacity-55',
             )}>
-              <div className="flex items-center gap-2 mb-1">
+              {/* Header row */}
+              <div className="flex items-center gap-2 mb-1.5 flex-wrap">
                 {d.approved
                   ? <CheckCircle2 className="h-3.5 w-3.5 text-emerald-400 flex-shrink-0" />
-                  : <XCircle className="h-3.5 w-3.5 text-slate-500 flex-shrink-0" />
-                }
-                <span className="font-mono font-bold text-white w-14">{d.symbol}</span>
+                  : <XCircle className="h-3.5 w-3.5 text-slate-500 flex-shrink-0" />}
+                <span className="font-mono font-bold text-white">{d.symbol}</span>
                 <span className={cn('text-[10px] font-bold px-1.5 py-0.5 rounded',
                   d.approved ? 'bg-emerald-500/20 text-emerald-400' : 'bg-slate-700 text-slate-400')}>
                   {d.approved ? 'APPROVED' : 'REJECTED'}
                 </span>
-                <span className="text-slate-500 ml-auto">Conviction: <span className="text-white">{d.conviction}</span></span>
-                {d.holdDays && <span className="text-slate-500">Hold: <span className="text-white">{d.holdDays}d</span></span>}
+                {d.signal?.convictionScore && (
+                  <span className="text-slate-500">Conviction: <span className="text-white">{d.signal.convictionScore}</span></span>
+                )}
+                {d.confidenceInDecision > 0 && (
+                  <span className="text-slate-500 ml-auto">Confidence: <span className="text-white">{d.confidenceInDecision}%</span></span>
+                )}
+                {d.holdWindowDays > 0 && (
+                  <span className="text-slate-500">Hold: <span className="text-white">{d.holdWindowDays}d</span></span>
+                )}
               </div>
-              <p className="text-slate-400 pl-5 leading-relaxed">{d.reasoning}</p>
-              {d.riskWarning && <p className="text-amber-400 pl-5 text-[10px] mt-0.5">⚠ {d.riskWarning}</p>}
+
+              {/* Reasoning */}
+              <p className="text-slate-300 pl-5 leading-relaxed mb-1">{d.reasoning}</p>
+
+              {/* Parameter overrides */}
+              {(d.adjustedPositionSizePct || d.stopLossOverride || d.takeProfitOverride) && (
+                <div className="pl-5 flex flex-wrap gap-x-4 gap-y-0.5 text-[10px] mb-1">
+                  {d.adjustedPositionSizePct && (
+                    <span className="text-sky-400">📐 Size: <strong>{d.adjustedPositionSizePct}%</strong></span>
+                  )}
+                  {d.stopLossOverride && (
+                    <span className="text-rose-400">🛑 Stop: <strong>${d.stopLossOverride.toFixed(2)}</strong></span>
+                  )}
+                  {d.takeProfitOverride && (
+                    <span className="text-emerald-400">🎯 Target: <strong>${d.takeProfitOverride.toFixed(2)}</strong></span>
+                  )}
+                </div>
+              )}
+
+              {/* Exit condition */}
+              {d.exitCondition && (
+                <p className="text-sky-300/70 pl-5 text-[10px] mt-0.5">📋 Exit: {d.exitCondition}</p>
+              )}
+
+              {/* Risk warning */}
+              {d.riskWarning && (
+                <p className="text-amber-400 pl-5 text-[10px] mt-0.5">⚠ {d.riskWarning}</p>
+              )}
             </div>
           ))}
         </div>
@@ -651,8 +708,8 @@ export default function AutoTrader() {
           )}
         </Card>
 
-        {/* Claude AI Decision */}
-        <AIDecisionPanel signals={signals} regime={(statusRaw as any)?.data?.regime} portfolioState={portfolio} />
+        {/* Claude Trading Brain */}
+        <ClaudeBrainPanel />
       </div>
 
       {/* ── Recent trade log ── */}

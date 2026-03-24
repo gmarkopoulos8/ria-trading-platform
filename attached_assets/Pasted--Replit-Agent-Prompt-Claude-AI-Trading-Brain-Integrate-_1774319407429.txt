@@ -1,0 +1,679 @@
+# Replit Agent Prompt — Claude AI Trading Brain
+
+Integrate Claude as the primary decision engine for all autonomous trades. Claude receives the full thesis intelligence the platform already produces and returns adjusted trading decisions — not just go/no-go but actual parameter refinements (size, stop, target, hold window, exit conditions). Every decision is logged with reasoning for a full audit trail.
+
+---
+
+## ARCHITECTURE
+
+```
+Signals from scan
+    ↓
+Hard mechanical gates (killswitch, circuit breaker, capital limits) — unchanged
+    ↓
+CLAUDE TRADING BRAIN  ← regime + portfolio + thesis + catalysts + recent history
+    ↓
+Enriched signals with Claude's adjusted parameters
+    ↓
+Position sizer (uses Claude's size override if provided)
+    ↓
+Execute on Alpaca
+```
+
+Claude only sees signals that pass hard gates. Cost: ~$0.05–0.10 per trading cycle (10 signals).
+
+---
+
+## PART A — Claude Trading Brain Service
+
+**File**: `server/src/services/autotrader/ClaudeTradingBrain.ts` (NEW FILE)
+
+```typescript
+import axios from 'axios';
+import { prisma } from '../../lib/prisma';
+import { detectRegime } from '../market/RegimeDetector';
+import { getPortfolioState } from '../portfolio/PortfolioStateService';
+import type { AutoTradeSignal, AutoTradeConfig } from './AutoTradeExecutor';
+
+export interface ClaudeTradeDecision {
+  symbol:                  string;
+  approved:                boolean;
+  adjustedPositionSizePct: number | null;  // null = use default sizing
+  stopLossOverride:        number | null;  // null = use scan's stop
+  takeProfitOverride:      number | null;  // null = use scan's target
+  holdWindowDays:          number;
+  reasoning:               string;
+  riskWarning:             string | null;
+  exitCondition:           string | null;  // plain-English exit rule
+  confidenceInDecision:    number;         // 0-100 how confident Claude is
+}
+
+export interface BrainResult {
+  decisions:     Map<string, ClaudeTradeDecision>;
+  modelUsed:     string;
+  tokensUsed:    number;
+  processingMs:  number;
+  fallback:      boolean;
+}
+
+// ── Build context for Claude ───────────────────────────────────────────────
+
+async function buildContext(
+  signals:  AutoTradeSignal[],
+  config:   AutoTradeConfig,
+  userId:   string,
+): Promise<string> {
+  const [regime, portfolio] = await Promise.all([
+    detectRegime().catch(() => null),
+    getPortfolioState().catch(() => null),
+  ]);
+
+  // Recent trade history (last 7 days)
+  const weekAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000);
+  const recentTrades = await prisma.autoTradeLog.findMany({
+    where: { phase: 'ENTRY', executedAt: { gte: weekAgo }, status: { in: ['FILLED', 'DRY_RUN'] } },
+    orderBy: { executedAt: 'desc' },
+    take: 10,
+    select: { symbol: true, entryPrice: true, stopLoss: true, takeProfit: true, convictionScore: true, executedAt: true, pnl: true },
+  });
+
+  // Open positions
+  const openPositions = await prisma.autoTradeLog.findMany({
+    where: { phase: 'ENTRY', status: { in: ['FILLED', 'DRY_RUN'] } },
+    select: { symbol: true, entryPrice: true, convictionScore: true },
+    take: 20,
+  });
+
+  const openSymbols   = openPositions.map(p => p.symbol);
+  const dryRunMode    = config.dryRun;
+
+  return `You are the autonomous trading brain for RIA BOT, an AI trading platform. You make final trade decisions with full accountability.
+
+## CURRENT MARKET STATE
+Regime: ${regime?.regime ?? 'UNKNOWN'} | VIX: ${regime?.vix?.toFixed(1) ?? 'N/A'}
+SPY above 50 SMA: ${regime?.spyAbove50sma ?? 'N/A'} | SPY above 200 SMA: ${regime?.spyAbove200sma ?? 'N/A'}
+Recent SPY drawdown: ${regime?.spyRecentDrawdown?.toFixed(1) ?? '0'}%
+
+## PORTFOLIO STATE
+Total equity: $${portfolio?.totalEquity?.toFixed(2) ?? 'N/A'}
+Open positions: ${portfolio?.openPositionCount ?? 0} | Today's P&L: ${portfolio?.dailyPnl !== undefined ? (portfolio.dailyPnl >= 0 ? '+' : '') + '$' + portfolio.dailyPnl.toFixed(2) : 'N/A'}
+Currently holding: ${openSymbols.length > 0 ? openSymbols.join(', ') : 'nothing'}
+
+## RECENT TRADE HISTORY (last 7 days)
+${recentTrades.length === 0
+  ? 'No recent trades.'
+  : recentTrades.map(t =>
+      `${t.symbol} @ $${t.entryPrice?.toFixed(2) ?? '?'} | Conviction: ${t.convictionScore} | P&L: ${t.pnl !== null ? (t.pnl >= 0 ? '+' : '') + '$' + t.pnl?.toFixed(2) : 'open'}`
+    ).join('\n')
+}
+
+## CONFIG
+Mode: ${dryRunMode ? 'DRY RUN (no real money)' : 'LIVE PAPER TRADING'}
+Default stop loss: ${config.stopLossPct}% | Default target: ${config.takeProfitPct}%
+Max position size: ${config.maxPositionPct}% of portfolio
+
+## PROPOSED TRADES (${signals.length} signals from today's scan)
+${signals.map((s, i) => `
+### Signal ${i + 1}: ${s.symbol} (${s.assetClass ?? 'STOCK'})
+- Bias: ${s.bias} | Action: ${(s as any).recommendedAction ?? 'BUY'}
+- Conviction: ${s.convictionScore}/100 | Confidence: ${s.confidenceScore}/100 | Risk score: ${s.riskScore ?? 'N/A'}/100
+- Entry zone: ${s.entryPrice ? '$' + s.entryPrice.toFixed(2) : 'market'} | Stop: ${s.stopLoss ? '$' + s.stopLoss.toFixed(2) : 'default'} | Target: ${s.takeProfit ? '$' + s.takeProfit.toFixed(2) : 'default'}
+- Setup: ${s.setupType ?? 'scan signal'} | Hold window: ${(s as any).suggestedHoldWindow ?? '2-4 WEEKS'}
+- Thesis: ${s.reason ?? 'No thesis available'}
+- Supporting reasons: ${(s as any).supportingReasons?.join('; ') ?? 'N/A'}
+- Main risk: ${(s as any).mainRiskToThesis ?? 'N/A'}
+- Market structure score: ${(s as any).marketStructureScore ?? 'N/A'}/100
+- Catalyst score: ${(s as any).catalystScore ?? 'N/A'}/100
+- Already holding this: ${openSymbols.includes(s.symbol) ? 'YES — consider position sizing carefully' : 'no'}
+`).join('')}`;
+}
+
+// ── Main brain function ────────────────────────────────────────────────────
+
+export async function runClaudeTradingBrain(
+  signals:  AutoTradeSignal[],
+  config:   AutoTradeConfig,
+  userId:   string,
+): Promise<BrainResult> {
+  const start = Date.now();
+
+  // Fallback function — approve signals meeting basic threshold
+  const makeFallback = (reason: string): BrainResult => ({
+    decisions: new Map(
+      signals.map(s => [s.symbol, {
+        symbol:                  s.symbol,
+        approved:                s.convictionScore >= (config.minConvictionScore ?? 70),
+        adjustedPositionSizePct: null,
+        stopLossOverride:        null,
+        takeProfitOverride:      null,
+        holdWindowDays:          14,
+        reasoning:               `Fallback approval: ${reason}`,
+        riskWarning:             null,
+        exitCondition:           null,
+        confidenceInDecision:    60,
+      }])
+    ),
+    modelUsed:    'fallback',
+    tokensUsed:   0,
+    processingMs: Date.now() - start,
+    fallback:     true,
+  });
+
+  const apiKey = process.env.ANTHROPIC_API_KEY;
+  if (!apiKey) return makeFallback('ANTHROPIC_API_KEY not configured');
+  if (signals.length === 0) return makeFallback('No signals to evaluate');
+
+  try {
+    const context = await buildContext(signals, config, userId);
+
+    const prompt = `${context}
+
+## YOUR TASK
+
+Evaluate each proposed trade and return a JSON array with one decision per signal.
+
+For each signal decide:
+1. **approved**: Should this trade execute? Consider: regime fit, conviction quality, portfolio concentration, correlation with existing positions, recent performance, macro risk.
+2. **adjustedPositionSizePct**: Override the default position size (0.5–${config.maxPositionPct}%). Reduce if: high portfolio correlation, uncertain setup, elevated regime risk. Increase (up to ${config.maxPositionPct}%) if: highest conviction, low portfolio correlation, strong catalyst.
+3. **stopLossOverride**: Override the stop loss price if the scan's stop seems wrong. null to keep the scan's stop.
+4. **takeProfitOverride**: Override the take profit if you see a better target. null to keep the scan's target.
+5. **holdWindowDays**: How many calendar days to hold this position (3–90).
+6. **reasoning**: 1–2 sentences explaining the decision. Be specific — mention the setup, catalyst, or risk that drove the decision.
+7. **riskWarning**: Any specific near-term risk (earnings, Fed meeting, macro event, sector headwind). null if none.
+8. **exitCondition**: A plain-English rule for when to exit regardless of stop (e.g. "Exit if daily close below 200d SMA"). null if the stop covers it.
+9. **confidenceInDecision**: 0–100 how confident you are in this decision.
+
+**Rules:**
+- Approve at most ${Math.min(signals.length, config.maxOpenPositions ?? 3)} signals
+- Reject if: conviction < 68, regime is BEAR_CRISIS and bias is BULLISH, already holding same sector with 2+ positions, obvious near-term binary event
+- Reduce size if: holding correlated position, elevated volatility, CHOPPY regime
+- NEVER approve more than you have portfolio capacity for
+- This is ${config.dryRun ? 'DRY RUN — no real money at risk' : 'REAL paper trading — be appropriately selective'}
+
+Respond ONLY with a JSON array. No markdown, no explanation outside the JSON:
+[
+  {
+    "symbol": "AAPL",
+    "approved": true,
+    "adjustedPositionSizePct": 3.0,
+    "stopLossOverride": null,
+    "takeProfitOverride": 195.00,
+    "holdWindowDays": 14,
+    "reasoning": "Clean breakout above resistance with volume confirmation. Services revenue momentum intact.",
+    "riskWarning": "iPhone 17 launch in 6 weeks — market may price in ahead of time",
+    "exitCondition": "Exit if weekly close below 50-week SMA",
+    "confidenceInDecision": 78
+  }
+]`;
+
+    const response = await axios.post(
+      'https://api.anthropic.com/v1/messages',
+      {
+        model:      'claude-sonnet-4-20250514',
+        max_tokens: 2000,
+        messages:   [{ role: 'user', content: prompt }],
+      },
+      {
+        headers: {
+          'x-api-key':         apiKey,
+          'anthropic-version': '2023-06-01',
+          'content-type':      'application/json',
+        },
+        timeout: 30_000,
+      },
+    );
+
+    const rawText    = response.data?.content?.[0]?.text ?? '[]';
+    const tokensUsed = (response.data?.usage?.input_tokens ?? 0) + (response.data?.usage?.output_tokens ?? 0);
+    const cleaned    = rawText.replace(/```json|```/g, '').trim();
+    const parsed: ClaudeTradeDecision[] = JSON.parse(cleaned);
+
+    const decisions = new Map<string, ClaudeTradeDecision>();
+    for (const d of parsed) {
+      if (d.symbol) decisions.set(d.symbol, d);
+    }
+
+    // Any signals Claude didn't mention get auto-rejected
+    for (const s of signals) {
+      if (!decisions.has(s.symbol)) {
+        decisions.set(s.symbol, {
+          symbol:                  s.symbol,
+          approved:                false,
+          adjustedPositionSizePct: null,
+          stopLossOverride:        null,
+          takeProfitOverride:      null,
+          holdWindowDays:          0,
+          reasoning:               'Not included in Claude\'s approved list',
+          riskWarning:             null,
+          exitCondition:           null,
+          confidenceInDecision:    0,
+        });
+      }
+    }
+
+    console.info(`[ClaudeBrain] Evaluated ${signals.length} signals → ${[...decisions.values()].filter(d => d.approved).length} approved | ${tokensUsed} tokens | ${Date.now() - start}ms`);
+
+    return {
+      decisions,
+      modelUsed:    'claude-sonnet-4-20250514',
+      tokensUsed,
+      processingMs: Date.now() - start,
+      fallback:     false,
+    };
+
+  } catch (err: any) {
+    console.warn('[ClaudeBrain] API call failed, using fallback:', err?.message);
+    return makeFallback(err?.message ?? 'API error');
+  }
+}
+```
+
+---
+
+## PART B — Wire Claude Brain into AutoTradeExecutor
+
+**File**: `server/src/services/autotrader/AutoTradeExecutor.ts`
+
+Add import at top:
+```typescript
+import { runClaudeTradingBrain, type ClaudeTradeDecision } from './ClaudeTradingBrain';
+```
+
+Modify `runTradingCycle` to call Claude before executing individual trades. Find the function:
+
+```typescript
+export async function runTradingCycle(
+  userSettingsId: string,
+  config: AutoTradeConfig,
+  signals: AutoTradeSignal[],
+```
+
+Replace the beginning of `runTradingCycle`:
+
+```typescript
+export async function runTradingCycle(
+  userSettingsId: string,
+  config: AutoTradeConfig,
+  signals: AutoTradeSignal[],
+  options?: { skipClaudeBrain?: boolean },
+): Promise<AutoTradeResult[]> {
+  if (signals.length === 0) return [];
+
+  const settings = await prisma.userSettings.findUnique({ where: { id: userSettingsId } });
+  const userId   = settings?.userId ?? '';
+
+  // ── Claude Trading Brain ────────────────────────────────────────────────
+  // Call Claude with all signals + full context before executing any trades.
+  // Claude returns adjusted parameters and reasoning for each signal.
+  let brainDecisions = new Map<string, ClaudeTradeDecision>();
+  let brainFallback  = true;
+
+  if (!options?.skipClaudeBrain && process.env.ANTHROPIC_API_KEY) {
+    try {
+      const brainResult = await runClaudeTradingBrain(signals, config, userId);
+      brainDecisions    = brainResult.decisions;
+      brainFallback     = brainResult.fallback;
+
+      // Log brain results to console for visibility
+      for (const [sym, d] of brainDecisions) {
+        const icon = d.approved ? '✅' : '❌';
+        console.info(`[ClaudeBrain] ${icon} ${sym}: ${d.reasoning.slice(0, 80)}${d.riskWarning ? ` ⚠️ ${d.riskWarning}` : ''}`);
+      }
+    } catch (err: any) {
+      console.warn('[ClaudeBrain] Failed, proceeding with rule-based execution:', err?.message);
+    }
+  }
+
+  // Enrich signals with Claude's decisions
+  const enrichedSignals = signals.map(s => {
+    const decision = brainDecisions.get(s.symbol);
+    if (!decision) return s;
+    return {
+      ...s,
+      // Override parameters with Claude's adjustments if provided
+      stopLoss:   decision.stopLossOverride   ?? s.stopLoss,
+      takeProfit: decision.takeProfitOverride ?? s.takeProfit,
+      // Carry Claude's data forward for use in executeAutoTrade
+      _claudeDecision: decision,
+    } as AutoTradeSignal & { _claudeDecision: ClaudeTradeDecision };
+  });
+
+  // Filter to only Claude-approved signals (or all if fallback/no API key)
+  const approvedSignals = brainDecisions.size > 0
+    ? enrichedSignals.filter(s => {
+        const d = brainDecisions.get(s.symbol);
+        return !d || d.approved; // if not in map, use rule-based
+      })
+    : enrichedSignals;
+
+  if (approvedSignals.length === 0 && brainDecisions.size > 0) {
+    console.info('[ClaudeBrain] No signals approved — skipping execution');
+    return signals.map(s => ({
+      success: false,
+      status: 'REJECTED' as const,
+      symbol: s.symbol,
+      exchange: s.exchange ?? config.exchange,
+      reason: `Claude rejected: ${brainDecisions.get(s.symbol)?.reasoning ?? 'Not approved'}`,
+    }));
+  }
+
+  // ── Execute approved signals ─────────────────────────────────────────────
+  const perScanTradeCount = new Map<string, number>();
+  const results: AutoTradeResult[] = [];
+
+  for (const signal of approvedSignals) {
+    const result = await executeAutoTrade(signal, config, userSettingsId, undefined, perScanTradeCount);
+    results.push(result);
+  }
+
+  return results;
+}
+```
+
+In `executeAutoTrade`, find where position sizing happens (`let sized = sizePosition(...)`) and add Claude's size override:
+
+```typescript
+let sized = sizePosition({
+  totalEquity,
+  maxPositionPct: config.maxPositionPct,
+  convictionScore: signal.convictionScore,
+  riskScore: (signal.riskScore ?? 50) / 100,
+  atrPercent: signal.atrPercent,
+  stopLossPrice: signal.stopLoss ?? computeStopLoss(entryPrice, 'LONG', config.stopLossPct),
+  entryPrice,
+  regimeSizeMultiplier: regimePositionSizeMultiplier,
+}, entryPrice);
+
+// Apply Claude's position size override if provided
+const claudeDecision = (signal as any)._claudeDecision as ClaudeTradeDecision | undefined;
+if (claudeDecision?.adjustedPositionSizePct && claudeDecision.adjustedPositionSizePct > 0) {
+  const overrideDollar = totalEquity * (claudeDecision.adjustedPositionSizePct / 100);
+  const overrideQty    = overrideDollar / entryPrice;
+  sized = { ...sized, dollarAmount: overrideDollar, quantity: overrideQty, positionPct: claudeDecision.adjustedPositionSizePct };
+  console.info(`[ClaudeBrain] ${signal.symbol} size overridden to ${claudeDecision.adjustedPositionSizePct}% ($${overrideDollar.toFixed(0)})`);
+}
+```
+
+Also update the `autoTradeLog.create` call to include Claude's reasoning:
+
+```typescript
+const log = await prisma.autoTradeLog.create({
+  data: {
+    // ... existing fields ...
+    reason: claudeDecision
+      ? `[Claude] ${claudeDecision.reasoning.slice(0, 200)}`
+      : signal.reason ?? `Conviction ${signal.convictionScore} | Setup: ${signal.setupType ?? 'scan'}`,
+    metadata: JSON.parse(JSON.stringify({
+      signal,
+      sized,
+      cbChecks: cb.checks,
+      claudeDecision: claudeDecision ?? null,
+    })),
+  },
+});
+```
+
+---
+
+## PART C — Brain Preview Endpoint
+
+Add a route to preview what Claude would decide without executing, for testing.
+
+**File**: `server/src/routes/autotrader.ts`
+
+Add before `export default router`:
+
+```typescript
+// GET — preview what Claude's trading brain would decide on current signals
+router.get('/brain-preview', async (req: Request, res: Response) => {
+  try {
+    const userId   = req.session!.userId as string;
+    const settings = await getUserSettings(userId);
+    const config   = parseConfig(settings);
+
+    const signals = await buildSignalsFromLatestScan({
+      minConvictionScore: Math.max(60, config.minConvictionScore - 10), // slightly wider for preview
+      minConfidenceScore: 55,
+      allowedBiases:      ['BULLISH', 'BEARISH', 'NEUTRAL'],
+      maxSymbols:         8,
+    });
+
+    if (signals.length === 0) {
+      return res.json({ success: true, data: { message: 'No signals available — run a Daily Scan first', decisions: [] } });
+    }
+
+    const { runClaudeTradingBrain } = await import('../services/autotrader/ClaudeTradingBrain');
+    const result = await runClaudeTradingBrain(signals, config, userId);
+
+    const decisions = [...result.decisions.values()].map(d => ({
+      ...d,
+      signal: signals.find(s => s.symbol === d.symbol),
+    }));
+
+    res.json({
+      success: true,
+      data: {
+        decisions,
+        signalCount: signals.length,
+        approved:    decisions.filter(d => d.approved).length,
+        rejected:    decisions.filter(d => !d.approved).length,
+        modelUsed:   result.modelUsed,
+        tokensUsed:  result.tokensUsed,
+        processingMs: result.processingMs,
+        fallback:    result.fallback,
+      },
+    });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err instanceof Error ? err.message : 'Brain preview failed' });
+  }
+});
+```
+
+**File**: `client/src/api/client.ts`
+
+In `autotrader` section add:
+```typescript
+brainPreview: () => get('/autotrader/brain-preview'),
+```
+
+---
+
+## PART D — Show Claude's Reasoning in AutoTrader Command Center
+
+**File**: `client/src/pages/AutoTrader.tsx`
+
+Replace the `AIDecisionPanel` component with an enhanced version that uses the brain preview:
+
+```tsx
+function ClaudeBrainPanel() {
+  const qc = useQueryClient();
+  const [result, setResult] = useState<any>(null);
+
+  const previewMut = useMutation({
+    mutationFn: () => (api.autotrader as any).brainPreview(),
+    onSuccess: (r: any) => {
+      setResult(r.data);
+      toast.success(`Claude reviewed ${r.data?.signalCount ?? 0} signals`);
+    },
+    onError: (e: any) => toast.error(e?.response?.data?.error ?? 'Brain preview failed'),
+  });
+
+  return (
+    <Card className="p-4 border border-violet-500/20 bg-violet-950/10">
+      <div className="flex items-center gap-2 mb-3">
+        <Brain className="h-4 w-4 text-violet-400" />
+        <h3 className="text-sm font-bold text-white">Claude Trading Brain</h3>
+        {result && (
+          <span className="text-[10px] text-slate-500 ml-auto">
+            {result.tokensUsed?.toLocaleString()} tokens · {result.processingMs}ms
+          </span>
+        )}
+        <button
+          onClick={() => previewMut.mutate()}
+          disabled={previewMut.isPending}
+          className="flex items-center gap-1.5 px-2.5 py-1.5 bg-violet-600/20 border border-violet-500/30 text-violet-300 text-xs rounded-lg hover:bg-violet-600/30 disabled:opacity-40 transition-colors ml-auto"
+        >
+          {previewMut.isPending
+            ? <><RefreshCw className="h-3 w-3 animate-spin" /> Analyzing…</>
+            : <><Brain className="h-3 w-3" /> Ask Claude</>
+          }
+        </button>
+      </div>
+
+      {!result && !previewMut.isPending && (
+        <p className="text-xs text-slate-500 py-2">
+          Claude reviews every signal with full market context — regime, portfolio concentration, catalyst quality, recent performance — and returns adjusted position sizes, stops, targets, and plain-English reasoning.
+        </p>
+      )}
+
+      {previewMut.isPending && (
+        <div className="flex items-center gap-2 py-3 text-xs text-slate-400">
+          <RefreshCw className="h-3.5 w-3.5 animate-spin text-violet-400" />
+          Claude is analyzing market context and all signals…
+        </div>
+      )}
+
+      {result?.decisions && (
+        <div className="space-y-2">
+          <div className="flex items-center gap-3 text-xs text-slate-500 mb-1">
+            <span className="text-emerald-400 font-semibold">{result.approved} approved</span>
+            <span>·</span>
+            <span className="text-slate-500">{result.rejected} rejected</span>
+            {result.fallback && <span className="text-amber-400">· fallback mode</span>}
+          </div>
+
+          {result.decisions.map((d: any) => (
+            <div key={d.symbol} className={cn(
+              'rounded-lg p-3 border text-xs',
+              d.approved
+                ? 'bg-emerald-500/5 border-emerald-500/20'
+                : 'bg-surface-2 border-surface-border opacity-60',
+            )}>
+              <div className="flex items-start gap-2 mb-1.5">
+                {d.approved
+                  ? <CheckCircle2 className="h-3.5 w-3.5 text-emerald-400 flex-shrink-0 mt-0.5" />
+                  : <XCircle className="h-3.5 w-3.5 text-slate-500 flex-shrink-0 mt-0.5" />
+                }
+                <div className="flex-1 min-w-0">
+                  <div className="flex items-center gap-2 flex-wrap">
+                    <span className="font-mono font-bold text-white">{d.symbol}</span>
+                    <span className={cn('text-[10px] font-bold px-1.5 py-0.5 rounded',
+                      d.approved ? 'bg-emerald-500/20 text-emerald-400' : 'bg-slate-700 text-slate-400')}>
+                      {d.approved ? 'APPROVED' : 'REJECTED'}
+                    </span>
+                    {d.approved && d.adjustedPositionSizePct && (
+                      <span className="text-[10px] text-violet-400 font-mono">{d.adjustedPositionSizePct}% size</span>
+                    )}
+                    {d.approved && d.holdWindowDays && (
+                      <span className="text-[10px] text-slate-500">{d.holdWindowDays}d hold</span>
+                    )}
+                    <span className="text-[10px] text-slate-600 ml-auto">{d.confidenceInDecision}% confidence</span>
+                  </div>
+                  <p className="text-slate-400 mt-1 leading-relaxed">{d.reasoning}</p>
+                  {d.riskWarning && (
+                    <p className="text-amber-400 text-[10px] mt-1 flex items-center gap-1">
+                      <AlertOctagon className="h-3 w-3 flex-shrink-0" />{d.riskWarning}
+                    </p>
+                  )}
+                  {d.exitCondition && (
+                    <p className="text-slate-500 text-[10px] mt-1">Exit rule: {d.exitCondition}</p>
+                  )}
+                  {d.approved && (d.stopLossOverride || d.takeProfitOverride) && (
+                    <div className="flex gap-3 mt-1.5 text-[10px]">
+                      {d.stopLossOverride && <span className="text-red-400">Stop: ${d.stopLossOverride.toFixed(2)}</span>}
+                      {d.takeProfitOverride && <span className="text-emerald-400">Target: ${d.takeProfitOverride.toFixed(2)}</span>}
+                    </div>
+                  )}
+                </div>
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+    </Card>
+  );
+}
+```
+
+In the main AutoTrader layout, replace `<AIDecisionPanel ... />` with `<ClaudeBrainPanel />`.
+
+---
+
+## PART E — CLAUDE.md for GitHub Actions
+
+Create this file in the root of the repo so Claude Code knows the architecture when reviewing PRs.
+
+**File**: `CLAUDE.md`
+
+```markdown
+# RIA BOT — Claude Code Context
+
+## What this is
+Autonomous AI trading platform. Claude (claude-sonnet-4-20250514) is the primary trading brain — it receives conviction scores, thesis analysis, market regime, and portfolio state, then decides which trades to execute with adjusted parameters.
+
+## Architecture
+- Frontend: React/Vite on port 5000 (dev), served from Express in production
+- Backend: Node.js/Express/TypeScript on port 3001
+- Database: PostgreSQL via Prisma ORM
+- Exchanges: Alpaca Paper (primary), Hyperliquid, ThinkorSwim
+
+## Critical files to check on any PR
+- `server/src/services/autotrader/ClaudeTradingBrain.ts` — Claude's trading decisions
+- `server/src/services/autotrader/AutoTradeExecutor.ts` — execution pipeline
+- `server/src/services/market/RegimeDetector.ts` — must have thresholds 70/72/75/85 NOT 85/88
+- `server/src/services/credentials/CredentialLoader.ts` — must have retry loop
+- `server/src/routes/alpaca.ts` — /status must return both `hasCredentials` AND `connected: true`
+- `main.py` — must NOT be empty, must run `npm run start`
+- `server/prisma/schema.prisma` — check for autonomous mode fields
+
+## Common bugs to watch for
+1. `status?.connected` in AutoTrader.tsx — should also check `hasCredentials`
+2. RegimeDetector ADJUSTMENTS — ELEVATED_VOLATILITY conviction should be 75 NOT 88
+3. PortfolioStateService — must use Alpaca account balance not internal paper table
+4. CredentialLoader — must retry 5 times, not fail silently once
+5. Missing route registrations in server/src/index.ts
+6. API client methods without matching server routes in autotrader.ts
+
+## Trading flow
+Daily scan → ThesisEngine scores → signals (conviction/confidence/risk) → ClaudeTradingBrain → executeAutoTrade → Alpaca
+
+## Secrets required
+DATABASE_URL, SESSION_SECRET, NODE_ENV=production, ANTHROPIC_API_KEY, ALPACA_API_KEY_ID, ALPACA_API_SECRET, TELEGRAM_BOT_TOKEN, TELEGRAM_BOT_USERNAME, APP_URL
+```
+
+---
+
+## SUMMARY
+
+### New files
+```
+server/src/services/autotrader/ClaudeTradingBrain.ts  — Claude's decision engine
+CLAUDE.md                                              — context for GitHub Actions
+```
+
+### Modified files
+```
+server/src/services/autotrader/AutoTradeExecutor.ts  — wire brain into runTradingCycle
+server/src/routes/autotrader.ts                      — /brain-preview endpoint
+client/src/pages/AutoTrader.tsx                      — ClaudeBrainPanel with full reasoning
+client/src/api/client.ts                             — brainPreview method
+```
+
+### What Claude does on each trading cycle
+
+1. Receives all signals that passed mechanical gates
+2. Gets full context: regime, VIX, portfolio state, open positions, recent trade history
+3. For each signal, decides:
+   - **Approved** or **Rejected** with plain-English reasoning
+   - **Position size** — may reduce if concentrated, increase if high conviction
+   - **Stop loss override** — may tighten or widen based on setup quality
+   - **Take profit override** — may extend target if catalyst is strong
+   - **Hold window** — calendar days to stay in position
+   - **Risk warning** — earnings, macro events, sector headwinds
+   - **Exit condition** — plain-English rule beyond the mechanical stop
+4. Only approved signals with Claude's parameters reach the exchange
+5. All reasoning stored in `autoTradeLog.metadata.claudeDecision` for audit trail
+
+### Cost estimate
+~1500 tokens input + 500 tokens output per cycle × 10 signals = ~$0.06 per trading cycle
+At 4 cycles/day = ~$0.24/day — essentially free

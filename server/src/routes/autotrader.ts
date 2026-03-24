@@ -565,6 +565,50 @@ router.get('/live-positions', async (req: Request, res: Response) => {
   }
 });
 
+// POST — Claude Trading Brain: full per-signal decisions with parameter overrides
+router.post('/brain-preview', requireAuth, async (req: Request, res: Response) => {
+  try {
+    const userId = req.session.userId!;
+    const settings = await prisma.userSettings.findUnique({ where: { userId } });
+    if (!settings) return res.status(404).json({ success: false, error: 'User settings not found' });
+
+    const rawSignals = await buildSignalsFromLatestScan({
+      minConviction: 60,
+      maxResults:    8,
+      exchange:      'PAPER',
+    });
+
+    if (rawSignals.length === 0) {
+      return res.json({ success: true, data: { decisions: [], modelUsed: 'fallback', message: 'No signals from latest scan' } });
+    }
+
+    const { runClaudeTradingBrain } = await import('../services/autotrader/ClaudeTradingBrain');
+    const { DEFAULT_AUTO_TRADE_CONFIG } = await import('../services/autotrader/AutoTradeExecutor');
+
+    const config = { ...DEFAULT_AUTO_TRADE_CONFIG, dryRun: true };
+    const result = await runClaudeTradingBrain(rawSignals, config, userId);
+
+    const decisions = [...result.decisions.values()].map(d => ({
+      ...d,
+      signal: rawSignals.find(s => s.symbol === d.symbol),
+    }));
+
+    res.json({
+      success: true,
+      data: {
+        decisions,
+        modelUsed:    result.modelUsed,
+        tokensUsed:   result.tokensUsed,
+        processingMs: result.processingMs,
+        fallback:     result.fallback,
+        signalCount:  rawSignals.length,
+      },
+    });
+  } catch (err: any) {
+    res.status(500).json({ success: false, error: err?.message ?? 'Brain preview failed' });
+  }
+});
+
 // POST — Claude AI reviews trade signals and returns go/no-go decisions
 router.post('/ai-decision', async (req: Request, res: Response) => {
   try {

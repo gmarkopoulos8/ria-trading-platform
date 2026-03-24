@@ -10,6 +10,7 @@ import { getConfig, checkSessionActive } from './ExchangeAutoConfigService';
 import { detectRegime } from '../market/RegimeDetector';
 import { getRecommendation } from '../options/OptionsAnalyzer';
 import { getCachedAdaptive } from './UniversalAdaptiveEngine';
+import { runClaudeTradingBrain, type ClaudeTradeDecision } from './ClaudeTradingBrain';
 
 export type AutoTradeExchange = 'TOS' | 'HYPERLIQUID' | 'PAPER';
 
@@ -364,6 +365,15 @@ export async function executeAutoTrade(
     regimeSizeMultiplier: regimePositionSizeMultiplier,
   }, entryPrice);
 
+  // Apply Claude's position size override if provided
+  const claudeDecision = (signal as any)._claudeDecision as ClaudeTradeDecision | undefined;
+  if (claudeDecision?.adjustedPositionSizePct && claudeDecision.adjustedPositionSizePct > 0) {
+    const overrideDollar = totalEquity * (claudeDecision.adjustedPositionSizePct / 100);
+    const overrideQty    = overrideDollar / entryPrice;
+    sized = { ...sized, dollarAmount: overrideDollar, quantity: overrideQty, positionPct: claudeDecision.adjustedPositionSizePct };
+    console.info(`[ClaudeBrain] ${signal.symbol} size overridden to ${claudeDecision.adjustedPositionSizePct}% ($${overrideDollar.toFixed(0)})`);
+  }
+
   // Clamp to per-exchange position size limits
   if (exchangeKey) {
     try {
@@ -405,7 +415,7 @@ export async function executeAutoTrade(
       positionSizePct: sized.positionPct,
       convictionScore: signal.convictionScore,
       reason: signal.reason ?? `Conviction ${signal.convictionScore} | Setup: ${signal.setupType ?? 'scan'}`,
-      metadata: JSON.parse(JSON.stringify({ signal, sized, cbChecks: cb.checks })),
+      metadata: JSON.parse(JSON.stringify({ signal, sized, cbChecks: cb.checks, claudeDecision: (signal as any)._claudeDecision ?? null })),
     },
   });
 
@@ -621,14 +631,70 @@ export async function runTradingCycle(
   userSettingsId: string,
   config: AutoTradeConfig,
   signals: AutoTradeSignal[],
+  options?: { skipClaudeBrain?: boolean },
 ): Promise<AutoTradeResult[]> {
-  const sessionId = `session_${Date.now()}`;
-  const results: AutoTradeResult[] = [];
-  const perScanTradeCount = new Map<string, number>();
+  if (signals.length === 0) return [];
 
+  const settings = await prisma.userSettings.findUnique({ where: { id: userSettingsId } });
+  const userId   = settings?.userId ?? '';
+
+  // ── Claude Trading Brain ─────────────────────────────────────────────────
+  let brainDecisions = new Map<string, ClaudeTradeDecision>();
+  let brainFallback  = true;
+
+  if (!options?.skipClaudeBrain && process.env.ANTHROPIC_API_KEY) {
+    try {
+      const brainResult = await runClaudeTradingBrain(signals, config, userId);
+      brainDecisions    = brainResult.decisions;
+      brainFallback     = brainResult.fallback;
+
+      for (const [sym, d] of brainDecisions) {
+        const icon = d.approved ? '✅' : '❌';
+        console.info(`[ClaudeBrain] ${icon} ${sym}: ${d.reasoning.slice(0, 80)}${d.riskWarning ? ` ⚠️ ${d.riskWarning}` : ''}`);
+      }
+    } catch (err: any) {
+      console.warn('[ClaudeBrain] Failed, proceeding with rule-based execution:', err?.message);
+    }
+  }
+
+  // Enrich signals with Claude's decisions
   const sorted = [...signals].sort((a, b) => b.convictionScore - a.convictionScore);
+  const enrichedSignals = sorted.map(s => {
+    const decision = brainDecisions.get(s.symbol);
+    if (!decision) return s;
+    return {
+      ...s,
+      stopLoss:        decision.stopLossOverride   ?? s.stopLoss,
+      takeProfit:      decision.takeProfitOverride ?? s.takeProfit,
+      _claudeDecision: decision,
+    } as AutoTradeSignal & { _claudeDecision: ClaudeTradeDecision };
+  });
 
-  for (const signal of sorted) {
+  // Filter to only Claude-approved signals (or all if fallback/no API key)
+  const approvedSignals = brainDecisions.size > 0
+    ? enrichedSignals.filter(s => {
+        const d = brainDecisions.get(s.symbol);
+        return !d || d.approved;
+      })
+    : enrichedSignals;
+
+  if (approvedSignals.length === 0 && brainDecisions.size > 0) {
+    console.info('[ClaudeBrain] No signals approved — skipping execution');
+    return signals.map(s => ({
+      success:  false,
+      status:   'REJECTED' as const,
+      symbol:   s.symbol,
+      exchange: s.exchange ?? config.exchange,
+      reason:   `Claude rejected: ${brainDecisions.get(s.symbol)?.reasoning ?? 'Not approved'}`,
+    }));
+  }
+
+  // ── Execute approved signals ─────────────────────────────────────────────
+  const sessionId          = `session_${Date.now()}`;
+  const perScanTradeCount  = new Map<string, number>();
+  const results: AutoTradeResult[] = [];
+
+  for (const signal of approvedSignals) {
     const result = await executeAutoTrade(signal, config, userSettingsId, sessionId, perScanTradeCount);
     results.push(result);
     if (result.status === 'FILLED' || result.status === 'DRY_RUN') {
