@@ -42,3 +42,9 @@ id = "cF1SBG0xCsP4BVEB4bVni"
 uri = "file://ria-src.tar.gz"
 type = "unspecified"
 title = "ria-src.tar.gz"
+
+[[outputs]]
+id = "dm2PeFcy4pMb4rvwb92sQ"
+uri = "file://r1.tar.gz"
+type = "unspecified"
+title = "r1.tar.gz"
