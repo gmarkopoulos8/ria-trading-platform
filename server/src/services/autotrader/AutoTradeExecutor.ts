@@ -397,6 +397,22 @@ export async function executeAutoTrade(
     return { success: false, status: 'REJECTED', symbol: signal.symbol, exchange, reason: 'Position size too small' };
   }
 
+  const isIntraday = (
+    claudeDecision?.holdWindowDays === 1 ||
+    ((signal as any)._premiumSelling === false &&
+      (signal.setupType?.toLowerCase().includes('momentum') ||
+       signal.setupType?.toLowerCase().includes('intraday') ||
+       (signal.assetClass === 'crypto' && exchange === 'HYPERLIQUID')))
+  );
+
+  const holdWindowDays = claudeDecision?.holdWindowDays ?? (isIntraday ? 1 : 5);
+  const holdUntil = new Date(Date.now() + holdWindowDays * 24 * 60 * 60 * 1000);
+
+  const stopDist = entryPrice > 0 && stopLoss > 0
+    ? Math.abs((entryPrice - stopLoss) / entryPrice) * 100
+    : config.stopLossPct;
+  const trailingStopPct = Math.max(1.5, stopDist * 0.4);
+
   const log = await prisma.autoTradeLog.create({
     data: {
       userSettingsId,
@@ -414,9 +430,18 @@ export async function executeAutoTrade(
       takeProfit,
       positionSizePct: sized.positionPct,
       convictionScore: signal.convictionScore,
-      reason: signal.reason ?? `Conviction ${signal.convictionScore} | Setup: ${signal.setupType ?? 'scan'}`,
-      metadata: JSON.parse(JSON.stringify({ signal, sized, cbChecks: cb.checks, claudeDecision: (signal as any)._claudeDecision ?? null })),
-    },
+      holdWindowDays,
+      holdUntil,
+      exitCondition:  claudeDecision?.exitCondition ?? null,
+      isIntraday,
+      trailingStopPct,
+      highWaterMark:  entryPrice,
+      dollarAmount:   sized.dollarAmount,
+      reason: claudeDecision
+        ? `[Claude] ${claudeDecision.reasoning.slice(0, 200)}`
+        : signal.reason ?? `Conviction ${signal.convictionScore} | Setup: ${signal.setupType ?? 'scan'}`,
+      metadata: JSON.parse(JSON.stringify({ signal, sized, cbChecks: cb.checks, claudeDecision: claudeDecision ?? null })),
+    } as any,
   });
 
   // Increment per-scan counter

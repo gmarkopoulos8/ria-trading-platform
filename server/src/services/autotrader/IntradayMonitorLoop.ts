@@ -33,73 +33,178 @@ function getNYHour(): number {
 
 async function monitorOpenAutoTrades(userSettingsId: string, config: AutoTradeConfig): Promise<void> {
   const activeLogs = await prisma.autoTradeLog.findMany({
-    where: {
-      userSettingsId,
-      status: { in: ['FILLED', 'DRY_RUN'] },
-      phase: 'ENTRY',
-    },
+    where:   { userSettingsId, status: { in: ['FILLED', 'DRY_RUN'] }, phase: 'ENTRY' },
     orderBy: { executedAt: 'desc' },
-    take: 20,
+    take:    20,
   });
 
   if (activeLogs.length === 0) return;
 
+  // Batch-fetch Alpaca positions for live prices
+  let alpacaPositions: Record<string, number> = {};
+  try {
+    const { hasAlpacaCredentials } = await import('../alpaca/alpacaConfig');
+    if (hasAlpacaCredentials()) {
+      const { getPositions } = await import('../alpaca/alpacaInfoService');
+      const positions = await getPositions();
+      for (const p of (positions ?? [])) {
+        alpacaPositions[(p as any).symbol] = parseFloat((p as any).current_price ?? '0');
+      }
+    }
+  } catch { /* non-fatal */ }
+
   for (const log of activeLogs) {
-    if (!log.entryPrice || !log.takeProfit || !log.stopLoss) continue;
+    if (!log.entryPrice || !log.stopLoss) continue;
 
     try {
       let currentPrice: number | null = null;
 
-      if (log.assetClass === 'crypto' || log.assetClass === 'CRYPTO') {
+      if (log.exchange === 'PAPER') {
+        currentPrice = alpacaPositions[log.symbol] ?? null;
+        if (!currentPrice) {
+          try {
+            const { getAlpacaLatestQuote } = await import('../alpaca/alpacaMarketDataService');
+            const q = await (getAlpacaLatestQuote as any)(log.symbol);
+            currentPrice = q?.price ?? null;
+          } catch { /* non-fatal */ }
+        }
+      } else if (log.assetClass === 'crypto' || log.assetClass === 'CRYPTO') {
         const { getAssetPrice } = await import('../hyperliquid/hyperliquidInfoService');
         currentPrice = await getAssetPrice(log.symbol);
       } else {
         const { getQuotes } = await import('../tos/tosInfoService');
         const quotes = await getQuotes([log.symbol]);
         const q = quotes[log.symbol];
-        if (q) currentPrice = q.lastPrice ?? q.mark ?? null;
+        currentPrice = q?.lastPrice ?? q?.mark ?? null;
       }
 
-      if (!currentPrice) continue;
+      if (!currentPrice || currentPrice <= 0) continue;
 
-      const pnl = (currentPrice - log.entryPrice) * (log.quantity ?? 0);
-      const hitTP = currentPrice >= log.takeProfit;
-      const hitSL = currentPrice <= log.stopLoss;
+      const entryPrice      = log.entryPrice;
+      const currentStop     = log.stopLoss;
+      const currentTarget   = log.takeProfit ?? entryPrice * 1.06;
+      const highWaterMark   = (log as any).highWaterMark ?? entryPrice;
+      const trailingStopPct = (log as any).trailingStopPct ?? 2.5;
+      const pnlPct          = ((currentPrice - entryPrice) / entryPrice) * 100;
 
-      // Hard stop blocks auto-exits (user has taken manual control); pause does not
-      const isHardStopped = log.assetClass === 'crypto' || log.assetClass === 'CRYPTO'
+      // ── Update high water mark ────────────────────────────────────────────
+      let newHighWater = highWaterMark;
+      if (currentPrice > highWaterMark) {
+        newHighWater = currentPrice;
+        await prisma.autoTradeLog.update({
+          where: { id: log.id },
+          data:  { highWaterMark: newHighWater } as any,
+        });
+      }
+
+      // ── Compute trailing stop (only when profitable, only moves up) ───────
+      let effectiveStop = currentStop;
+      if (currentPrice > entryPrice * 1.01 && newHighWater > entryPrice) {
+        const trailedStop = newHighWater * (1 - trailingStopPct / 100);
+        if (trailedStop > currentStop) {
+          effectiveStop = trailedStop;
+          await prisma.autoTradeLog.update({
+            where: { id: log.id },
+            data:  { stopLoss: effectiveStop },
+          });
+          console.info(
+            `[Monitor] ${log.symbol} trailing stop raised: $${currentStop.toFixed(2)} → $${effectiveStop.toFixed(2)}` +
+            ` (high: $${newHighWater.toFixed(2)}, current: $${currentPrice.toFixed(2)})`
+          );
+        }
+      }
+
+      // ── Check exit conditions ─────────────────────────────────────────────
+      const hitTP = currentPrice >= currentTarget;
+      const hitSL = currentPrice <= effectiveStop;
+
+      const isHardStopped = log.exchange === 'HYPERLIQUID'
         ? isHLStopped()
         : isTOSStopped();
       if (isHardStopped) continue;
 
-      if (hitTP || hitSL) {
-        const exitReason = hitTP ? 'TAKE_PROFIT' : 'STOP_LOSS';
+      // Check Claude's exit condition via Haiku (only when down > 1%, non-fatal)
+      const exitCondition = (log as any).exitCondition as string | null;
+      let claudeExitTriggered = false;
+
+      if (exitCondition && pnlPct < -1 && process.env.ANTHROPIC_API_KEY) {
+        try {
+          const axios = (await import('axios')).default;
+          const checkPrompt =
+            `Position: ${log.symbol} at $${currentPrice.toFixed(2)} (entered $${entryPrice.toFixed(2)}, P&L: ${pnlPct.toFixed(2)}%)\n` +
+            `Exit condition: "${exitCondition}"\n` +
+            `Does this exit condition apply right now? Reply with only YES or NO.`;
+
+          const resp = await axios.post(
+            'https://api.anthropic.com/v1/messages',
+            { model: 'claude-haiku-4-5-20251001', max_tokens: 5, messages: [{ role: 'user', content: checkPrompt }] },
+            { headers: { 'x-api-key': process.env.ANTHROPIC_API_KEY, 'anthropic-version': '2023-06-01', 'content-type': 'application/json' }, timeout: 8000 },
+          );
+          const answer = resp.data?.content?.[0]?.text?.trim().toUpperCase();
+          claudeExitTriggered = answer === 'YES';
+          if (claudeExitTriggered) {
+            console.info(`[Monitor] ${log.symbol} Claude exit condition triggered: "${exitCondition}"`);
+          }
+        } catch { /* non-fatal */ }
+      }
+
+      if (hitTP || hitSL || claudeExitTriggered) {
+        const exitReason = claudeExitTriggered
+          ? 'CLAUDE_EXIT_CONDITION'
+          : hitTP ? 'TAKE_PROFIT' : 'STOP_LOSS';
+
+        const dollarPnl = (currentPrice - entryPrice) * (log.quantity ?? 0);
+
+        // Close on exchange
+        if (log.exchange === 'PAPER' && log.status === 'FILLED') {
+          try {
+            const { closePosition } = await import('../alpaca/alpacaExchangeService');
+            await closePosition(log.symbol);
+          } catch (closeErr: any) {
+            console.warn(`[Monitor] Failed to close ${log.symbol} on Alpaca:`, closeErr?.message);
+          }
+        }
+
         await prisma.autoTradeLog.create({
           data: {
             userSettingsId,
-            sessionId: log.sessionId,
-            phase: 'EXIT',
-            exchange: log.exchange,
-            symbol: log.symbol,
+            sessionId:  log.sessionId ?? '',
+            phase:      'EXIT',
+            exchange:   log.exchange,
+            symbol:     log.symbol,
             assetClass: log.assetClass,
-            action: 'SELL',
-            status: log.dryRun ? 'DRY_RUN' : 'FILLED',
-            dryRun: log.dryRun,
-            quantity: log.quantity,
+            action:     'SELL',
+            status:     log.status === 'DRY_RUN' ? 'DRY_RUN' : 'FILLED',
+            dryRun:     log.dryRun,
+            quantity:   log.quantity,
             entryPrice: log.entryPrice,
-            exitPrice: currentPrice,
-            pnl,
-            reason: exitReason,
-            metadata: JSON.parse(JSON.stringify({ entryLogId: log.id, currentPrice, hitTP, hitSL })),
+            exitPrice:  currentPrice,
+            pnl:        dollarPnl,
+            stopLoss:   effectiveStop,
+            reason:     exitReason,
           },
         });
 
         await prisma.autoTradeLog.update({
           where: { id: log.id },
-          data: { status: 'CLOSED', exitPrice: currentPrice, pnl },
+          data:  { status: 'CLOSED', exitPrice: currentPrice, pnl: dollarPnl, reason: exitReason },
         });
 
-        console.log(`[AutoTrader] ${exitReason} for ${log.symbol} @ ${currentPrice} | PnL: $${pnl.toFixed(2)}`);
+        const { default: telegramService } = await import('../notifications/TelegramService');
+        telegramService.notify({
+          type:   'TRADE_CLOSED',
+          ticker: log.symbol,
+          data: {
+            ticker:      log.symbol,
+            closeReason: exitReason,
+            pnl:         dollarPnl.toFixed(2),
+            pnlPct:      pnlPct.toFixed(2),
+            holdDays:    Math.floor((Date.now() - new Date(log.executedAt).getTime()) / 86_400_000),
+            exchange:    log.exchange,
+          },
+        }, userSettingsId).catch(() => {});
+
+        console.info(`[Monitor] ${exitReason}: ${log.symbol} @ $${currentPrice.toFixed(2)} | P&L: ${pnlPct.toFixed(2)}% ($${dollarPnl.toFixed(2)})`);
 
         const nyHourNow = getNYHour();
         if (nyHourNow >= 9 && nyHourNow < 15) {
@@ -110,8 +215,8 @@ async function monitorOpenAutoTrades(userSettingsId: string, config: AutoTradeCo
           }, 30_000);
         }
       }
-    } catch (err) {
-      console.error(`[AutoTrader] Monitor error for ${log.symbol}:`, err instanceof Error ? err.message : err);
+    } catch (err: any) {
+      console.warn(`[Monitor] Error checking ${log.symbol}:`, err?.message);
     }
   }
 }

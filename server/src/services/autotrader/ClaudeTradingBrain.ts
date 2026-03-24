@@ -45,12 +45,16 @@ async function buildContext(
     }),
     prisma.autoTradeLog.findMany({
       where:  { phase: 'ENTRY', status: { in: ['FILLED', 'DRY_RUN'] } },
-      select: { symbol: true, entryPrice: true, convictionScore: true },
+      select: {
+        symbol: true, entryPrice: true, convictionScore: true,
+        holdWindowDays: true, holdUntil: true, exitCondition: true,
+        executedAt: true, highWaterMark: true,
+      } as any,
       take:   20,
     }),
   ]);
 
-  const openSymbols = openPositions.map(p => p.symbol);
+  const openSymbols = openPositions.map((p: any) => p.symbol);
 
   return `You are the autonomous trading brain for RIA BOT, an AI trading platform. You make final trade decisions with full accountability.
 
@@ -62,7 +66,14 @@ Recent SPY drawdown: ${(regime as any)?.spyRecentDrawdown?.toFixed(1) ?? '0'}%
 ## PORTFOLIO STATE
 Total equity: $${portfolio?.totalEquity?.toFixed(2) ?? 'N/A'}
 Open positions: ${portfolio?.openPositionCount ?? 0} | Today's P&L: ${portfolio?.dailyPnl !== undefined ? (portfolio.dailyPnl >= 0 ? '+' : '') + '$' + portfolio.dailyPnl.toFixed(2) : 'N/A'}
-Currently holding: ${openSymbols.length > 0 ? openSymbols.join(', ') : 'nothing'}
+Currently holding:
+${openPositions.length > 0
+  ? (openPositions as any[]).map((p: any) => {
+      const daysHeld = Math.floor((Date.now() - new Date(p.executedAt).getTime()) / 86_400_000);
+      const daysLeft = p.holdWindowDays ? p.holdWindowDays - daysHeld : '?';
+      return `  ${p.symbol} — day ${daysHeld + 1} of ${p.holdWindowDays ?? '?'} | ${daysLeft} days remaining`;
+    }).join('\n')
+  : '  nothing open'}
 
 ## RECENT TRADE HISTORY (last 7 days)
 ${recentTrades.length === 0

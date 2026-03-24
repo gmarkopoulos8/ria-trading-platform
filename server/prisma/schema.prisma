@@ -861,6 +861,13 @@ model AutoTradeLog {
   circuitBreakerReason  String?
   positionSizePct       Float?
   convictionScore       Float?
+  holdWindowDays        Int?
+  holdUntil             DateTime?
+  exitCondition         String?
+  isIntraday            Boolean   @default(false)
+  trailingStopPct       Float?
+  highWaterMark         Float?
+  dollarAmount          Float?
   metadata              Json?
   executedAt            DateTime @default(now())
 

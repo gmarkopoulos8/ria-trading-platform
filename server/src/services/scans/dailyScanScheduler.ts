@@ -1,6 +1,5 @@
 import { runDailyScan } from './dailyScanOrchestrator';
 import { runAutonomousCycle } from '../autotrader/AutonomousExecutor';
-import { closeAllPositions } from '../alpaca/alpacaExchangeService';
 import { hasAlpacaCredentials } from '../alpaca/alpacaConfig';
 import telegramService from '../notifications/TelegramService';
 import { prisma } from '../../lib/prisma';
@@ -48,31 +47,126 @@ function isEndOfDayTime(date: Date): boolean {
 }
 
 async function runEndOfDay(): Promise<void> {
-  console.log('[Scheduler] End-of-day routine starting');
+  console.log('[Scheduler] Smart EOD — closing intraday positions only');
 
-  if (hasAlpacaCredentials()) {
-    try {
-      const { closed, errors } = await closeAllPositions();
-      console.log(`[Scheduler] EOD: closed ${closed} positions, ${errors.length} errors`);
-      if (errors.length > 0) console.warn('[Scheduler] EOD close errors:', errors);
-    } catch (err: any) {
-      console.error('[Scheduler] EOD close all failed:', err?.message);
-    }
+  if (!hasAlpacaCredentials()) {
+    console.log('[Scheduler] EOD: Alpaca not connected — skipping');
+    await telegramService.sendDailySummary().catch(() => {});
+    console.log('[Scheduler] End-of-day routine complete');
+    return;
   }
 
   try {
-    const today = new Date();
-    today.setHours(0, 0, 0, 0);
-    await prisma.autoTradeLog.updateMany({
-      where: { exchange: 'PAPER', status: 'FILLED', phase: 'ENTRY', executedAt: { gte: today } },
-      data:  { status: 'CLOSED', exitPrice: 0, reason: 'EOD_FORCED_CLOSE' },
-    });
+    const { getPositions } = await import('../alpaca/alpacaInfoService');
+    const { closePosition } = await import('../alpaca/alpacaExchangeService');
+    const alpacaPositions = await getPositions();
+
+    if (!alpacaPositions || alpacaPositions.length === 0) {
+      console.log('[Scheduler] EOD: No open positions');
+    } else {
+      let closedCount = 0;
+      let heldCount   = 0;
+
+      for (const pos of alpacaPositions) {
+        const symbol = (pos as any).symbol;
+
+        const tradeLog = await prisma.autoTradeLog.findFirst({
+          where: {
+            symbol,
+            exchange: 'PAPER',
+            status:   { in: ['FILLED', 'DRY_RUN'] },
+            phase:    'ENTRY',
+          },
+          orderBy: { executedAt: 'desc' },
+        });
+
+        const currentPrice = parseFloat((pos as any).current_price ?? '0');
+        const entryPrice   = parseFloat((pos as any).avg_entry_price ?? '0');
+        const pnlPct       = entryPrice > 0 ? ((currentPrice - entryPrice) / entryPrice) * 100 : 0;
+
+        const shouldClose = determineEODClose(tradeLog, pos, pnlPct);
+
+        if (shouldClose.close) {
+          console.log(`[EOD] Closing ${symbol}: ${shouldClose.reason}`);
+          try {
+            await closePosition(symbol);
+            closedCount++;
+
+            if (tradeLog) {
+              const dollarPnl = (pnlPct / 100) * parseFloat((pos as any).market_value ?? '0');
+              await prisma.autoTradeLog.update({
+                where: { id: tradeLog.id },
+                data:  { status: 'CLOSED', exitPrice: currentPrice, pnl: dollarPnl, reason: shouldClose.reason },
+              });
+            }
+          } catch (err: any) {
+            console.warn(`[EOD] Failed to close ${symbol}:`, err?.message);
+          }
+        } else {
+          console.log(`[EOD] Holding ${symbol}: ${shouldClose.reason} | P&L: ${pnlPct.toFixed(2)}%`);
+          heldCount++;
+
+          if (tradeLog && currentPrice > ((tradeLog as any).highWaterMark ?? 0)) {
+            await prisma.autoTradeLog.update({
+              where: { id: tradeLog.id },
+              data:  { highWaterMark: currentPrice } as any,
+            });
+          }
+        }
+      }
+
+      console.log(`[Scheduler] EOD complete: ${closedCount} closed, ${heldCount} held overnight`);
+    }
   } catch (err: any) {
-    console.warn('[Scheduler] EOD log cleanup error:', err?.message);
+    console.error('[Scheduler] EOD error:', err?.message);
   }
 
   await telegramService.sendDailySummary().catch(() => {});
   console.log('[Scheduler] End-of-day routine complete');
+}
+
+function determineEODClose(
+  tradeLog: any,
+  position: any,
+  pnlPct: number,
+): { close: boolean; reason: string } {
+  if (tradeLog?.exchange === 'HYPERLIQUID') {
+    return { close: true, reason: 'EOD_INTRADAY: Hyperliquid funding cost' };
+  }
+
+  if (tradeLog?.isIntraday === true) {
+    return { close: true, reason: 'EOD_INTRADAY: marked as intraday setup' };
+  }
+
+  if (!tradeLog || (tradeLog as any).holdWindowDays === 1) {
+    return { close: true, reason: 'EOD_INTRADAY: 1-day hold window' };
+  }
+
+  if (tradeLog?.stopLoss && tradeLog?.entryPrice) {
+    const maxStopDist = Math.abs(tradeLog.entryPrice - tradeLog.stopLoss);
+    const currentPx   = tradeLog.entryPrice * (1 + pnlPct / 100);
+    const currentDist = Math.abs(currentPx - tradeLog.entryPrice);
+    const stopUsed    = maxStopDist > 0 ? currentDist / maxStopDist : 0;
+    if (pnlPct < 0 && stopUsed > 0.6) {
+      return { close: true, reason: `EOD_THESIS_BROKEN: down ${Math.abs(pnlPct).toFixed(1)}% (>60% of stop used)` };
+    }
+  }
+
+  if ((tradeLog as any).holdUntil) {
+    if (new Date() > new Date((tradeLog as any).holdUntil)) {
+      return { close: true, reason: `EOD_HOLD_EXPIRED: hold window of ${(tradeLog as any).holdWindowDays} days elapsed` };
+    }
+  }
+
+  const strategy = tradeLog?.metadata?.claudeDecision?.strategy
+    ?? tradeLog?.metadata?.optionsRecommendation?.strategy;
+  if (['IRON_CONDOR', 'CASH_SECURED_PUT', 'COVERED_CALL', 'BEAR_PUT_SPREAD'].includes(strategy)) {
+    return { close: false, reason: `HOLD: options strategy ${strategy} — theta decay needs time` };
+  }
+
+  const holdDays = (tradeLog as any).holdWindowDays ?? 5;
+  const daysHeld = Math.floor((Date.now() - new Date(tradeLog.executedAt).getTime()) / 86_400_000);
+  return { close: false, reason: `HOLD: ${holdDays}-day setup, day ${daysHeld + 1} of ${holdDays}` };
 }
 
 async function schedulerTick() {

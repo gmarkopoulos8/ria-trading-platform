@@ -150,23 +150,45 @@ function AccountPanel({ status }: { status: any }) {
       </div>
 
       {alpacaPositions.length > 0 && (
-        <div className="space-y-1">
-          {alpacaPositions.slice(0, 6).map((p: any) => (
-            <div key={p.id} className={cn(
-              'flex items-center gap-2 text-xs px-3 py-2 rounded-lg border',
-              (p.unrealizedPnl ?? 0) >= 0 ? 'bg-emerald-500/5 border-emerald-500/15' : 'bg-red-500/5 border-red-500/15',
-            )}>
-              <span className={cn('text-[10px] font-bold px-1.5 py-0.5 rounded',
-                p.strategy === 'IRON_CONDOR' || p.strategy === 'CSP' ? 'bg-violet-500/20 text-violet-300' : 'bg-blue-500/20 text-blue-300')}>
-                {p.strategy ?? 'LONG'}
-              </span>
-              <span className="font-mono font-bold text-white w-14">{p.symbol}</span>
-              <span className="text-slate-500 flex-1">{p.entryPrice ? `@${fmt$(p.entryPrice)}` : ''}</span>
-              <span className={cn('font-mono font-bold', (p.unrealizedPnl ?? 0) >= 0 ? 'text-emerald-400' : 'text-red-400')}>
-                {p.unrealizedPnl != null ? fmt$(p.unrealizedPnl) : '—'}
-              </span>
-            </div>
-          ))}
+        <div className="space-y-1.5">
+          {alpacaPositions.slice(0, 6).map((p: any) => {
+            const daysHeld   = p.executedAt ? Math.floor((Date.now() - new Date(p.executedAt).getTime()) / 86_400_000) : 0;
+            const holdDays   = p.holdWindowDays ?? 1;
+            const progress   = Math.min(100, (daysHeld / holdDays) * 100);
+            const isOvernight = holdDays > 1;
+            return (
+              <div key={p.id} className={cn(
+                'px-3 py-2.5 rounded-xl border text-xs space-y-1.5',
+                (p.unrealizedPnl ?? 0) >= 0 ? 'bg-emerald-500/5 border-emerald-500/15' : 'bg-red-500/5 border-red-500/15',
+              )}>
+                <div className="flex items-center gap-2">
+                  <span className={cn('text-[10px] font-bold px-1.5 py-0.5 rounded flex-shrink-0',
+                    isOvernight ? 'bg-violet-500/20 text-violet-300' : 'bg-blue-500/20 text-blue-300')}>
+                    {isOvernight ? `${holdDays}D` : 'INTRADAY'}
+                  </span>
+                  <span className="font-mono font-bold text-white">{p.symbol}</span>
+                  <span className="text-slate-500 flex-1">{p.entryPrice ? `@${fmt$(p.entryPrice)}` : ''}</span>
+                  <span className={cn('font-mono font-bold', (p.unrealizedPnl ?? 0) >= 0 ? 'text-emerald-400' : 'text-red-400')}>
+                    {p.unrealizedPnl != null ? fmt$(p.unrealizedPnl) : '—'}
+                  </span>
+                </div>
+                {isOvernight && (
+                  <div className="flex items-center gap-2">
+                    <div className="flex-1 h-1 bg-surface-3 rounded-full overflow-hidden">
+                      <div className="h-full bg-violet-500/60 rounded-full transition-all" style={{ width: `${progress}%` }} />
+                    </div>
+                    <span className="text-[10px] text-slate-500 flex-shrink-0">Day {daysHeld + 1}/{holdDays}</span>
+                    {p.stopLoss && (
+                      <span className="text-[10px] text-red-400/70 flex-shrink-0">Stop {fmt$(p.stopLoss)}</span>
+                    )}
+                  </div>
+                )}
+                {p.exitCondition && (
+                  <p className="text-[10px] text-slate-600 truncate">Exit if: {p.exitCondition}</p>
+                )}
+              </div>
+            );
+          })}
         </div>
       )}
 
