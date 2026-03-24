@@ -22,6 +22,7 @@ import { api } from '../../api/client';
 import { useAuth } from '../../contexts/AuthContext';
 
 const navItems = [
+  { path: '/mission-control', label: 'Mission Control', icon: Bot, description: 'One-button autonomous trading' },
   { path: '/dashboard', label: 'Dashboard', icon: LayoutDashboard, description: 'Market overview' },
   { path: '/daily-scan', label: 'Daily Scan', icon: Radar, description: 'Ranked universe · top 100' },
   { path: '/stock-health', label: 'Stock Health', icon: HeartPulse, description: 'NYSE health analyzer' },

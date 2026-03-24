@@ -1,0 +1,729 @@
+# Replit Agent Prompt — Mission Control: One-Button Autonomous Trading
+
+Build the "Mission Control" page — a single screen where the user clicks one button to start fully autonomous trading. Claude picks the stocks, crypto, and options. Everything runs without human intervention. This replaces the AutoTrader page as the primary interface.
+
+Also fix the remaining gaps: crypto routing for Alpaca, missing autonomousDisable route, and the `autoTradeEnabled` field in the autonomous toggle logic.
+
+---
+
+## WHAT'S ALREADY WORKING (do not rebuild)
+- `ClaudeTradingBrain.ts` — fully wired, makes all trade decisions ✅
+- `AutonomousExecutor.ts` — runs the cycle for all users with autonomousMode=true ✅
+- `dailyScanScheduler.ts` — triggers scan + autonomous cycle at 9:30 AM ET ✅
+- EOD close at 3:45 PM + Telegram summary at 4 PM ✅
+- Alpaca stock execution, stop/target monitor ✅
+- Intraday monitor loop (minute-level) ✅
+- Regime detector with correct thresholds ✅
+
+## WHAT NEEDS FIXING
+
+### Gap 1 — Crypto symbols fail on Alpaca
+Crypto assets (BTC, ETH, SOL, etc.) from the scan go to `PAPER` exchange → Alpaca. Alpaca crypto uses different symbols (`BTC/USD` not `BTC`) and `ioc` not `day` time-in-force. The current code sends `BTC` as a stock order and Alpaca rejects it.
+
+### Gap 2 — `autonomousDisable` route missing from `autotrader.ts`
+The `/autonomous/disable` route doesn't exist. The UI disable button would 404.
+
+### Gap 3 — Autonomous enable doesn't set `autoTradeEnabled: true`
+Setting `autonomousMode: true` without `autoTradeEnabled: true` means the executor finds no qualifying users. Both fields need to be set together.
+
+### Gap 4 — No unified "GO" interface
+The user has to: run a scan, then enable autotrader, then enable autonomous mode, then run a cycle. There's no single button that starts the whole thing.
+
+---
+
+## FIX 1 — Crypto Routing in Alpaca
+
+**File**: `server/src/services/alpaca/alpacaExchangeService.ts`
+
+Add a helper at the top of the file:
+```typescript
+// Alpaca crypto symbols use / separator and ioc time-in-force
+function toAlpacaCryptoSymbol(symbol: string): string {
+  const map: Record<string, string> = {
+    'BTC': 'BTC/USD', 'ETH': 'ETH/USD', 'SOL': 'SOL/USD', 'DOGE': 'DOGE/USD',
+    'AVAX': 'AVAX/USD', 'LINK': 'LINK/USD', 'XRP': 'XRP/USD', 'DOT': 'DOT/USD',
+    'ADA': 'ADA/USD', 'MATIC': 'MATIC/USD', 'ATOM': 'ATOM/USD', 'NEAR': 'NEAR/USD',
+    'APT': 'APT/USD', 'ARB': 'ARB/USD', 'OP': 'OP/USD', 'INJ': 'INJ/USD',
+    'BNB': 'BNB/USD', 'LTC': 'LTC/USD', 'UNI': 'UNI/USD',
+  };
+  return map[symbol.toUpperCase()] ?? `${symbol.toUpperCase()}/USD`;
+}
+
+const CRYPTO_SYMBOLS = new Set([
+  'BTC','ETH','SOL','DOGE','AVAX','LINK','XRP','DOT','ADA','MATIC',
+  'ATOM','NEAR','APT','ARB','OP','INJ','BNB','LTC','UNI',
+]);
+
+export function isCryptoSymbol(symbol: string): boolean {
+  return CRYPTO_SYMBOLS.has(symbol.toUpperCase()) || symbol.includes('/');
+}
+```
+
+In the `placeOrder` function, add crypto detection right after `const body: Record<string, unknown> = {`:
+
+```typescript
+// Detect crypto and adjust symbol + time_in_force
+const isCrypto = isCryptoSymbol(req.symbol);
+const finalSymbol = isCrypto ? toAlpacaCryptoSymbol(req.symbol) : req.symbol;
+
+const body: Record<string, unknown> = {
+  symbol:          finalSymbol,         // ← use finalSymbol not req.symbol
+  side:            req.side,
+  type:            req.type,
+  time_in_force:   isCrypto ? 'ioc' : (req.timeInForce ?? 'day'),  // ← crypto uses ioc
+  client_order_id: clientOrderId,
+  extended_hours:  req.extendedHours ?? false,
+};
+```
+
+Also update the log records to use `finalSymbol`:
+```typescript
+// In both the dryRun log and the real order log, change:
+symbol: req.symbol
+// to:
+symbol: finalSymbol,
+```
+
+---
+
+## FIX 2 — Add Missing Routes to autotrader.ts
+
+**File**: `server/src/routes/autotrader.ts`
+
+The `/autonomous/disable` route is missing. Also add a `/mission-control/status` route that returns everything the Mission Control page needs in one call.
+
+Find the `/autonomous/enable` route and add immediately after it:
+
+```typescript
+router.post('/autonomous/disable', async (req: Request, res: Response) => {
+  try {
+    const userId   = req.session!.userId as string;
+    const settings = await getUserSettings(userId);
+    await prisma.userSettings.update({
+      where: { id: settings.id },
+      data: {
+        autonomousMode:   false,
+        autoTradeEnabled: false,
+      } as any,
+    });
+    res.json({ success: true, data: { autonomousMode: false, autoTradeEnabled: false } });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err instanceof Error ? err.message : 'Disable failed' });
+  }
+});
+```
+
+Fix `/autonomous/enable` to also set `autoTradeEnabled: true`:
+
+Find in `/autonomous/enable`:
+```typescript
+data: {
+  autonomousMode:          true,
+  autoTradeEnabled:        true,    // ← make sure this line is present
+```
+
+Add the Mission Control status route before `export default router`:
+
+```typescript
+// GET — everything Mission Control needs in one request
+router.get('/mission-control', async (req: Request, res: Response) => {
+  try {
+    const userId   = req.session!.userId as string;
+    const settings = await getUserSettings(userId);
+
+    // Reload Alpaca credentials if needed
+    let alpacaConnected = hasAlpacaCredentials();
+    if (!alpacaConnected) {
+      try {
+        const { credentialService } = await import('../services/credentials/CredentialService');
+        const creds = await credentialService.getAlpacaCredentials(userId);
+        if (creds) { setAlpacaRuntimeCredentials(creds); alpacaConnected = true; }
+      } catch { /* non-fatal */ }
+    }
+
+    const [regime, portfolio, latestScan, recentLogs, signals] = await Promise.allSettled([
+      import('../services/market/RegimeDetector').then(m => m.detectRegime()),
+      import('../services/portfolio/PortfolioStateService').then(m => m.getPortfolioState()),
+      prisma.dailyScanRun.findFirst({
+        where: { status: 'COMPLETED' },
+        orderBy: { completedAt: 'desc' },
+        select: { id: true, completedAt: true, resultCount: true, runType: true },
+      }),
+      prisma.autoTradeLog.findMany({
+        where:   { userSettingsId: settings.id },
+        orderBy: { executedAt: 'desc' },
+        take:    10,
+        select:  { symbol: true, status: true, exchange: true, entryPrice: true,
+                   exitPrice: true, pnl: true, executedAt: true, reason: true,
+                   convictionScore: true, assetClass: true },
+      }),
+      buildSignalsFromLatestScan({
+        minConvictionScore: Math.max(60, ((settings as any).autonomousMinConviction ?? 75) - 10),
+        minConfidenceScore: 55,
+        allowedBiases:      ['BULLISH', 'BEARISH', 'NEUTRAL'],
+        maxSymbols:         8,
+      }).catch(() => []),
+    ]);
+
+    const todayStart = new Date();
+    todayStart.setHours(0, 0, 0, 0);
+    const todayStats = await prisma.autoTradeLog.aggregate({
+      where: { userSettingsId: settings.id, executedAt: { gte: todayStart } },
+      _count: { id: true },
+      _sum:   { pnl: true },
+    });
+
+    res.json({
+      success: true,
+      data: {
+        // Mode state
+        autonomousMode:          (settings as any).autonomousMode          ?? false,
+        autoTradeEnabled:        settings.autoTradeEnabled,
+        autonomousMinConviction: (settings as any).autonomousMinConviction ?? 75,
+        autonomousMaxPositions:  (settings as any).autonomousMaxPositions  ?? 3,
+        autonomousCapitalPct:    (settings as any).autonomousCapitalPct    ?? 5.0,
+        lastAutonomousRun:       (settings as any).lastAutonomousRun       ?? null,
+        dryRun:                  getAlpacaCredentials()?.dryRun ?? true,
+
+        // Connections
+        alpacaConnected,
+
+        // Market
+        regime:    regime.status === 'fulfilled' ? regime.value : null,
+        portfolio: portfolio.status === 'fulfilled' ? portfolio.value : null,
+
+        // Scan
+        latestScan: latestScan.status === 'fulfilled' ? latestScan.value : null,
+
+        // Signals
+        signals: signals.status === 'fulfilled' ? signals.value : [],
+
+        // Performance
+        todayTrades: todayStats._count.id,
+        todayPnl:    todayStats._sum.pnl ?? 0,
+        recentLogs:  recentLogs.status === 'fulfilled' ? recentLogs.value : [],
+      },
+    });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err instanceof Error ? err.message : 'Mission control status failed' });
+  }
+});
+```
+
+**File**: `client/src/api/client.ts`
+
+In `autotrader` section add:
+```typescript
+autonomousDisable:  () => post('/autotrader/autonomous/disable', {}),
+missionControl:     () => get('/autotrader/mission-control'),
+```
+
+---
+
+## FIX 3 — Mission Control Page
+
+**File**: `client/src/pages/MissionControl.tsx` (NEW FILE)
+
+```tsx
+import { useState, useEffect } from 'react';
+import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
+import { toast } from 'sonner';
+import {
+  Bot, Power, PowerOff, RefreshCw, Brain, TrendingUp, TrendingDown,
+  DollarSign, Activity, Shield, Zap, Clock, CheckCircle2, XCircle,
+  AlertOctagon, BarChart3, Globe, Play, StopCircle,
+} from 'lucide-react';
+import { cn } from '../lib/utils';
+import { api } from '../api/client';
+import { Card } from '../components/ui/Card';
+
+const fmtDollar = (n: number) => {
+  const abs = Math.abs(n);
+  const s   = abs >= 1000 ? `$${(abs / 1000).toFixed(1)}k` : `$${abs.toFixed(2)}`;
+  return n < 0 ? `-${s}` : s;
+};
+
+const fmtPct = (n: number) => `${n >= 0 ? '+' : ''}${n.toFixed(2)}%`;
+
+const REGIME_COLORS: Record<string, string> = {
+  BULL_TREND:          'text-emerald-400 bg-emerald-500/15 border-emerald-500/30',
+  CHOPPY:              'text-amber-400 bg-amber-500/15 border-amber-500/30',
+  ELEVATED_VOLATILITY: 'text-orange-400 bg-orange-500/15 border-orange-500/30',
+  BEAR_CRISIS:         'text-red-400 bg-red-500/15 border-red-500/30',
+};
+
+const ASSET_COLORS: Record<string, string> = {
+  stock:  'bg-blue-500/20 text-blue-300',
+  crypto: 'bg-violet-500/20 text-violet-300',
+  etf:    'bg-cyan-500/20 text-cyan-300',
+};
+
+export default function MissionControl() {
+  const qc = useQueryClient();
+  const [showAdvanced, setShowAdvanced] = useState(false);
+  const [minConviction, setMinConviction] = useState(75);
+  const [maxPositions, setMaxPositions]   = useState(3);
+  const [capitalPct, setCapitalPct]       = useState(5.0);
+
+  const { data: raw, isLoading, refetch } = useQuery({
+    queryKey:        ['mission-control'],
+    queryFn:         () => (api.autotrader as any).missionControl().then((r: any) => r.data),
+    refetchInterval: 15_000,
+    staleTime:       10_000,
+  });
+  const d = raw as any;
+
+  useEffect(() => {
+    if (d) {
+      setMinConviction(d.autonomousMinConviction ?? 75);
+      setMaxPositions(d.autonomousMaxPositions  ?? 3);
+      setCapitalPct(d.autonomousCapitalPct      ?? 5.0);
+    }
+  }, [d?.autonomousMinConviction, d?.autonomousMaxPositions, d?.autonomousCapitalPct]);
+
+  const isActive = !!(d?.autonomousMode && d?.autoTradeEnabled);
+
+  const enableMut = useMutation({
+    mutationFn: () => (api.autotrader as any).autonomousEnable({
+      minConviction, maxPositions, capitalPct,
+    }),
+    onSuccess: () => {
+      toast.success('🤖 Autonomous trading started — Claude is now in control');
+      qc.invalidateQueries({ queryKey: ['mission-control'] });
+    },
+    onError: (e: any) => toast.error(e?.response?.data?.error ?? 'Failed to start'),
+  });
+
+  const disableMut = useMutation({
+    mutationFn: () => (api.autotrader as any).autonomousDisable(),
+    onSuccess: () => {
+      toast.info('Autonomous trading stopped');
+      qc.invalidateQueries({ queryKey: ['mission-control'] });
+    },
+    onError: (e: any) => toast.error(e?.response?.data?.error ?? 'Failed to stop'),
+  });
+
+  const runNowMut = useMutation({
+    mutationFn: () => (api.autotrader as any).autonomousRun(),
+    onSuccess: (r: any) => {
+      const placed = r?.data?.tradesPlaced ?? 0;
+      toast.success(placed > 0 ? `✅ ${placed} trade${placed !== 1 ? 's' : ''} placed` : 'Cycle complete — no trades this run');
+      qc.invalidateQueries({ queryKey: ['mission-control'] });
+    },
+    onError: (e: any) => toast.error(e?.response?.data?.error ?? 'Cycle failed'),
+  });
+
+  const scanMut = useMutation({
+    mutationFn: () => api.scans.trigger({ force: true }),
+    onSuccess: () => {
+      toast.success('Scan started — takes 2–3 minutes');
+      setTimeout(() => qc.invalidateQueries({ queryKey: ['mission-control'] }), 180_000);
+    },
+    onError: () => toast.error('Scan failed to start'),
+  });
+
+  if (isLoading) {
+    return (
+      <div className="flex items-center justify-center h-64">
+        <div className="text-center space-y-3">
+          <RefreshCw className="h-8 w-8 animate-spin text-violet-400 mx-auto" />
+          <p className="text-slate-500 text-sm">Loading Mission Control…</p>
+        </div>
+      </div>
+    );
+  }
+
+  const regime    = d?.regime;
+  const portfolio = d?.portfolio;
+  const signals   = d?.signals ?? [];
+  const logs      = d?.recentLogs ?? [];
+  const regimeKey = regime?.regime ?? 'UNKNOWN';
+  const regimeCls = REGIME_COLORS[regimeKey] ?? 'text-slate-400 bg-surface-2 border-surface-border';
+
+  return (
+    <div className="min-h-screen p-6 space-y-6 max-w-[1200px] mx-auto">
+
+      {/* ── Hero header ── */}
+      <div className="text-center space-y-2 pt-4 pb-2">
+        <div className="flex items-center justify-center gap-3 mb-2">
+          <div className={cn(
+            'w-14 h-14 rounded-2xl flex items-center justify-center border-2 transition-all',
+            isActive
+              ? 'bg-violet-500/20 border-violet-500/50 shadow-[0_0_30px_rgba(139,92,246,0.3)]'
+              : 'bg-surface-3 border-surface-border',
+          )}>
+            <Bot className={cn('h-8 w-8', isActive ? 'text-violet-400' : 'text-slate-500')} />
+          </div>
+        </div>
+        <h1 className="text-2xl font-bold text-white tracking-tight">RIA BOT Mission Control</h1>
+        <p className="text-sm text-slate-500">
+          Claude autonomously selects and trades stocks, crypto, and options · Sub-minute execution · Auto stop/target
+        </p>
+      </div>
+
+      {/* ── Big GO button ── */}
+      <div className="flex flex-col items-center gap-4">
+        {!d?.alpacaConnected ? (
+          <div className="w-full max-w-sm p-4 bg-red-500/10 border border-red-500/30 rounded-2xl text-center">
+            <p className="text-red-400 font-semibold text-sm mb-1">Alpaca not connected</p>
+            <p className="text-xs text-slate-500">Go to <a href="/settings" className="text-violet-400 underline">Settings → Connections</a> to connect your Alpaca paper account first.</p>
+          </div>
+        ) : isActive ? (
+          <div className="flex flex-col items-center gap-3 w-full max-w-sm">
+            {/* Active pulse ring */}
+            <div className="relative">
+              <div className="absolute inset-0 rounded-full bg-violet-500/20 animate-ping" />
+              <div className="absolute inset-2 rounded-full bg-violet-500/10 animate-ping animation-delay-150" />
+              <button
+                onClick={() => disableMut.mutate()}
+                disabled={disableMut.isPending}
+                className="relative w-36 h-36 rounded-full bg-red-500/20 border-2 border-red-500/50 text-red-300 font-bold text-lg flex flex-col items-center justify-center gap-1 hover:bg-red-500/30 transition-all disabled:opacity-50 shadow-lg"
+              >
+                {disableMut.isPending ? <RefreshCw className="h-8 w-8 animate-spin" /> : <StopCircle className="h-8 w-8" />}
+                <span className="text-sm">STOP</span>
+              </button>
+            </div>
+            <div className="flex items-center gap-2 text-xs text-violet-400">
+              <div className="w-2 h-2 rounded-full bg-violet-400 animate-pulse" />
+              <span className="font-semibold">CLAUDE IS TRADING</span>
+              {d?.dryRun && <span className="text-slate-500 font-normal">· DRY RUN</span>}
+            </div>
+            <button
+              onClick={() => runNowMut.mutate()}
+              disabled={runNowMut.isPending}
+              className="flex items-center gap-2 px-4 py-2 text-xs text-slate-400 border border-surface-border rounded-xl hover:text-white hover:border-violet-500/40 transition-colors disabled:opacity-50"
+            >
+              {runNowMut.isPending ? <RefreshCw className="h-3 w-3 animate-spin" /> : <Play className="h-3 w-3" />}
+              {runNowMut.isPending ? 'Running cycle…' : 'Run cycle now'}
+            </button>
+          </div>
+        ) : (
+          <div className="flex flex-col items-center gap-4 w-full max-w-sm">
+            <button
+              onClick={() => enableMut.mutate()}
+              disabled={enableMut.isPending || !d?.alpacaConnected}
+              className="w-36 h-36 rounded-full bg-violet-600/20 border-2 border-violet-500/50 text-violet-300 font-bold text-lg flex flex-col items-center justify-center gap-1 hover:bg-violet-600/40 hover:shadow-[0_0_40px_rgba(139,92,246,0.4)] transition-all disabled:opacity-40 shadow-lg"
+            >
+              {enableMut.isPending ? <RefreshCw className="h-8 w-8 animate-spin" /> : <Power className="h-8 w-8" />}
+              <span className="text-sm">{enableMut.isPending ? 'Starting…' : 'GO'}</span>
+            </button>
+            <p className="text-xs text-slate-600 text-center">
+              Click GO to start autonomous trading.<br />Claude will scan, select, and execute trades automatically.
+            </p>
+          </div>
+        )}
+
+        {/* Advanced settings */}
+        <button
+          onClick={() => setShowAdvanced(!showAdvanced)}
+          className="text-xs text-slate-600 hover:text-slate-400 transition-colors"
+        >
+          {showAdvanced ? '▲ Hide settings' : '▼ Configure parameters'}
+        </button>
+
+        {showAdvanced && (
+          <div className="w-full max-w-md p-4 bg-surface-2 border border-surface-border rounded-2xl space-y-4">
+            <p className="text-xs font-semibold text-slate-400 uppercase tracking-wider">Trading Parameters</p>
+            {[
+              { label: 'Min conviction score', value: minConviction, set: setMinConviction, min: 60, max: 95, step: 1, fmt: (v: number) => `${v}/100` },
+              { label: 'Max positions', value: maxPositions, set: setMaxPositions, min: 1, max: 10, step: 1, fmt: (v: number) => `${v} trades` },
+              { label: 'Capital per trade', value: capitalPct, set: setCapitalPct, min: 0.5, max: 20, step: 0.5, fmt: (v: number) => `${v}% of portfolio` },
+            ].map(({ label, value, set, min, max, step, fmt }) => (
+              <div key={label}>
+                <div className="flex justify-between mb-1.5">
+                  <span className="text-xs text-slate-400">{label}</span>
+                  <span className="text-xs font-mono text-white">{fmt(value)}</span>
+                </div>
+                <input
+                  type="range" min={min} max={max} step={step} value={value}
+                  onChange={e => set(Number(e.target.value))}
+                  className="w-full accent-violet-500"
+                />
+              </div>
+            ))}
+            <p className="text-[10px] text-slate-600">These apply on the next GO — changes take effect immediately when active.</p>
+          </div>
+        )}
+      </div>
+
+      {/* ── Status row ── */}
+      <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
+        {[
+          {
+            label: 'Portfolio',
+            value: portfolio ? fmtDollar(portfolio.totalEquity) : '—',
+            sub:   portfolio ? `${fmtDollar(portfolio.dailyPnl)} today` : '',
+            icon:  <DollarSign className="h-4 w-4" />,
+            color: 'text-cyan-400',
+          },
+          {
+            label: 'Market Regime',
+            value: regimeKey.replace('_', ' '),
+            sub:   regime?.vix ? `VIX ${regime.vix.toFixed(1)}` : 'VIX N/A',
+            icon:  <Globe className="h-4 w-4" />,
+            color: regimeKey === 'BULL_TREND' ? 'text-emerald-400' : regimeKey === 'BEAR_CRISIS' ? 'text-red-400' : 'text-amber-400',
+          },
+          {
+            label: "Today's Trades",
+            value: d?.todayTrades ?? 0,
+            sub:   d?.todayPnl !== undefined ? `${fmtDollar(d.todayPnl)} P&L` : '',
+            icon:  <Activity className="h-4 w-4" />,
+            color: 'text-blue-400',
+          },
+          {
+            label: 'Signals Ready',
+            value: signals.length,
+            sub:   d?.latestScan ? `Scan ${new Date(d.latestScan.completedAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}` : 'No scan yet',
+            icon:  <Brain className="h-4 w-4" />,
+            color: 'text-violet-400',
+          },
+        ].map(({ label, value, sub, icon, color }) => (
+          <Card key={label} className="p-3">
+            <div className={cn('flex items-center gap-2 mb-1', color)}>
+              {icon}
+              <span className="text-[10px] font-semibold uppercase tracking-wider text-slate-500">{label}</span>
+            </div>
+            <p className={cn('text-xl font-bold font-mono', color)}>{value}</p>
+            {sub && <p className="text-[10px] text-slate-500 mt-0.5">{sub}</p>}
+          </Card>
+        ))}
+      </div>
+
+      {/* ── Signals + Scan ── */}
+      <div className="grid grid-cols-1 lg:grid-cols-2 gap-5">
+
+        {/* Signals */}
+        <Card className="p-4">
+          <div className="flex items-center justify-between mb-3">
+            <div className="flex items-center gap-2">
+              <Zap className="h-4 w-4 text-amber-400" />
+              <h3 className="text-sm font-bold text-white">Claude's Candidates</h3>
+              <span className="text-[10px] text-slate-500">{signals.length} qualifying signals</span>
+            </div>
+            <button
+              onClick={() => scanMut.mutate()}
+              disabled={scanMut.isPending}
+              className="flex items-center gap-1.5 px-2.5 py-1.5 text-xs text-slate-400 border border-surface-border rounded-lg hover:text-white hover:border-violet-500/40 transition-colors disabled:opacity-50"
+            >
+              {scanMut.isPending ? <RefreshCw className="h-3 w-3 animate-spin" /> : <RefreshCw className="h-3 w-3" />}
+              {scanMut.isPending ? 'Scanning…' : 'New Scan'}
+            </button>
+          </div>
+
+          {signals.length === 0 ? (
+            <div className="text-center py-8 space-y-2">
+              <Brain className="h-8 w-8 text-slate-700 mx-auto" />
+              <p className="text-sm text-slate-500">No signals yet</p>
+              <p className="text-xs text-slate-600">Run a scan or wait for the 9:30 AM automatic scan</p>
+            </div>
+          ) : (
+            <div className="space-y-1.5">
+              {signals.map((s: any) => {
+                const cv = s.convictionScore ?? 0;
+                const barColor = cv >= 80 ? 'bg-emerald-500' : cv >= 70 ? 'bg-blue-500' : 'bg-amber-500';
+                const assetCls = ASSET_COLORS[s.assetClass?.toLowerCase() ?? 'stock'] ?? ASSET_COLORS.stock;
+                return (
+                  <div key={s.symbol} className="flex items-center gap-3 p-2.5 rounded-xl bg-surface-2 border border-surface-border hover:border-violet-500/20 transition-colors">
+                    <span className={cn('text-[10px] font-bold px-1.5 py-0.5 rounded', assetCls)}>
+                      {s.assetClass?.toUpperCase().slice(0, 5) ?? 'STK'}
+                    </span>
+                    <span className="font-mono font-bold text-white w-14 text-sm">{s.symbol}</span>
+                    <div className="flex-1">
+                      <div className="h-1.5 bg-surface-3 rounded-full">
+                        <div className={cn('h-full rounded-full transition-all', barColor)} style={{ width: `${cv}%` }} />
+                      </div>
+                    </div>
+                    <span className="text-xs font-mono text-white w-8 text-right">{cv}</span>
+                    <span className={cn('text-[10px] px-1.5 py-0.5 rounded font-semibold',
+                      s.bias === 'BULLISH' ? 'bg-emerald-500/20 text-emerald-400' :
+                      s.bias === 'BEARISH' ? 'bg-red-500/20 text-red-400' :
+                      'bg-slate-700 text-slate-400')}>
+                      {s.bias?.slice(0, 4)}
+                    </span>
+                    {s.entryPrice && (
+                      <span className="text-[10px] text-slate-500 font-mono">${s.entryPrice.toFixed(2)}</span>
+                    )}
+                  </div>
+                );
+              })}
+            </div>
+          )}
+        </Card>
+
+        {/* Recent trades */}
+        <Card className="p-4">
+          <div className="flex items-center gap-2 mb-3">
+            <Clock className="h-4 w-4 text-slate-500" />
+            <h3 className="text-sm font-bold text-white">Recent Trades</h3>
+            <button onClick={() => refetch()} className="ml-auto text-slate-600 hover:text-slate-400">
+              <RefreshCw className="h-3 w-3" />
+            </button>
+          </div>
+
+          {logs.length === 0 ? (
+            <div className="text-center py-8 text-slate-600 text-xs">
+              No trades yet — click GO to start
+            </div>
+          ) : (
+            <div className="space-y-1.5">
+              {logs.map((log: any, i: number) => {
+                const pnl  = log.pnl ?? null;
+                const open = !log.exitPrice && log.status !== 'CLOSED';
+                return (
+                  <div key={i} className={cn(
+                    'flex items-center gap-2 text-xs p-2.5 rounded-xl border',
+                    pnl !== null && pnl >= 0 ? 'bg-emerald-500/5 border-emerald-500/15' :
+                    pnl !== null && pnl < 0  ? 'bg-red-500/5 border-red-500/15' :
+                    'bg-surface-2 border-surface-border',
+                  )}>
+                    <span className={cn('text-[10px] font-bold px-1.5 py-0.5 rounded',
+                      log.status === 'FILLED'  ? 'bg-emerald-500/20 text-emerald-400' :
+                      log.status === 'DRY_RUN' ? 'bg-violet-500/20 text-violet-400' :
+                      log.status === 'CLOSED'  ? 'bg-slate-700 text-slate-400' :
+                      'bg-amber-500/20 text-amber-400')}>
+                      {log.status}
+                    </span>
+                    <span className="font-mono font-bold text-white w-14">{log.symbol}</span>
+                    {log.entryPrice && <span className="text-slate-400">${log.entryPrice.toFixed(2)}</span>}
+                    {pnl !== null && (
+                      <span className={cn('font-mono font-bold ml-auto', pnl >= 0 ? 'text-emerald-400' : 'text-red-400')}>
+                        {pnl >= 0 ? '+' : ''}{fmtDollar(pnl)}
+                      </span>
+                    )}
+                    {open && <span className="text-violet-400 ml-auto text-[10px]">OPEN</span>}
+                    <span className="text-slate-600 text-[10px]">
+                      {log.executedAt ? new Date(log.executedAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : ''}
+                    </span>
+                  </div>
+                );
+              })}
+            </div>
+          )}
+        </Card>
+      </div>
+
+      {/* ── How it works (shown when inactive) ── */}
+      {!isActive && (
+        <Card className="p-5">
+          <h3 className="text-sm font-bold text-white mb-3 flex items-center gap-2">
+            <Shield className="h-4 w-4 text-violet-400" /> How autonomous trading works
+          </h3>
+          <div className="grid grid-cols-1 md:grid-cols-3 gap-4 text-xs">
+            {[
+              {
+                icon: '🔍',
+                title: '9:30 AM — Claude scans',
+                body: 'Every weekday, RIA BOT scans 80+ stocks and 16 crypto assets. Claude analyzes technical structure, news catalysts, and risk for each one.',
+              },
+              {
+                icon: '🧠',
+                title: 'Claude decides what to buy',
+                body: 'Claude reviews all qualifying signals with full market context — regime, VIX, your portfolio concentration — and selects the best trades with adjusted position sizes and stop levels.',
+              },
+              {
+                icon: '⚡',
+                title: 'Sub-minute execution',
+                body: 'Approved trades execute on Alpaca immediately. The intraday monitor checks every 60 seconds and closes positions at stop-loss or take-profit automatically.',
+              },
+              {
+                icon: '📊',
+                title: '3:45 PM — Close all',
+                body: 'All open positions close before market close every day. No overnight risk.',
+              },
+              {
+                icon: '📱',
+                title: '4:00 PM — Daily summary',
+                body: 'Telegram message with every trade placed, P&L for the day, and what Claude is watching for tomorrow.',
+              },
+              {
+                icon: '🛡️',
+                title: 'Circuit breakers',
+                body: 'Hard stops kick in automatically if daily loss exceeds limit or drawdown hits max. Claude is overridden — safety always wins.',
+              },
+            ].map(({ icon, title, body }) => (
+              <div key={title} className="space-y-1.5">
+                <p className="text-base leading-none">{icon}</p>
+                <p className="font-semibold text-slate-300">{title}</p>
+                <p className="text-slate-500 leading-relaxed">{body}</p>
+              </div>
+            ))}
+          </div>
+        </Card>
+      )}
+
+      {/* ── Footer status ── */}
+      <div className="flex items-center justify-between text-[10px] text-slate-700 pb-4">
+        <span>Next scheduled scan: weekdays 9:30 AM ET</span>
+        <span>EOD close: 3:45 PM ET · Telegram summary: 4:00 PM ET</span>
+        {d?.lastAutonomousRun && (
+          <span>Last cycle: {new Date(d.lastAutonomousRun).toLocaleString([], { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' })}</span>
+        )}
+      </div>
+    </div>
+  );
+}
+```
+
+---
+
+## FIX 4 — Add MissionControl to the Router and Sidebar
+
+**File**: `client/src/App.tsx`
+
+Add import:
+```tsx
+import MissionControl from './pages/MissionControl';
+```
+
+Add route (make it the default landing page after login):
+```tsx
+<Route path="/mission-control" element={<MissionControl />} />
+```
+
+Also change the default redirect after login from `/dashboard` to `/mission-control`:
+```tsx
+// Find the default redirect and change to:
+<Route path="/" element={<Navigate to="/mission-control" replace />} />
+```
+
+**File**: `client/src/components/layout/Sidebar.tsx`
+
+Add Mission Control as the first nav item:
+```tsx
+{ path: '/mission-control', label: 'Mission Control', icon: Bot },
+```
+
+Import `Bot` from lucide-react if not already imported.
+
+---
+
+## SUMMARY
+
+### What this builds
+
+**One page. One button.** The user connects Alpaca in Settings, comes to Mission Control, clicks GO. Everything else is automatic.
+
+### Execution schedule (after clicking GO)
+```
+9:15 AM ET  → (optional) premarket scan
+9:30 AM ET  → Full scan → Claude reviews all signals → executes approved trades on Alpaca
+Every 60s   → Intraday monitor checks stops and targets, executes exits
+3:45 PM ET  → Close all open positions
+4:00 PM ET  → Telegram daily summary
+Next day    → Repeat
+```
+
+### What Claude trades
+- **Stocks**: 80+ symbols across tech, semiconductors, healthcare, consumer, energy
+- **Crypto**: BTC, ETH, SOL, DOGE, AVAX, LINK, XRP and 9 others via Alpaca crypto
+- **Options**: Analyzed and recommended for TOS; Alpaca options path available if account is approved
+
+### Files changed
+```
+server/src/services/alpaca/alpacaExchangeService.ts  → crypto symbol routing (BTC→BTC/USD, ioc)
+server/src/routes/autotrader.ts                      → /autonomous/disable, /mission-control
+client/src/api/client.ts                             → autonomousDisable, missionControl
+client/src/pages/MissionControl.tsx                  → NEW — the full page
+client/src/App.tsx                                   → add route, set as default
+client/src/components/layout/Sidebar.tsx             → add nav item
+```

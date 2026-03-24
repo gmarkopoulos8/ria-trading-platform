@@ -15,7 +15,7 @@ import {
 } from '../services/autotrader/ExchangeAutoConfigService';
 import { computeAdaptive, getCachedAdaptive, DEFAULT_BOUNDS, type AdaptiveExchange } from '../services/autotrader/UniversalAdaptiveEngine';
 import { runAutonomousCycle } from '../services/autotrader/AutonomousExecutor';
-import { hasAlpacaCredentials, getAlpacaCredentials } from '../services/alpaca/alpacaConfig';
+import { hasAlpacaCredentials, getAlpacaCredentials, setAlpacaRuntimeCredentials } from '../services/alpaca/alpacaConfig';
 import { scanIntradaySignals } from '../services/autotrader/IntradaySignalEngine';
 import { filterSignalsWithAI } from '../services/autotrader/IntradayAIFilter';
 import { getOpenIntradayPositions } from '../services/autotrader/IntradayTradeManager';
@@ -366,8 +366,11 @@ router.post('/autonomous/disable', async (req: Request, res: Response) => {
   try {
     const userId   = (req as any).session?.userId as string;
     const settings = await getUserSettings(userId);
-    await prisma.userSettings.update({ where: { id: settings.id }, data: { autonomousMode: false } });
-    res.json({ success: true, data: { autonomousMode: false } });
+    await prisma.userSettings.update({
+      where: { id: settings.id },
+      data: { autonomousMode: false, autoTradeEnabled: false } as any,
+    });
+    res.json({ success: true, data: { autonomousMode: false, autoTradeEnabled: false } });
   } catch (err) {
     res.status(500).json({ success: false, error: err instanceof Error ? err.message : 'Disable failed' });
   }
@@ -684,6 +687,77 @@ Approve max 3 trades. Reject if: regime is BEAR_CRISIS, conviction < 68, or obvi
         error: err?.message,
       },
     });
+  }
+});
+
+router.get('/mission-control', async (req: Request, res: Response) => {
+  try {
+    const userId   = (req as any).session?.userId as string;
+    const settings = await getUserSettings(userId);
+
+    let alpacaConnected = hasAlpacaCredentials();
+    if (!alpacaConnected) {
+      try {
+        const { credentialService } = await import('../services/credentials/CredentialService');
+        const creds = await credentialService.getAlpacaCredentials(userId);
+        if (creds) { setAlpacaRuntimeCredentials(creds); alpacaConnected = true; }
+      } catch { /* non-fatal */ }
+    }
+
+    const [regime, portfolio, latestScan, recentLogs, signals] = await Promise.allSettled([
+      import('../services/market/RegimeDetector').then(m => m.detectRegime()),
+      import('../services/portfolio/PortfolioStateService').then(m => m.getPortfolioState()),
+      prisma.dailyScanRun.findFirst({
+        where: { status: 'COMPLETED' },
+        orderBy: { completedAt: 'desc' },
+        select: { id: true, completedAt: true, resultCount: true, runType: true },
+      }),
+      prisma.autoTradeLog.findMany({
+        where:   { userSettingsId: settings.id },
+        orderBy: { executedAt: 'desc' },
+        take:    10,
+        select:  { symbol: true, status: true, exchange: true, entryPrice: true,
+                   exitPrice: true, pnl: true, executedAt: true, reason: true,
+                   convictionScore: true, assetClass: true },
+      }),
+      buildSignalsFromLatestScan({
+        minConvictionScore: Math.max(60, ((settings as any).autonomousMinConviction ?? 75) - 10),
+        minConfidenceScore: 55,
+        allowedBiases:      ['BULLISH', 'BEARISH', 'NEUTRAL'],
+        maxSymbols:         8,
+      }).catch(() => []),
+    ]);
+
+    const todayStart = new Date();
+    todayStart.setHours(0, 0, 0, 0);
+    const todayStats = await prisma.autoTradeLog.aggregate({
+      where: { userSettingsId: settings.id, executedAt: { gte: todayStart } },
+      _count: { id: true },
+      _sum:   { pnl: true },
+    });
+
+    res.json({
+      success: true,
+      data: {
+        autonomousMode:          (settings as any).autonomousMode          ?? false,
+        autoTradeEnabled:        settings.autoTradeEnabled,
+        autonomousMinConviction: (settings as any).autonomousMinConviction ?? 75,
+        autonomousMaxPositions:  (settings as any).autonomousMaxPositions  ?? 3,
+        autonomousCapitalPct:    (settings as any).autonomousCapitalPct    ?? 5.0,
+        lastAutonomousRun:       (settings as any).lastAutonomousRun       ?? null,
+        dryRun:                  getAlpacaCredentials()?.dryRun ?? true,
+        alpacaConnected,
+        regime:    regime.status    === 'fulfilled' ? regime.value    : null,
+        portfolio: portfolio.status === 'fulfilled' ? portfolio.value : null,
+        latestScan: latestScan.status === 'fulfilled' ? latestScan.value : null,
+        signals:   signals.status   === 'fulfilled' ? signals.value   : [],
+        todayTrades: todayStats._count.id,
+        todayPnl:    todayStats._sum.pnl ?? 0,
+        recentLogs:  recentLogs.status === 'fulfilled' ? recentLogs.value : [],
+      },
+    });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err instanceof Error ? err.message : 'Mission control status failed' });
   }
 });
 

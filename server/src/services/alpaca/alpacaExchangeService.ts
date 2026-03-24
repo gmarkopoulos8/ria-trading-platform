@@ -7,6 +7,26 @@ import {
 } from './alpacaConfig';
 import { prisma } from '../../lib/prisma';
 
+function toAlpacaCryptoSymbol(symbol: string): string {
+  const map: Record<string, string> = {
+    'BTC': 'BTC/USD', 'ETH': 'ETH/USD', 'SOL': 'SOL/USD', 'DOGE': 'DOGE/USD',
+    'AVAX': 'AVAX/USD', 'LINK': 'LINK/USD', 'XRP': 'XRP/USD', 'DOT': 'DOT/USD',
+    'ADA': 'ADA/USD', 'MATIC': 'MATIC/USD', 'ATOM': 'ATOM/USD', 'NEAR': 'NEAR/USD',
+    'APT': 'APT/USD', 'ARB': 'ARB/USD', 'OP': 'OP/USD', 'INJ': 'INJ/USD',
+    'BNB': 'BNB/USD', 'LTC': 'LTC/USD', 'UNI': 'UNI/USD',
+  };
+  return map[symbol.toUpperCase()] ?? `${symbol.toUpperCase()}/USD`;
+}
+
+const CRYPTO_SYMBOLS = new Set([
+  'BTC','ETH','SOL','DOGE','AVAX','LINK','XRP','DOT','ADA','MATIC',
+  'ATOM','NEAR','APT','ARB','OP','INJ','BNB','LTC','UNI',
+]);
+
+export function isCryptoSymbol(symbol: string): boolean {
+  return CRYPTO_SYMBOLS.has(symbol.toUpperCase()) || symbol.includes('/');
+}
+
 export interface AlpacaOrderRequest {
   symbol: string;
   qty?: number;
@@ -52,13 +72,16 @@ export async function placeOrder(req: AlpacaOrderRequest): Promise<AlpacaOrderRe
   const clientOrderId = `riabot-${uuidv4().slice(0, 8)}`;
   const submittedAt = new Date();
 
+  const isCrypto = isCryptoSymbol(req.symbol);
+  const finalSymbol = isCrypto ? toAlpacaCryptoSymbol(req.symbol) : req.symbol;
+
   const body: Record<string, unknown> = {
-    symbol: req.symbol,
-    side: req.side,
-    type: req.type,
-    time_in_force: req.timeInForce ?? 'day',
+    symbol:          finalSymbol,
+    side:            req.side,
+    type:            req.type,
+    time_in_force:   isCrypto ? 'ioc' : (req.timeInForce ?? 'day'),
     client_order_id: clientOrderId,
-    extended_hours: req.extendedHours ?? false,
+    extended_hours:  isCrypto ? false : (req.extendedHours ?? false),
   };
 
   if (req.qty != null)      body.qty = String(req.qty);
@@ -76,14 +99,14 @@ export async function placeOrder(req: AlpacaOrderRequest): Promise<AlpacaOrderRe
     await prisma.alpacaOrderLog.create({
       data: {
         userId:       req.userId ?? 'system',
-        symbol:       req.symbol,
+        symbol:       finalSymbol,
         side:         req.side,
         orderType:    req.type,
         qty:          req.qty != null ? String(req.qty) : null,
         notional:     req.notional != null ? String(req.notional) : null,
         limitPrice:   req.limitPrice != null ? String(req.limitPrice) : null,
         stopPrice:    req.stopPrice != null ? String(req.stopPrice) : null,
-        timeInForce:  req.timeInForce ?? 'day',
+        timeInForce:  isCrypto ? 'ioc' : (req.timeInForce ?? 'day'),
         orderClass:   req.orderClass ?? null,
         clientOrderId,
         status:       'dry_run',
@@ -105,14 +128,14 @@ export async function placeOrder(req: AlpacaOrderRequest): Promise<AlpacaOrderRe
     await prisma.alpacaOrderLog.create({
       data: {
         userId:        req.userId ?? 'system',
-        symbol:        req.symbol,
+        symbol:        finalSymbol,
         side:          req.side,
         orderType:     req.type,
         qty:           req.qty != null ? String(req.qty) : null,
         notional:      req.notional != null ? String(req.notional) : null,
         limitPrice:    req.limitPrice != null ? String(req.limitPrice) : null,
         stopPrice:     req.stopPrice != null ? String(req.stopPrice) : null,
-        timeInForce:   req.timeInForce ?? 'day',
+        timeInForce:   isCrypto ? 'ioc' : (req.timeInForce ?? 'day'),
         orderClass:    req.orderClass ?? null,
         alpacaOrderId: data.id,
         clientOrderId: data.client_order_id ?? clientOrderId,
@@ -136,7 +159,7 @@ export async function placeOrder(req: AlpacaOrderRequest): Promise<AlpacaOrderRe
     await prisma.alpacaOrderLog.create({
       data: {
         userId:       req.userId ?? 'system',
-        symbol:       req.symbol,
+        symbol:       finalSymbol,
         side:         req.side,
         orderType:    req.type,
         qty:          req.qty != null ? String(req.qty) : null,

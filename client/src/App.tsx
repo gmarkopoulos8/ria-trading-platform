@@ -19,6 +19,7 @@ import ScanReport from './pages/ScanReport';
 import ScanHistory from './pages/ScanHistory';
 import AutoTrader from './pages/AutoTrader';
 import AlpacaDashboard from './pages/alpaca/AlpacaDashboard';
+import MissionControl from './pages/MissionControl';
 import Login from './pages/Login';
 import Register from './pages/Register';
 
@@ -37,7 +38,8 @@ export default function App() {
             </ProtectedRoute>
           }
         >
-          <Route index element={<Navigate to="/dashboard" replace />} />
+          <Route index element={<Navigate to="/mission-control" replace />} />
+          <Route path="mission-control" element={<MissionControl />} />
           <Route path="dashboard" element={<Dashboard />} />
           <Route path="scanner" element={<OpportunityScanner />} />
           <Route path="symbol/:symbol?" element={<SymbolIntelligence />} />
@@ -58,7 +60,7 @@ export default function App() {
           <Route path="alpaca" element={<AlpacaDashboard />} />
         </Route>
 
-        <Route path="*" element={<Navigate to="/dashboard" replace />} />
+        <Route path="*" element={<Navigate to="/mission-control" replace />} />
       </Routes>
     </AuthProvider>
   );

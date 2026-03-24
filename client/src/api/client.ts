@@ -240,6 +240,7 @@ export const api = {
     autonomousDisable: () => post('/autotrader/autonomous/disable', {}),
     autonomousRun:     () => post('/autotrader/autonomous/run', {}),
     autonomousStatus:  () => get('/autotrader/autonomous/status'),
+    missionControl:    () => get('/autotrader/mission-control'),
     intradaySignals: (withAI = true) => get(`/autotrader/intraday/signals?ai=${withAI}`),
     intradayPositions: () => get('/autotrader/intraday/positions'),
     intradayRun: (params?: { maxSignals?: number; dryRun?: boolean }) => post('/autotrader/intraday/run', params ?? {}),
