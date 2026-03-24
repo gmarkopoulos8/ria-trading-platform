@@ -704,7 +704,7 @@ router.get('/mission-control', async (req: Request, res: Response) => {
       } catch { /* non-fatal */ }
     }
 
-    const [regime, portfolio, latestScan, recentLogs, signals] = await Promise.allSettled([
+    const [regime, portfolio, latestScan, recentLogs, signals, alpacaPositions] = await Promise.allSettled([
       import('../services/market/RegimeDetector').then(m => m.detectRegime()),
       import('../services/portfolio/PortfolioStateService').then(m => m.getPortfolioState()),
       prisma.dailyScanRun.findFirst({
@@ -726,6 +726,31 @@ router.get('/mission-control', async (req: Request, res: Response) => {
         allowedBiases:      ['BULLISH', 'BEARISH', 'NEUTRAL'],
         maxSymbols:         8,
       }).catch(() => []),
+      (async () => {
+        if (!hasAlpacaCredentials()) return { positions: [], account: null };
+        try {
+          const { getPositions, getAccount } = await import('../services/alpaca/alpacaInfoService');
+          const [positions, account] = await Promise.all([getPositions(), getAccount()]);
+          return {
+            positions: (positions ?? []).map((p: any) => ({
+              symbol:          p.symbol,
+              side:            p.side,
+              qty:             parseFloat(p.qty ?? '0'),
+              entryPrice:      parseFloat(p.avg_entry_price ?? '0'),
+              currentPrice:    parseFloat(p.current_price ?? '0'),
+              unrealizedPl:    parseFloat(p.unrealized_pl ?? '0'),
+              unrealizedPlPct: parseFloat(p.unrealized_plpc ?? '0') * 100,
+              marketValue:     parseFloat(p.market_value ?? '0'),
+            })),
+            account: {
+              equity:      parseFloat(account.equity      ?? '0'),
+              buyingPower: parseFloat(account.buying_power ?? '0'),
+              cash:        parseFloat(account.cash        ?? '0'),
+              lastEquity:  parseFloat(account.last_equity ?? account.equity ?? '0'),
+            },
+          };
+        } catch { return { positions: [], account: null }; }
+      })(),
     ]);
 
     const todayStart = new Date();
@@ -750,7 +775,8 @@ router.get('/mission-control', async (req: Request, res: Response) => {
         regime:    regime.status    === 'fulfilled' ? regime.value    : null,
         portfolio: portfolio.status === 'fulfilled' ? portfolio.value : null,
         latestScan: latestScan.status === 'fulfilled' ? latestScan.value : null,
-        signals:   signals.status   === 'fulfilled' ? signals.value   : [],
+        signals:    signals.status    === 'fulfilled' ? signals.value    : [],
+        alpacaData: alpacaPositions.status === 'fulfilled' ? alpacaPositions.value : null,
         todayTrades: todayStats._count.id,
         todayPnl:    todayStats._sum.pnl ?? 0,
         recentLogs:  recentLogs.status === 'fulfilled' ? recentLogs.value : [],

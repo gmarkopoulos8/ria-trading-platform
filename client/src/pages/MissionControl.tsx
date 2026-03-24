@@ -203,58 +203,153 @@ export default function MissionControl() {
         )}
       </div>
 
-      {/* ── Stats row ── */}
-      <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
-        <Card className="p-4 space-y-1">
-          <p className="text-xs text-slate-500 flex items-center gap-1"><Activity className="h-3 w-3" /> Today's Trades</p>
-          <p className="text-2xl font-bold text-white">{d?.todayTrades ?? 0}</p>
-        </Card>
-        <Card className="p-4 space-y-1">
-          <p className="text-xs text-slate-500 flex items-center gap-1"><DollarSign className="h-3 w-3" /> Today's P&amp;L</p>
-          <p className={cn('text-2xl font-bold', (d?.todayPnl ?? 0) >= 0 ? 'text-emerald-400' : 'text-red-400')}>
-            {fmtDollar(d?.todayPnl ?? 0)}
-          </p>
-        </Card>
-        <Card className="p-4 space-y-1">
-          <p className="text-xs text-slate-500 flex items-center gap-1"><BarChart3 className="h-3 w-3" /> Signals Ready</p>
-          <p className="text-2xl font-bold text-white">{signals.length}</p>
-        </Card>
-        <Card className={cn('p-4 space-y-1 border', regimeCls)}>
-          <p className="text-xs opacity-70 flex items-center gap-1"><Globe className="h-3 w-3" /> Market Regime</p>
-          <p className="text-sm font-bold">{(regimeKey).replace('_', ' ')}</p>
-          {regime?.vix && <p className="text-xs opacity-60">VIX {regime.vix.toFixed(1)}</p>}
-        </Card>
-      </div>
+      {/* ── Alpaca Account Panel ── */}
+      {(() => {
+        const alpaca   = (d?.alpacaData as any) ?? null;
+        const account  = alpaca?.account ?? null;
+        const positions: any[] = alpaca?.positions ?? [];
+        const totalUnrealized = positions.reduce((s: number, p: any) => s + (p.unrealizedPl ?? 0), 0);
+        const dayPnl = account ? account.equity - account.lastEquity : 0;
 
-      {/* ── Portfolio summary ── */}
-      {portfolio && (
-        <Card className="p-4">
-          <div className="flex items-center gap-2 mb-3">
-            <Shield className="h-4 w-4 text-slate-400" />
-            <span className="text-sm font-semibold text-white">Portfolio</span>
-          </div>
-          <div className="grid grid-cols-2 md:grid-cols-4 gap-4 text-sm">
-            <div>
-              <p className="text-slate-500 text-xs">Equity</p>
-              <p className="font-semibold text-white">{fmtDollar(portfolio.equity ?? 0)}</p>
+        return (
+          <Card className={cn('p-4 border', isActive ? 'border-violet-500/20' : 'border-surface-border')}>
+            <div className="flex items-center gap-2 mb-4">
+              <BarChart3 className="h-4 w-4 text-violet-400" />
+              <h3 className="text-sm font-bold text-white">Alpaca Paper Account</h3>
+              {d?.dryRun && (
+                <span className="text-[10px] px-2 py-0.5 rounded-full bg-violet-500/20 text-violet-400 border border-violet-500/20 font-semibold">
+                  DRY RUN
+                </span>
+              )}
             </div>
-            <div>
-              <p className="text-slate-500 text-xs">Cash</p>
-              <p className="font-semibold text-white">{fmtDollar(portfolio.cash ?? 0)}</p>
-            </div>
-            <div>
-              <p className="text-slate-500 text-xs">Open Positions</p>
-              <p className="font-semibold text-white">{portfolio.openPositions ?? 0}</p>
-            </div>
-            <div>
-              <p className="text-slate-500 text-xs">Unrealized P&amp;L</p>
-              <p className={cn('font-semibold', (portfolio.unrealizedPnl ?? 0) >= 0 ? 'text-emerald-400' : 'text-red-400')}>
-                {fmtDollar(portfolio.unrealizedPnl ?? 0)}
+
+            {!d?.alpacaConnected ? (
+              <p className="text-xs text-slate-500 text-center py-4">
+                Connect Alpaca in <a href="/settings" className="text-violet-400 underline">Settings → Connections</a>
               </p>
+            ) : (
+              <>
+                <div className="grid grid-cols-2 md:grid-cols-4 gap-3 mb-4">
+                  {[
+                    {
+                      label: 'Account Equity',
+                      value: account ? fmtDollar(account.equity) : '—',
+                      sub:   dayPnl !== 0 ? `${dayPnl >= 0 ? '+' : ''}${fmtDollar(dayPnl)} today` : 'vs yesterday',
+                      color: 'text-white',
+                      subColor: dayPnl >= 0 ? 'text-emerald-400' : 'text-red-400',
+                    },
+                    {
+                      label: 'Buying Power',
+                      value: account ? fmtDollar(account.buyingPower) : '—',
+                      sub:   'available to deploy',
+                      color: 'text-cyan-400',
+                      subColor: 'text-slate-500',
+                    },
+                    {
+                      label: 'Open Positions',
+                      value: positions.length,
+                      sub:   positions.length > 0 ? `${fmtDollar(totalUnrealized)} unrealized` : 'no open trades',
+                      color: positions.length > 0 ? 'text-violet-400' : 'text-slate-500',
+                      subColor: totalUnrealized >= 0 ? 'text-emerald-400' : 'text-red-400',
+                    },
+                    {
+                      label: 'Unrealized P&L',
+                      value: positions.length > 0 ? fmtDollar(totalUnrealized) : '—',
+                      sub:   positions.length > 0
+                        ? `${positions.filter((p: any) => p.unrealizedPl >= 0).length} winning · ${positions.filter((p: any) => p.unrealizedPl < 0).length} losing`
+                        : 'no positions',
+                      color: totalUnrealized >= 0 ? 'text-emerald-400' : 'text-red-400',
+                      subColor: 'text-slate-500',
+                    },
+                  ].map(({ label, value, sub, color, subColor }) => (
+                    <div key={label} className="p-3 bg-surface-2 rounded-xl border border-surface-border">
+                      <p className="text-[10px] text-slate-500 uppercase tracking-wider mb-1">{label}</p>
+                      <p className={cn('text-lg font-bold font-mono', color)}>{value}</p>
+                      <p className={cn('text-[10px] mt-0.5', subColor)}>{sub}</p>
+                    </div>
+                  ))}
+                </div>
+
+                {positions.length > 0 && (
+                  <div className="space-y-1">
+                    <p className="text-[10px] text-slate-500 uppercase tracking-wider mb-2">Open Positions</p>
+                    {positions.map((p: any) => (
+                      <div key={p.symbol} className={cn(
+                        'flex items-center gap-3 text-xs px-3 py-2 rounded-lg border',
+                        p.unrealizedPl >= 0
+                          ? 'bg-emerald-500/5 border-emerald-500/15'
+                          : 'bg-red-500/5 border-red-500/15',
+                      )}>
+                        <span className={cn(
+                          'text-[10px] font-bold px-1.5 py-0.5 rounded',
+                          p.side === 'long' ? 'bg-emerald-500/20 text-emerald-400' : 'bg-red-500/20 text-red-400',
+                        )}>
+                          {p.side?.toUpperCase()}
+                        </span>
+                        <span className="font-mono font-bold text-white w-16">{p.symbol}</span>
+                        <span className="text-slate-400">{p.qty.toFixed(p.qty < 1 ? 4 : 2)} @ {fmtDollar(p.entryPrice)}</span>
+                        <span className="text-slate-500">→ {fmtDollar(p.currentPrice)}</span>
+                        <span className="text-slate-500 flex-1">{fmtDollar(p.marketValue)}</span>
+                        <span className={cn('font-mono font-bold', p.unrealizedPl >= 0 ? 'text-emerald-400' : 'text-red-400')}>
+                          {fmtPct(p.unrealizedPlPct)}
+                        </span>
+                        <span className={cn('font-mono text-[10px] w-16 text-right font-bold',
+                          p.unrealizedPl >= 0 ? 'text-emerald-400' : 'text-red-400')}>
+                          {p.unrealizedPl >= 0 ? '+' : ''}{fmtDollar(p.unrealizedPl)}
+                        </span>
+                      </div>
+                    ))}
+                  </div>
+                )}
+
+                {positions.length === 0 && isActive && (
+                  <p className="text-xs text-slate-600 text-center py-2">
+                    No open positions — Claude will deploy capital at next qualifying signal
+                  </p>
+                )}
+              </>
+            )}
+          </Card>
+        );
+      })()}
+
+      {/* ── Market stats row ── */}
+      <div className="grid grid-cols-2 md:grid-cols-3 gap-3">
+        {[
+          {
+            label: 'Market Regime',
+            value: regimeKey.replace('_', ' '),
+            sub:   regime?.vix ? `VIX ${regime.vix.toFixed(1)}` : 'VIX N/A',
+            icon:  <Globe className="h-4 w-4" />,
+            color: regimeKey === 'BULL_TREND' ? 'text-emerald-400' : regimeKey === 'BEAR_CRISIS' ? 'text-red-400' : 'text-amber-400',
+          },
+          {
+            label: "Today's Trades",
+            value: d?.todayTrades ?? 0,
+            sub:   d?.todayPnl !== undefined ? `${fmtDollar(d.todayPnl)} realized P&L` : '',
+            icon:  <Activity className="h-4 w-4" />,
+            color: 'text-blue-400',
+          },
+          {
+            label: 'Signals Ready',
+            value: signals.length,
+            sub:   d?.latestScan
+              ? `Scan ${new Date(d.latestScan.completedAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}`
+              : 'No scan yet',
+            icon:  <Brain className="h-4 w-4" />,
+            color: 'text-violet-400',
+          },
+        ].map(({ label, value, sub, icon, color }) => (
+          <Card key={label} className="p-3">
+            <div className={cn('flex items-center gap-2 mb-1', color)}>
+              {icon}
+              <span className="text-[10px] font-semibold uppercase tracking-wider text-slate-500">{label}</span>
             </div>
-          </div>
-        </Card>
-      )}
+            <p className={cn('text-xl font-bold font-mono', color)}>{value}</p>
+            {sub && <p className="text-[10px] text-slate-500 mt-0.5">{sub}</p>}
+          </Card>
+        ))}
+      </div>
 
       {/* ── Signals Claude will trade ── */}
       {signals.length > 0 && (
