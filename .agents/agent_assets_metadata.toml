@@ -24,3 +24,9 @@ id = "gmdNdt5MYblSRI8l8PxA-"
 uri = "file://ria-bot-codebase.tar.gz"
 type = "unspecified"
 title = "RIA Bot — Full Codebase (.tar.gz)"
+
+[[outputs]]
+id = "-CfMpePDZFmQzNrfp2jWZ"
+uri = "file://ria-bot-current.tar.gz"
+type = "unspecified"
+title = "ria-bot-current.tar.gz"
