@@ -23,6 +23,7 @@ import autotraderRouter from './routes/autotrader';
 import credentialRouter from './routes/credentials';
 import alpacaRouter from './routes/alpaca';
 import optionsRouter from './routes/options';
+import telegramRouter from './routes/telegram';
 import { errorHandler, notFoundHandler } from './middleware/errorHandler';
 import { monitorAllOpenPositions } from './services/monitoring/PositionMonitor';
 import { startDailyScanScheduler } from './services/scans/dailyScanScheduler';
@@ -134,6 +135,7 @@ app.use('/api/autotrader', autotraderRouter);
 app.use('/api/credentials', credentialRouter);
 app.use('/api/alpaca', alpacaRouter);
 app.use('/api/options', optionsRouter);
+app.use('/api/telegram', telegramRouter);
 
 app.use('/api/*', notFoundHandler);
 
@@ -182,6 +184,24 @@ app.listen(PORT, async () => {
   } catch { /* non-fatal */ }
 
   await loadDefaultCredentials();
+
+  // Auto-register Telegram webhook on startup (if bot is configured)
+  if (process.env.TELEGRAM_BOT_TOKEN && process.env.TELEGRAM_BOT_USERNAME) {
+    setTimeout(async () => {
+      try {
+        const axios = (await import('axios')).default;
+        const webhookUrl = `${process.env.APP_URL ?? 'https://ria-bot.replit.app'}/api/telegram/webhook`;
+        await axios.post(
+          `https://api.telegram.org/bot${process.env.TELEGRAM_BOT_TOKEN}/setWebhook`,
+          { url: webhookUrl, allowed_updates: ['message'] },
+          { timeout: 10_000 }
+        );
+        console.log('   Telegram   : Webhook registered →', webhookUrl);
+      } catch (err: any) {
+        console.warn('[Telegram] Webhook registration failed:', err?.message);
+      }
+    }, 5_000);
+  }
 
   // Reset any scans left in RUNNING state from a previous server instance
   try {

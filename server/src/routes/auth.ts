@@ -1,4 +1,5 @@
 import { Router, Request, Response, NextFunction } from 'express';
+import crypto from 'crypto';
 import { prisma } from '../lib/prisma';
 import { hashPassword, verifyPassword, sanitizeUser } from '../lib/auth';
 import { requireAuth } from '../middleware/requireAuth';
@@ -153,18 +154,81 @@ router.get('/me', requireAuth, (req: Request, res: Response) => {
 
 router.put('/profile', requireAuth, async (req: Request, res: Response, next: NextFunction) => {
   try {
-    const { displayName } = req.body;
+    const { displayName, phoneNumber } = req.body;
     if (displayName !== undefined && (typeof displayName !== 'string' || displayName.trim().length < 1)) {
       return res.status(400).json({ success: false, error: 'Invalid display name' });
     }
     const userId = req.session.userId!;
     const updated = await prisma.user.update({
       where: { id: userId },
-      data: { ...(displayName !== undefined && { displayName: displayName.trim() }) },
+      data: {
+        ...(displayName  !== undefined && { displayName:  displayName.trim() }),
+        ...(phoneNumber  !== undefined && { phoneNumber:  phoneNumber?.trim() || null }),
+      },
     });
     return res.json({ success: true, data: { user: sanitizeUser(updated) } });
   } catch (err) {
     next(err);
+  }
+});
+
+router.get('/notification-settings', requireAuth, async (req: Request, res: Response) => {
+  try {
+    const userId = req.session.userId!;
+    const [settings, user] = await Promise.all([
+      prisma.userSettings.findUnique({
+        where: { userId },
+        select: { telegramChatId: true, telegramEnabled: true, telegramConsent: true, telegramConsentAt: true },
+      }),
+      prisma.user.findUnique({ where: { id: userId }, select: { phoneNumber: true } }),
+    ]);
+    res.json({
+      success: true,
+      data: {
+        phoneNumber:       user?.phoneNumber ?? null,
+        telegramLinked:    !!settings?.telegramChatId,
+        telegramEnabled:   settings?.telegramEnabled  ?? false,
+        telegramConsent:   settings?.telegramConsent  ?? false,
+        telegramConsentAt: settings?.telegramConsentAt ?? null,
+        botConfigured:     !!(process.env.TELEGRAM_BOT_TOKEN && process.env.TELEGRAM_BOT_USERNAME),
+      },
+    });
+  } catch {
+    res.status(500).json({ success: false, error: 'Failed' });
+  }
+});
+
+router.post('/notification-settings/telegram-connect', requireAuth, async (req: Request, res: Response) => {
+  try {
+    const userId = req.session.userId!;
+    if (!process.env.TELEGRAM_BOT_TOKEN || !process.env.TELEGRAM_BOT_USERNAME) {
+      return res.status(400).json({ success: false, error: 'Telegram bot not configured. Set TELEGRAM_BOT_TOKEN and TELEGRAM_BOT_USERNAME in Replit Secrets.' });
+    }
+    const token  = crypto.randomBytes(20).toString('hex');
+    const expiry = new Date(Date.now() + 10 * 60_000);
+    const existing = await prisma.userSettings.findUnique({ where: { userId } });
+    if (!existing) {
+      await prisma.userSettings.create({ data: { userId, telegramConnectToken: token, telegramConnectExpiry: expiry } });
+    } else {
+      await prisma.userSettings.update({ where: { userId }, data: { telegramConnectToken: token, telegramConnectExpiry: expiry } });
+    }
+    const connectUrl = `https://t.me/${process.env.TELEGRAM_BOT_USERNAME}?start=${token}`;
+    res.json({ success: true, data: { connectUrl, expiresAt: expiry } });
+  } catch {
+    res.status(500).json({ success: false, error: 'Failed to generate connect link' });
+  }
+});
+
+router.post('/notification-settings/telegram-disconnect', requireAuth, async (req: Request, res: Response) => {
+  try {
+    const userId = req.session.userId!;
+    await prisma.userSettings.updateMany({
+      where: { userId },
+      data:  { telegramEnabled: false, telegramChatId: null, telegramConsent: false, telegramConsentAt: null },
+    });
+    res.json({ success: true, data: { disconnected: true } });
+  } catch {
+    res.status(500).json({ success: false, error: 'Failed' });
   }
 });
 

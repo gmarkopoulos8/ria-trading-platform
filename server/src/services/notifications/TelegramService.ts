@@ -11,7 +11,7 @@ export interface TelegramMessage {
 }
 
 function getToken(): string | null { return process.env.TELEGRAM_BOT_TOKEN ?? null; }
-function getChatId(): string | null { return process.env.TELEGRAM_CHAT_ID ?? null; }
+function getGlobalChatId(): string | null { return process.env.TELEGRAM_CHAT_ID ?? null; }
 
 export async function sendMessage(chatId: string, text: string, parseMode: 'HTML' | 'Markdown' = 'HTML'): Promise<boolean> {
   const token = getToken();
@@ -68,22 +68,59 @@ function formatMessage(msg: TelegramMessage): string {
   }
 }
 
-export async function notify(message: TelegramMessage): Promise<void> {
-  const chatId = getChatId();
-  if (!chatId) return;
+export async function notify(message: TelegramMessage, userSettingsId?: string): Promise<void> {
+  const token = getToken();
+  if (!token) return;
 
-  // Check notification prefs — load from any active user settings
   try {
-    const settings = await prisma.userSettings.findFirst({ where: { autoTradeEnabled: true } });
-    if (settings?.notificationPrefs) {
-      const prefs = settings.notificationPrefs as Record<string, boolean>;
-      const prefKey = message.type.toLowerCase().replace(/_/g, '');
-      if (prefs[prefKey] === false) return;
-    }
-  } catch { }
+    let chatId: string | null = null;
 
-  const text = formatMessage(message);
-  await sendMessage(chatId, text);
+    if (userSettingsId) {
+      const settings = await prisma.userSettings.findUnique({
+        where: { id: userSettingsId },
+        select: { telegramChatId: true, telegramEnabled: true, telegramConsent: true, notificationPrefs: true },
+      });
+      if (settings?.telegramConsent === false) return;
+      if (settings?.telegramChatId && settings?.telegramEnabled) {
+        chatId = settings.telegramChatId;
+      }
+      if (settings?.notificationPrefs) {
+        const prefs = settings.notificationPrefs as Record<string, boolean>;
+        const prefKey = message.type.toLowerCase().replace(/_/g, '');
+        if (prefs[prefKey] === false) return;
+      }
+    }
+
+    if (!chatId) chatId = getGlobalChatId();
+    if (!chatId) return;
+
+    const text = formatMessage(message);
+    await sendMessage(chatId, text);
+  } catch (err) {
+    console.warn('[Telegram] Notify error:', err instanceof Error ? err.message : err);
+  }
+}
+
+export async function notifyAllConnected(message: TelegramMessage): Promise<void> {
+  const token = getToken();
+  if (!token) return;
+
+  try {
+    const connectedUsers = await prisma.userSettings.findMany({
+      where: { telegramEnabled: true, telegramChatId: { not: null } },
+      select: { id: true, telegramChatId: true },
+    });
+
+    const text = formatMessage(message);
+    await Promise.allSettled(
+      connectedUsers.map(u => sendMessage(u.telegramChatId!, text))
+    );
+
+    const globalId = getGlobalChatId();
+    if (globalId) await sendMessage(globalId, text).catch(() => {});
+  } catch (err) {
+    console.warn('[Telegram] notifyAllConnected error:', err instanceof Error ? err.message : err);
+  }
 }
 
 export async function sendDailySummary(): Promise<void> {
@@ -93,38 +130,49 @@ export async function sendDailySummary(): Promise<void> {
 
     const [placed, closed, pnlAgg] = await Promise.all([
       prisma.autoTradeLog.count({ where: { phase: 'ENTRY', executedAt: { gte: startOfDay } } }),
-      prisma.autoTradeLog.count({ where: { phase: 'EXIT', executedAt: { gte: startOfDay } } }),
+      prisma.autoTradeLog.count({ where: { phase: 'EXIT',  executedAt: { gte: startOfDay } } }),
       prisma.autoTradeLog.aggregate({ where: { phase: 'EXIT', executedAt: { gte: startOfDay } }, _sum: { pnl: true } }),
     ]);
 
-    await notify({
+    const latestRun = await prisma.dailyScanRun.findFirst({ where: { status: 'COMPLETED' }, orderBy: { completedAt: 'desc' } });
+    const topResult = latestRun ? await prisma.dailyScanResult.findFirst({
+      where: { scanRunId: latestRun.id }, orderBy: { convictionScore: 'desc' },
+    }) : null;
+
+    const msg: TelegramMessage = {
       type: 'DAILY_SUMMARY',
       data: {
-        tradesPlaced: placed,
-        tradesClosed: closed,
-        dailyPnl: pnlAgg._sum.pnl ?? 0,
-        tosEquity: '—',
-        hlEquity: '—',
-        tosPositions: 0,
-        hlPositions: 0,
-        topPick: 'N/A',
-        topConviction: 'N/A',
+        tradesPlaced:  placed,
+        tradesClosed:  closed,
+        dailyPnl:      pnlAgg._sum.pnl ?? 0,
+        tosEquity:     '—', hlEquity: '—', tosPositions: 0, hlPositions: 0,
+        topPick:       topResult?.symbol ?? 'None',
+        topConviction: topResult?.convictionScore ?? 'N/A',
         circuitBreakerActive: false,
       },
-    });
+    };
+
+    await notifyAllConnected(msg);
   } catch (err) {
     console.warn('[Telegram] Daily summary error:', err instanceof Error ? err.message : err);
   }
 }
 
-export function getSetupLink(): string {
+export function getConnectLink(token: string): string {
   const botUsername = process.env.TELEGRAM_BOT_USERNAME ?? 'RIABotNotifier';
-  return `https://t.me/${botUsername}?start=setup`;
+  return `https://t.me/${botUsername}?start=${token}`;
 }
 
 export function isConfigured(): boolean {
-  return !!(getToken() && getChatId());
+  return !!getToken();
 }
 
-const telegramService = { notify, sendMessage, sendDailySummary, getSetupLink, isConfigured };
+export function isBotFullyConfigured(): boolean {
+  return !!(getToken() && process.env.TELEGRAM_BOT_USERNAME);
+}
+
+const telegramService = {
+  notify, notifyAllConnected, sendMessage, sendDailySummary,
+  getConnectLink, isConfigured, isBotFullyConfigured,
+};
 export default telegramService;

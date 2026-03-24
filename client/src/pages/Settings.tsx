@@ -1,7 +1,7 @@
 import { useState } from 'react';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { toast } from 'sonner';
-import { User, Lock, Bell, Palette, Info, ChevronRight, FlaskConical, Eye, EyeOff } from 'lucide-react';
+import { User, Lock, Bell, Palette, Info, ChevronRight, FlaskConical, Eye, EyeOff, ExternalLink, CheckCircle2, XCircle, Send } from 'lucide-react';
 import { useAuth } from '../contexts/AuthContext';
 import { api } from '../api/client';
 import { Card } from '../components/ui/Card';
@@ -112,6 +112,120 @@ function AlpacaConnectionSection() {
           >
             {connect.isPending ? 'Connecting…' : 'Connect Alpaca Paper'}
           </button>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function TelegramConnectSection() {
+  const qc = useQueryClient();
+  const [connectUrl, setConnectUrl] = useState<string | null>(null);
+  const [expiresAt, setExpiresAt]   = useState<string | null>(null);
+
+  const { data: ntfData, isLoading } = useQuery({
+    queryKey: ['notification-settings'],
+    queryFn: () => api.auth.notificationSettings(),
+    refetchInterval: 8_000,
+  });
+  const ntf = (ntfData as any)?.data;
+
+  const connectMutation = useMutation({
+    mutationFn: () => api.auth.telegramConnect(),
+    onSuccess: (res: any) => {
+      setConnectUrl(res.data?.connectUrl ?? null);
+      setExpiresAt(res.data?.expiresAt ? new Date(res.data.expiresAt).toLocaleTimeString() : null);
+    },
+    onError: (e: any) => toast.error(e?.response?.data?.error ?? 'Could not generate link'),
+  });
+
+  const disconnectMutation = useMutation({
+    mutationFn: () => api.auth.telegramDisconnect(),
+    onSuccess: () => {
+      toast.success('Telegram disconnected');
+      setConnectUrl(null);
+      qc.invalidateQueries({ queryKey: ['notification-settings'] });
+    },
+    onError: () => toast.error('Disconnect failed'),
+  });
+
+  if (isLoading) return <div className="text-xs text-slate-500 font-mono">Loading…</div>;
+
+  if (!ntf?.botConfigured) {
+    return (
+      <div className="p-4 rounded-lg bg-surface-3 border border-surface-border">
+        <div className="flex items-center gap-2 mb-2">
+          <Send size={15} className="text-slate-400" />
+          <span className="text-sm font-medium text-slate-300">Telegram Alerts</span>
+        </div>
+        <p className="text-xs text-slate-500 leading-relaxed">
+          Telegram is not configured. Ask your admin to set <code className="bg-black/30 px-1 rounded">TELEGRAM_BOT_TOKEN</code> and{' '}
+          <code className="bg-black/30 px-1 rounded">TELEGRAM_BOT_USERNAME</code> in Replit Secrets.
+        </p>
+      </div>
+    );
+  }
+
+  if (ntf?.telegramLinked) {
+    return (
+      <div className="p-4 rounded-lg bg-surface-3 border border-surface-border">
+        <div className="flex items-center justify-between mb-3">
+          <div className="flex items-center gap-2">
+            <Send size={15} className="text-accent-blue" />
+            <span className="text-sm font-medium text-white">Telegram Alerts</span>
+          </div>
+          <div className="flex items-center gap-1.5 px-2 py-0.5 rounded-full bg-emerald-500/10 border border-emerald-500/30">
+            <CheckCircle2 size={11} className="text-emerald-400" />
+            <span className="text-xs text-emerald-400 font-mono">CONNECTED</span>
+          </div>
+        </div>
+        <p className="text-xs text-slate-400 mb-3">
+          {ntf.telegramEnabled ? 'You are receiving trade alerts in Telegram.' : 'Connected but notifications are paused. Use /stop and /start in the bot to toggle.'}
+        </p>
+        <button
+          onClick={() => disconnectMutation.mutate()}
+          disabled={disconnectMutation.isPending}
+          className="flex items-center gap-1.5 text-xs text-red-400 hover:text-red-300 transition-colors disabled:opacity-50"
+        >
+          <XCircle size={13} />
+          {disconnectMutation.isPending ? 'Disconnecting…' : 'Disconnect Telegram'}
+        </button>
+      </div>
+    );
+  }
+
+  return (
+    <div className="p-4 rounded-lg bg-surface-3 border border-surface-border">
+      <div className="flex items-center gap-2 mb-2">
+        <Send size={15} className="text-slate-400" />
+        <span className="text-sm font-medium text-slate-300">Telegram Alerts</span>
+        <span className="text-xs text-slate-600 font-mono">Not connected</span>
+      </div>
+      <p className="text-xs text-slate-500 mb-3 leading-relaxed">
+        Get instant trade alerts, daily summaries, and circuit breaker warnings sent directly to your Telegram.
+      </p>
+      {!connectUrl ? (
+        <button
+          onClick={() => connectMutation.mutate()}
+          disabled={connectMutation.isPending}
+          className="flex items-center gap-2 px-3 py-2 bg-sky-600 hover:bg-sky-500 text-white text-xs rounded-lg transition-colors disabled:opacity-50"
+        >
+          <Send size={13} />
+          {connectMutation.isPending ? 'Generating link…' : 'Connect Telegram'}
+        </button>
+      ) : (
+        <div className="space-y-2">
+          <p className="text-xs text-amber-400 font-mono">Link expires at {expiresAt} — click below to open Telegram:</p>
+          <a
+            href={connectUrl}
+            target="_blank"
+            rel="noopener noreferrer"
+            className="inline-flex items-center gap-2 px-3 py-2 bg-sky-600 hover:bg-sky-500 text-white text-xs rounded-lg transition-colors"
+          >
+            <ExternalLink size={13} />
+            Open in Telegram → press Start
+          </a>
+          <p className="text-xs text-slate-600">This page auto-refreshes when you connect.</p>
         </div>
       )}
     </div>
@@ -334,28 +448,36 @@ export default function Settings() {
           {activeSection === 'notifications' && (
             <Card className="p-5">
               <h2 className="text-sm font-semibold text-white mb-4">Notification Preferences</h2>
-              <div className="space-y-3">
-                {[
-                  { label: 'Stop-loss breach alerts', description: 'When a position hits your stop-loss level', default: true },
-                  { label: 'Target price reached', description: 'When current price meets your target', default: true },
-                  { label: 'High volatility warnings', description: 'Unusual intraday price swings', default: false },
-                  { label: 'Thesis degradation alerts', description: 'When thesis assumptions are invalidated', default: true },
-                  { label: 'Weekly performance digest', description: 'Summary of portfolio performance', default: false },
-                ].map((item) => (
-                  <div key={item.label} className="flex items-center justify-between p-3 rounded-lg bg-surface-3">
-                    <div>
-                      <p className="text-sm text-white font-medium">{item.label}</p>
-                      <p className="text-xs text-slate-500">{item.description}</p>
-                    </div>
-                    <label className="relative inline-flex items-center cursor-pointer">
-                      <input type="checkbox" defaultChecked={item.default} className="sr-only peer" />
-                      <div className="w-9 h-5 bg-surface-border rounded-full peer peer-checked:bg-accent-blue peer-focus:ring-2 peer-focus:ring-accent-blue/30 transition-colors" />
-                      <div className="absolute left-0.5 top-0.5 w-4 h-4 bg-white rounded-full transition-transform peer-checked:translate-x-4" />
-                    </label>
+              <div className="space-y-4">
+                <TelegramConnectSection />
+                <div className="pt-2 border-t border-surface-border">
+                  <p className="text-xs text-slate-400 font-mono uppercase tracking-wide mb-3">Alert types</p>
+                  <div className="space-y-3">
+                    {[
+                      { label: 'Trade placed alerts',       description: 'When an autonomous trade is executed',        default: true  },
+                      { label: 'Position closed alerts',    description: 'When a position is exited or stopped out',    default: true  },
+                      { label: 'Stop-loss breach alerts',   description: 'When a position hits your stop-loss level',   default: true  },
+                      { label: 'Target price reached',      description: 'When current price meets your target',        default: true  },
+                      { label: 'Circuit breaker warnings',  description: 'When autonomous trading is paused',           default: true  },
+                      { label: 'High volatility warnings',  description: 'Unusual intraday price swings',               default: false },
+                      { label: 'Thesis degradation alerts', description: 'When thesis assumptions are invalidated',     default: true  },
+                      { label: 'Weekly performance digest', description: 'Summary of portfolio performance',            default: false },
+                    ].map((item) => (
+                      <div key={item.label} className="flex items-center justify-between p-3 rounded-lg bg-surface-3">
+                        <div>
+                          <p className="text-sm text-white font-medium">{item.label}</p>
+                          <p className="text-xs text-slate-500">{item.description}</p>
+                        </div>
+                        <label className="relative inline-flex items-center cursor-pointer">
+                          <input type="checkbox" defaultChecked={item.default} className="sr-only peer" />
+                          <div className="w-9 h-5 bg-surface-border rounded-full peer peer-checked:bg-accent-blue peer-focus:ring-2 peer-focus:ring-accent-blue/30 transition-colors" />
+                          <div className="absolute left-0.5 top-0.5 w-4 h-4 bg-white rounded-full transition-transform peer-checked:translate-x-4" />
+                        </label>
+                      </div>
+                    ))}
                   </div>
-                ))}
+                </div>
               </div>
-              <p className="text-xs text-slate-600 mt-4 font-mono">Notification preferences are saved locally.</p>
             </Card>
           )}
 

@@ -86,6 +86,9 @@ export const api = {
     }) => post<AuthResponse>('/auth/register', body),
     updateProfile: (body: unknown) => put('/auth/profile', body),
     changePassword: (body: unknown) => put('/auth/password', body),
+    notificationSettings: () => get('/auth/notification-settings'),
+    telegramConnect: () => post('/auth/notification-settings/telegram-connect', {}),
+    telegramDisconnect: () => post('/auth/notification-settings/telegram-disconnect', {}),
   },
 
   market: {

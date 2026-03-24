@@ -14,6 +14,7 @@ model User {
   email        String   @unique
   username     String   @unique
   displayName  String
+  phoneNumber  String?
   passwordHash String
 
   createdAt DateTime @default(now())
@@ -47,6 +48,12 @@ model UserSettings {
   cryptoApiKey         String?
   preferences          Json?
   notificationPrefs    Json?
+  telegramChatId        String?
+  telegramEnabled       Boolean   @default(false)
+  telegramConsent       Boolean   @default(false)
+  telegramConsentAt     DateTime?
+  telegramConnectToken  String?
+  telegramConnectExpiry DateTime?
   autoTradeEnabled        Boolean  @default(false)
   autoTradeConfig         Json?
   autonomousMode          Boolean  @default(false)

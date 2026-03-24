@@ -1,0 +1,804 @@
+# Replit Agent Prompt — Per-User Telegram Connect Flow
+
+Right now `TELEGRAM_CHAT_ID` is a single hardcoded env var — all alerts go to one person. This adds a proper per-user connect flow: each user gets a button that opens Telegram, starts the bot, and automatically links their personal chat ID to their account.
+
+---
+
+## HOW TELEGRAM BOTS WORK (important context)
+
+Telegram bots **cannot** message users by username or phone number. A bot can only message someone after that person has started a conversation with it. The correct flow is:
+
+1. User clicks **"Connect Telegram"** → opens a deep link: `https://t.me/YourBotName?start=TOKEN`
+2. Telegram opens, user hits **Start**
+3. The bot receives a `/start TOKEN` message with the user's chat ID
+4. A webhook on your server receives this, matches the token to the user, saves their `chatId`
+5. Bot sends a confirmation message: "✅ RIA BOT connected! You'll receive trade alerts here."
+6. Done — all future alerts go directly to that user's chat
+
+---
+
+## PART A — Schema Changes
+
+**File**: `server/prisma/schema.prisma`
+
+In `UserSettings`, add these fields after `notificationPrefs`:
+
+```prisma
+telegramChatId        String?
+telegramEnabled       Boolean   @default(false)
+telegramConsent       Boolean   @default(false)
+telegramConsentAt     DateTime?
+telegramConnectToken  String?     // one-time token for the connect flow
+telegramConnectExpiry DateTime?   // token expires after 10 minutes
+```
+
+Also in the `User` model, add after `displayName`:
+```prisma
+phoneNumber  String?
+```
+
+Run migration:
+```
+cd server && npx prisma migrate dev --name add_phone_telegram_per_user
+```
+
+---
+
+## PART B — Telegram Service: Per-User Chat IDs
+
+**File**: `server/src/services/notifications/TelegramService.ts`
+
+Replace `getChatId()` and `notify()` to support per-user chat IDs:
+
+```typescript
+function getToken(): string | null { return process.env.TELEGRAM_BOT_TOKEN ?? null; }
+// Global fallback chat ID (admin's chat — used if user hasn't connected)
+function getGlobalChatId(): string | null { return process.env.TELEGRAM_CHAT_ID ?? null; }
+
+// Send to a specific chat ID
+export async function sendMessage(chatId: string, text: string, parseMode: 'HTML' | 'Markdown' = 'HTML'): Promise<boolean> {
+  const token = getToken();
+  if (!token) return false;
+  try {
+    await axios.post(`https://api.telegram.org/bot${token}/sendMessage`, {
+      chat_id: chatId,
+      text,
+      parse_mode: parseMode,
+      disable_web_page_preview: true,
+    }, { timeout: 8000 });
+    return true;
+  } catch (err) {
+    console.warn('[Telegram] Send failed:', err instanceof Error ? err.message : err);
+    return false;
+  }
+}
+
+// Notify — resolves the right chat ID for the user
+export async function notify(message: TelegramMessage, userSettingsId?: string): Promise<void> {
+  const token = getToken();
+  if (!token) return;
+
+  try {
+    let chatId: string | null = null;
+
+    // Try per-user chat ID first
+    if (userSettingsId) {
+      const settings = await prisma.userSettings.findUnique({
+        where: { id: userSettingsId },
+        select: { telegramChatId: true, telegramEnabled: true, telegramConsent: true, notificationPrefs: true },
+      });
+      if (settings?.telegramConsent === false) return; // explicitly opted out
+      if (settings?.telegramChatId && settings?.telegramEnabled) {
+        chatId = settings.telegramChatId;
+      }
+
+      // Check notification type preferences
+      if (settings?.notificationPrefs) {
+        const prefs = settings.notificationPrefs as Record<string, boolean>;
+        const prefKey = message.type.toLowerCase().replace(/_/g, '');
+        if (prefs[prefKey] === false) return;
+      }
+    }
+
+    // Fall back to global chat ID (admin/owner)
+    if (!chatId) chatId = getGlobalChatId();
+    if (!chatId) return;
+
+    const text = formatMessage(message);
+    await sendMessage(chatId, text);
+  } catch (err) {
+    console.warn('[Telegram] Notify error:', err instanceof Error ? err.message : err);
+  }
+}
+
+// Notify all users who have Telegram connected and enabled
+export async function notifyAllConnected(message: TelegramMessage): Promise<void> {
+  const token = getToken();
+  if (!token) return;
+
+  try {
+    const connectedUsers = await prisma.userSettings.findMany({
+      where: { telegramEnabled: true, telegramChatId: { not: null } },
+      select: { id: true, telegramChatId: true },
+    });
+
+    const text = formatMessage(message);
+    await Promise.allSettled(
+      connectedUsers.map(u => sendMessage(u.telegramChatId!, text))
+    );
+
+    // Also send to global chat ID if set (catches admin who may not have gone through flow)
+    const globalId = getGlobalChatId();
+    if (globalId) await sendMessage(globalId, text).catch(() => {});
+  } catch (err) {
+    console.warn('[Telegram] notifyAllConnected error:', err instanceof Error ? err.message : err);
+  }
+}
+
+export async function sendDailySummary(): Promise<void> {
+  try {
+    const startOfDay = new Date();
+    startOfDay.setHours(0, 0, 0, 0);
+
+    const [placed, closed, pnlAgg] = await Promise.all([
+      prisma.autoTradeLog.count({ where: { phase: 'ENTRY', executedAt: { gte: startOfDay } } }),
+      prisma.autoTradeLog.count({ where: { phase: 'EXIT',  executedAt: { gte: startOfDay } } }),
+      prisma.autoTradeLog.aggregate({ where: { phase: 'EXIT', executedAt: { gte: startOfDay } }, _sum: { pnl: true } }),
+    ]);
+
+    const latestRun = await prisma.dailyScanRun.findFirst({ where: { status: 'COMPLETED' }, orderBy: { completedAt: 'desc' } });
+    const topResult = latestRun ? await prisma.dailyScanResult.findFirst({
+      where: { scanRunId: latestRun.id }, orderBy: { convictionScore: 'desc' },
+    }) : null;
+
+    const msg: TelegramMessage = {
+      type: 'DAILY_SUMMARY',
+      data: {
+        tradesPlaced:  placed,
+        tradesClosed:  closed,
+        dailyPnl:      pnlAgg._sum.pnl ?? 0,
+        tosEquity:     '—', hlEquity: '—', tosPositions: 0, hlPositions: 0,
+        topPick:       topResult?.symbol ?? 'None',
+        topConviction: topResult?.convictionScore ?? 'N/A',
+        circuitBreakerActive: false,
+      },
+    };
+
+    await notifyAllConnected(msg);
+  } catch (err) {
+    console.warn('[Telegram] Daily summary error:', err instanceof Error ? err.message : err);
+  }
+}
+
+export function getConnectLink(token: string): string {
+  const botUsername = process.env.TELEGRAM_BOT_USERNAME ?? 'RIABotNotifier';
+  return `https://t.me/${botUsername}?start=${token}`;
+}
+
+export function isConfigured(): boolean {
+  return !!getToken();
+}
+
+export function isBotFullyConfigured(): boolean {
+  return !!(getToken() && process.env.TELEGRAM_BOT_USERNAME);
+}
+
+const telegramService = {
+  notify, notifyAllConnected, sendMessage, sendDailySummary,
+  getConnectLink, isConfigured, isBotFullyConfigured,
+};
+export default telegramService;
+```
+
+---
+
+## PART C — Telegram Bot Webhook Route
+
+This receives messages from Telegram when users start the bot with a token.
+
+**File**: `server/src/routes/telegram.ts` (NEW FILE)
+
+```typescript
+import { Router, type Request, type Response } from 'express';
+import { prisma } from '../lib/prisma';
+import telegramService from '../services/notifications/TelegramService';
+
+const router = Router();
+
+// Telegram sends updates to this webhook
+// Register it with: POST https://api.telegram.org/bot{TOKEN}/setWebhook?url=https://ria-bot.replit.app/api/telegram/webhook
+router.post('/webhook', async (req: Request, res: Response) => {
+  // Always respond 200 immediately — Telegram will retry if we don't
+  res.sendStatus(200);
+
+  try {
+    const update = req.body;
+    const message = update?.message;
+    if (!message) return;
+
+    const chatId   = String(message.chat.id);
+    const text     = message.text ?? '';
+    const username = message.from?.username ?? null;
+    const firstName= message.from?.first_name ?? 'there';
+
+    // Handle /start TOKEN command
+    if (text.startsWith('/start')) {
+      const parts = text.split(' ');
+      const token = parts[1]?.trim();
+
+      if (!token) {
+        // No token — generic welcome
+        await telegramService.sendMessage(chatId,
+          `👋 Hi ${firstName}! I'm <b>RIA BOT</b> — your autonomous trading assistant.\n\n` +
+          `To receive trade alerts, go to <b>Settings → Notifications</b> in the RIA BOT app and click <b>Connect Telegram</b>.`,
+          'HTML'
+        );
+        return;
+      }
+
+      // Find user by connect token
+      const settings = await prisma.userSettings.findFirst({
+        where: {
+          telegramConnectToken:  token,
+          telegramConnectExpiry: { gt: new Date() },   // token must not be expired
+        },
+        include: { user: { select: { displayName: true, email: true } } },
+      });
+
+      if (!settings) {
+        await telegramService.sendMessage(chatId,
+          `❌ This link has expired or is invalid.\n\nPlease go back to <b>Settings → Notifications</b> and generate a new Connect link.`,
+          'HTML'
+        );
+        return;
+      }
+
+      // Save chat ID and enable notifications
+      await prisma.userSettings.update({
+        where: { id: settings.id },
+        data: {
+          telegramChatId:        chatId,
+          telegramEnabled:       true,
+          telegramConsent:       true,
+          telegramConsentAt:     new Date(),
+          telegramConnectToken:  null,   // one-time use — clear after use
+          telegramConnectExpiry: null,
+        },
+      });
+
+      const name = settings.user?.displayName ?? settings.user?.email ?? 'Trader';
+      await telegramService.sendMessage(chatId,
+        `✅ <b>RIA BOT connected!</b>\n\n` +
+        `Hi ${name}! You'll now receive:\n` +
+        `• 🟢 Trade placed alerts\n` +
+        `• 🔴 Position closed alerts\n` +
+        `• 📊 Daily summary at 4:00 PM ET\n` +
+        `• 🚨 Circuit breaker warnings\n\n` +
+        `To disconnect, go to <b>Settings → Notifications</b> in the app.\n\n` +
+        `<i>Your chat ID: <code>${chatId}</code></i>`,
+        'HTML'
+      );
+    }
+
+    // Handle /stop command
+    else if (text === '/stop' || text === '/disconnect') {
+      const settings = await prisma.userSettings.findFirst({
+        where: { telegramChatId: chatId },
+      });
+      if (settings) {
+        await prisma.userSettings.update({
+          where: { id: settings.id },
+          data: { telegramEnabled: false },
+        });
+        await telegramService.sendMessage(chatId,
+          `⏸ <b>Notifications paused.</b>\n\nYou won't receive any more alerts. To re-enable, go to Settings → Notifications in the app.`,
+          'HTML'
+        );
+      } else {
+        await telegramService.sendMessage(chatId, `You don't have an active RIA BOT connection.`);
+      }
+    }
+
+    // Handle /status
+    else if (text === '/status') {
+      const settings = await prisma.userSettings.findFirst({
+        where: { telegramChatId: chatId },
+        select: { telegramEnabled: true, autoTradeEnabled: true },
+      });
+      if (settings) {
+        await telegramService.sendMessage(chatId,
+          `📊 <b>RIA BOT Status</b>\n\n` +
+          `Notifications: ${settings.telegramEnabled ? '✅ Active' : '⏸ Paused'}\n` +
+          `Auto-trading: ${settings.autoTradeEnabled ? '✅ Enabled' : '❌ Disabled'}\n\n` +
+          `Commands: /stop to pause, /status to check`,
+          'HTML'
+        );
+      } else {
+        await telegramService.sendMessage(chatId, `Not connected to a RIA BOT account.`);
+      }
+    }
+
+  } catch (err: any) {
+    console.error('[Telegram Webhook]', err?.message);
+  }
+});
+
+// GET — register the webhook with Telegram automatically
+router.post('/register-webhook', async (req: Request, res: Response) => {
+  const token = process.env.TELEGRAM_BOT_TOKEN;
+  if (!token) return res.status(400).json({ success: false, error: 'TELEGRAM_BOT_TOKEN not set' });
+
+  const webhookUrl = `${process.env.APP_URL ?? 'https://ria-bot.replit.app'}/api/telegram/webhook`;
+  try {
+    const axios = (await import('axios')).default;
+    const { data } = await axios.post(
+      `https://api.telegram.org/bot${token}/setWebhook`,
+      { url: webhookUrl, allowed_updates: ['message'] },
+      { timeout: 10_000 }
+    );
+    res.json({ success: true, data });
+  } catch (err: any) {
+    res.status(500).json({ success: false, error: err?.message });
+  }
+});
+
+export default router;
+```
+
+**File**: `server/src/index.ts`
+
+Add import and route registration:
+```typescript
+import telegramRouter from './routes/telegram';
+// ...
+app.use('/api/telegram', telegramRouter);
+```
+
+Also add webhook auto-registration on startup. Inside `app.listen`, add:
+```typescript
+// Auto-register Telegram webhook on startup
+if (process.env.TELEGRAM_BOT_TOKEN && process.env.TELEGRAM_BOT_USERNAME) {
+  setTimeout(async () => {
+    try {
+      const axios = (await import('axios')).default;
+      const webhookUrl = `${process.env.APP_URL ?? 'https://ria-bot.replit.app'}/api/telegram/webhook`;
+      await axios.post(
+        `https://api.telegram.org/bot${process.env.TELEGRAM_BOT_TOKEN}/setWebhook`,
+        { url: webhookUrl, allowed_updates: ['message'] },
+        { timeout: 10_000 }
+      );
+      console.log('   Telegram   : Webhook registered →', webhookUrl);
+    } catch (err: any) {
+      console.warn('[Telegram] Webhook registration failed:', err?.message);
+    }
+  }, 5_000);
+}
+```
+
+---
+
+## PART D — Connect Token API Routes
+
+**File**: `server/src/routes/auth.ts`
+
+Add these routes before `export default router`:
+
+```typescript
+import crypto from 'crypto';
+
+// GET — notification settings including Telegram connect status
+router.get('/notification-settings', requireAuth, async (req, res) => {
+  try {
+    const userId = req.session.userId!;
+    const settings = await prisma.userSettings.findUnique({
+      where: { userId },
+      select: {
+        telegramChatId:    true,
+        telegramEnabled:   true,
+        telegramConsent:   true,
+        telegramConsentAt: true,
+      },
+    });
+    const user = await prisma.user.findUnique({
+      where: { id: userId },
+      select: { phoneNumber: true },
+    });
+
+    res.json({
+      success: true,
+      data: {
+        phoneNumber:      user?.phoneNumber ?? null,
+        telegramLinked:   !!settings?.telegramChatId,
+        telegramEnabled:  settings?.telegramEnabled  ?? false,
+        telegramConsent:  settings?.telegramConsent  ?? false,
+        telegramConsentAt:settings?.telegramConsentAt ?? null,
+        botConfigured:    !!(process.env.TELEGRAM_BOT_TOKEN && process.env.TELEGRAM_BOT_USERNAME),
+      },
+    });
+  } catch (err) {
+    res.status(500).json({ success: false, error: 'Failed' });
+  }
+});
+
+// POST — generate a one-time connect link for the user
+router.post('/notification-settings/telegram-connect', requireAuth, async (req, res) => {
+  try {
+    const userId = req.session.userId!;
+
+    if (!process.env.TELEGRAM_BOT_TOKEN || !process.env.TELEGRAM_BOT_USERNAME) {
+      return res.status(400).json({ success: false, error: 'Telegram bot not configured by admin. Set TELEGRAM_BOT_TOKEN and TELEGRAM_BOT_USERNAME in Replit Secrets.' });
+    }
+
+    // Generate a secure one-time token
+    const token  = crypto.randomBytes(20).toString('hex');
+    const expiry = new Date(Date.now() + 10 * 60_000); // expires in 10 minutes
+
+    const settings = await prisma.userSettings.findUnique({ where: { userId } });
+    if (!settings) {
+      await prisma.userSettings.create({ data: { userId, telegramConnectToken: token, telegramConnectExpiry: expiry } });
+    } else {
+      await prisma.userSettings.update({
+        where: { userId },
+        data: { telegramConnectToken: token, telegramConnectExpiry: expiry },
+      });
+    }
+
+    const botUsername = process.env.TELEGRAM_BOT_USERNAME;
+    const connectUrl  = `https://t.me/${botUsername}?start=${token}`;
+
+    res.json({ success: true, data: { connectUrl, expiresAt: expiry, token } });
+  } catch (err) {
+    res.status(500).json({ success: false, error: 'Failed to generate connect link' });
+  }
+});
+
+// POST — disable Telegram notifications
+router.post('/notification-settings/telegram-disconnect', requireAuth, async (req, res) => {
+  try {
+    const userId = req.session.userId!;
+    await prisma.userSettings.updateMany({
+      where:  { userId },
+      data:   { telegramEnabled: false, telegramChatId: null, telegramConsent: false, telegramConsentAt: null },
+    });
+    res.json({ success: true, data: { disconnected: true } });
+  } catch (err) {
+    res.status(500).json({ success: false, error: 'Failed' });
+  }
+});
+
+// PUT /profile — update display name and phone number
+router.put('/profile', requireAuth, async (req, res, next) => {
+  try {
+    const { displayName, phoneNumber } = req.body;
+    const userId = req.session.userId!;
+
+    if (displayName !== undefined && (typeof displayName !== 'string' || displayName.trim().length < 1)) {
+      return res.status(400).json({ success: false, error: 'Invalid display name' });
+    }
+    if (phoneNumber !== undefined && phoneNumber !== null && phoneNumber !== '') {
+      const cleaned = String(phoneNumber).replace(/\D/g, '');
+      if (cleaned.length < 7 || cleaned.length > 15) {
+        return res.status(400).json({ success: false, error: 'Invalid phone number — must be 7–15 digits' });
+      }
+    }
+
+    const updated = await prisma.user.update({
+      where: { id: userId },
+      data: {
+        ...(displayName !== undefined && { displayName: displayName.trim() }),
+        ...(phoneNumber !== undefined && { phoneNumber: phoneNumber?.trim() || null }),
+      },
+    });
+
+    return res.json({ success: true, data: { user: sanitizeUser(updated) } });
+  } catch (err) { next(err); }
+});
+```
+
+---
+
+## PART E — API Client
+
+**File**: `client/src/api/client.ts`
+
+In the `auth` section add:
+```typescript
+notificationSettings:      () => get('/auth/notification-settings'),
+telegramConnect:           () => post('/auth/notification-settings/telegram-connect', {}),
+telegramDisconnect:        () => post('/auth/notification-settings/telegram-disconnect', {}),
+```
+
+---
+
+## PART F — Settings Page: Telegram Connect Card
+
+**File**: `client/src/pages/Settings.tsx`
+
+Add this component before the main `Settings` export:
+
+```tsx
+function TelegramConnectCard() {
+  const qc = useQueryClient();
+  const [connectUrl, setConnectUrl] = useState<string | null>(null);
+  const [expiry, setExpiry]         = useState<Date | null>(null);
+  const [copied, setCopied]         = useState(false);
+
+  const { data: raw } = useQuery({
+    queryKey: ['notification-settings'],
+    queryFn:  () => (api.auth as any).notificationSettings().then((r: any) => r.data),
+    refetchInterval: 10_000,
+  });
+  const s = raw as any;
+
+  const connectMut = useMutation({
+    mutationFn: () => (api.auth as any).telegramConnect(),
+    onSuccess: (r: any) => {
+      setConnectUrl(r.data?.connectUrl ?? null);
+      setExpiry(r.data?.expiresAt ? new Date(r.data.expiresAt) : null);
+    },
+    onError: (e: any) => toast.error(e?.response?.data?.error ?? 'Failed to generate link'),
+  });
+
+  const disconnectMut = useMutation({
+    mutationFn: () => (api.auth as any).telegramDisconnect(),
+    onSuccess: () => {
+      toast.success('Telegram disconnected');
+      setConnectUrl(null);
+      qc.invalidateQueries({ queryKey: ['notification-settings'] });
+    },
+  });
+
+  const copyLink = () => {
+    if (!connectUrl) return;
+    navigator.clipboard.writeText(connectUrl);
+    setCopied(true);
+    setTimeout(() => setCopied(false), 2000);
+  };
+
+  const botReady    = s?.botConfigured   ?? false;
+  const isLinked    = s?.telegramLinked  ?? false;
+  const isEnabled   = s?.telegramEnabled ?? false;
+  const consentDate = s?.telegramConsentAt
+    ? new Date(s.telegramConsentAt).toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' })
+    : null;
+
+  return (
+    <Card className={cn('p-5 border transition-all', isLinked ? 'border-violet-500/30 bg-violet-950/10' : 'border-surface-border')}>
+
+      {/* Header */}
+      <div className="flex items-start gap-3 mb-4">
+        <div className={cn('w-10 h-10 rounded-xl flex items-center justify-center text-xl flex-shrink-0',
+          isLinked ? 'bg-violet-500/20' : 'bg-surface-3')}>
+          📱
+        </div>
+        <div className="flex-1 min-w-0">
+          <div className="flex items-center gap-2 flex-wrap">
+            <h3 className="text-sm font-bold text-white">Telegram Alerts</h3>
+            {isLinked && isEnabled && (
+              <span className="text-[10px] font-bold px-2 py-0.5 rounded-full bg-emerald-500/20 text-emerald-400 border border-emerald-500/20">
+                CONNECTED
+              </span>
+            )}
+            {isLinked && !isEnabled && (
+              <span className="text-[10px] font-bold px-2 py-0.5 rounded-full bg-amber-500/20 text-amber-400 border border-amber-500/20">
+                PAUSED
+              </span>
+            )}
+          </div>
+          <p className="text-xs text-slate-500 mt-0.5">
+            Trade alerts, daily P&L summary, and circuit breaker warnings sent to your Telegram.
+          </p>
+        </div>
+      </div>
+
+      {/* What you'll receive */}
+      {!isLinked && (
+        <div className="mb-4 p-3 bg-surface-2 rounded-lg space-y-1.5 text-xs">
+          <p className="text-[10px] text-slate-500 uppercase tracking-wider font-semibold mb-1.5">You'll receive</p>
+          {[
+            ['🟢', 'Trade placed — symbol, price, stop, target, conviction'],
+            ['🔴', 'Position closed — P&L and reason'],
+            ['📊', 'Daily summary at 4 PM ET — trades + P&L'],
+            ['🚨', 'Circuit breaker + killswitch alerts'],
+          ].map(([icon, text]) => (
+            <div key={text} className="flex items-start gap-2 text-slate-400">
+              <span className="flex-shrink-0">{icon}</span><span>{text}</span>
+            </div>
+          ))}
+        </div>
+      )}
+
+      {/* Bot not configured warning */}
+      {!botReady && (
+        <div className="mb-4 p-3 bg-amber-500/10 border border-amber-500/20 rounded-lg text-xs text-amber-400">
+          <p className="font-medium mb-1">⚙️ Bot not configured yet</p>
+          <p className="text-amber-400/70">Add <span className="font-mono">TELEGRAM_BOT_TOKEN</span> and <span className="font-mono">TELEGRAM_BOT_USERNAME</span> to Replit Secrets to enable the connect flow.</p>
+        </div>
+      )}
+
+      {/* Connected state */}
+      {isLinked ? (
+        <div className="space-y-3">
+          <div className="p-3 bg-emerald-500/10 border border-emerald-500/20 rounded-lg">
+            <div className="flex items-center justify-between mb-1">
+              <p className="text-sm text-emerald-400 font-medium">✓ Your Telegram is connected</p>
+            </div>
+            {consentDate && <p className="text-xs text-emerald-400/60">Connected on {consentDate}</p>}
+            <p className="text-xs text-slate-400 mt-1.5">
+              Use <span className="font-mono text-slate-300">/stop</span> in the bot chat to pause, or <span className="font-mono text-slate-300">/status</span> to check.
+            </p>
+          </div>
+          <button
+            onClick={() => disconnectMut.mutate()}
+            disabled={disconnectMut.isPending}
+            className="w-full py-2 text-xs text-red-400 hover:text-red-300 border border-red-400/20 hover:border-red-400/40 rounded-lg transition-colors disabled:opacity-50"
+          >
+            {disconnectMut.isPending ? 'Disconnecting…' : 'Disconnect Telegram'}
+          </button>
+        </div>
+      ) : (
+        /* Not connected — show connect flow */
+        <div className="space-y-3">
+          {!connectUrl ? (
+            <button
+              onClick={() => connectMut.mutate()}
+              disabled={connectMut.isPending || !botReady}
+              className="w-full py-2.5 bg-violet-600 hover:bg-violet-700 disabled:opacity-50 text-white text-sm font-semibold rounded-lg transition-colors flex items-center justify-center gap-2"
+            >
+              {connectMut.isPending
+                ? <><span className="animate-spin inline-block">⟳</span> Generating link…</>
+                : <>📱 Connect Telegram</>
+              }
+            </button>
+          ) : (
+            <div className="space-y-3">
+              <div className="p-3 bg-violet-950/40 border border-violet-500/30 rounded-lg space-y-3">
+                <p className="text-xs font-semibold text-violet-300">Your secure connect link is ready:</p>
+
+                {/* Step instructions */}
+                <ol className="space-y-2 text-xs text-slate-400 list-decimal list-inside">
+                  <li>Click the button below to open Telegram</li>
+                  <li>Press <strong className="text-white">Start</strong> in the bot chat</li>
+                  <li>Come back — this page will update automatically</li>
+                </ol>
+
+                {/* Open in Telegram button */}
+                <a
+                  href={connectUrl}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="flex items-center justify-center gap-2 w-full py-2.5 bg-[#2AABEE] hover:bg-[#229ED9] text-white text-sm font-semibold rounded-lg transition-colors"
+                >
+                  <svg className="w-4 h-4" viewBox="0 0 24 24" fill="currentColor">
+                    <path d="M12 0C5.373 0 0 5.373 0 12s5.373 12 12 12 12-5.373 12-12S18.627 0 12 0zm5.894 8.221l-1.97 9.28c-.145.658-.537.818-1.084.508l-3-2.21-1.447 1.394c-.16.16-.295.295-.605.295l.213-3.053 5.56-5.023c.242-.213-.054-.333-.373-.12l-6.871 4.326-2.962-.924c-.643-.204-.657-.643.136-.953l11.57-4.461c.537-.194 1.006.131.833.94z"/>
+                  </svg>
+                  Open in Telegram
+                </a>
+
+                {/* Copy link fallback */}
+                <button onClick={copyLink}
+                  className="w-full py-1.5 text-xs text-slate-400 hover:text-slate-200 border border-surface-border rounded-lg transition-colors">
+                  {copied ? '✓ Copied!' : 'Copy link (if Telegram doesn\'t open)'}
+                </button>
+
+                {expiry && (
+                  <p className="text-[10px] text-slate-500 text-center">
+                    Link expires at {expiry.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
+                    {' '}· <button onClick={() => setConnectUrl(null)} className="underline hover:text-slate-300">Cancel</button>
+                  </p>
+                )}
+              </div>
+            </div>
+          )}
+          <p className="text-[10px] text-slate-600 text-center">
+            You control what you receive. Disconnect anytime from this page.
+          </p>
+        </div>
+      )}
+    </Card>
+  );
+}
+```
+
+Replace the notifications section to use the new card:
+
+```tsx
+{activeSection === 'notifications' && (
+  <div className="space-y-4">
+    <TelegramConnectCard />
+    <Card className="p-5">
+      <h2 className="text-sm font-semibold text-white mb-1">In-App Alerts</h2>
+      <p className="text-xs text-slate-500 mb-4">These appear as notifications inside the app.</p>
+      <div className="space-y-3">
+        {[
+          { label: 'Stop-loss breach alerts',  description: 'When a position hits your stop-loss level', on: true  },
+          { label: 'Target price reached',      description: 'When current price meets your target',      on: true  },
+          { label: 'High volatility warnings',  description: 'Unusual intraday price swings',             on: false },
+          { label: 'Thesis degradation alerts', description: 'When thesis assumptions are invalidated',   on: true  },
+          { label: 'Weekly performance digest', description: 'Summary of portfolio performance',          on: false },
+        ].map((item) => (
+          <div key={item.label} className="flex items-center justify-between p-3 rounded-lg bg-surface-3">
+            <div>
+              <p className="text-sm text-white">{item.label}</p>
+              <p className="text-xs text-slate-500 mt-0.5">{item.description}</p>
+            </div>
+            <div className={cn('w-9 h-5 rounded-full relative cursor-pointer transition-colors',
+              item.on ? 'bg-accent-blue' : 'bg-surface-border')}>
+              <span className={cn('absolute top-0.5 w-4 h-4 bg-white rounded-full shadow transition-all',
+                item.on ? 'left-4' : 'left-0.5')} />
+            </div>
+          </div>
+        ))}
+      </div>
+    </Card>
+  </div>
+)}
+```
+
+Also add phone number to the Profile section. Inside the profile form, add after the Username field:
+
+```tsx
+<div>
+  <label className="block text-xs text-slate-400 font-mono uppercase tracking-wide mb-1.5">
+    Phone Number <span className="text-slate-600 normal-case font-sans">(optional)</span>
+  </label>
+  <input
+    type="tel"
+    value={phoneNumber}
+    onChange={(e) => setPhoneNumber(e.target.value)}
+    className="input-field w-full"
+    placeholder="+1 555 000 0000"
+  />
+  <p className="text-xs text-slate-600 mt-1">Reserved for future SMS alerts. Not shared.</p>
+</div>
+```
+
+And add the state:
+```typescript
+const [phoneNumber, setPhoneNumber] = useState((user as any)?.phoneNumber ?? '');
+```
+
+Update `handleProfileSubmit`:
+```typescript
+const handleProfileSubmit = (e: React.FormEvent) => {
+  e.preventDefault();
+  updateProfileMutation.mutate({ displayName, phoneNumber });
+};
+```
+
+---
+
+## SUMMARY
+
+### How it works end-to-end
+
+```
+User → Settings → Notifications
+     → clicks "Connect Telegram"
+     → server generates token (expires 10 min) + deep link
+     → user clicks "Open in Telegram" 
+     → Telegram opens, user presses Start
+     → bot receives /start TOKEN
+     → webhook saves chatId to user's settings
+     → bot sends confirmation message
+     → Settings page auto-refreshes, shows "CONNECTED"
+
+Future alerts → notify(message, userSettingsId) 
+             → looks up user's chatId from DB
+             → sends directly to their personal chat
+```
+
+### Required Replit Secrets
+
+| Key | Value |
+|-----|-------|
+| `TELEGRAM_BOT_TOKEN` | From @BotFather |
+| `TELEGRAM_BOT_USERNAME` | Your bot's username (without @) |
+| `APP_URL` | `https://ria-bot.replit.app` |
+
+`TELEGRAM_CHAT_ID` is no longer required — each user has their own chat ID stored in the DB. The global `TELEGRAM_CHAT_ID` still works as a fallback if set.
+
+### Bot commands users get
+- `/start TOKEN` — connects their account (automatic from deep link)
+- `/stop` — pauses notifications
+- `/status` — shows connection and trading status
