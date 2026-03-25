@@ -281,7 +281,10 @@ export async function executeAutoTrade(
   // ─── Phase 5: Intraday confirmation check ───────────────────────────────
   // Premium-selling strategies (Iron Condors, CSPs) benefit from overbought/range-bound
   // conditions, so EXTENDED/WAIT confirmations are not disqualifying — skip filter.
-  if (!isPremiumSelling) {
+  // Last-resort fallback signals (_lastResort=true) also bypass this filter since the
+  // guarantee is that at least one trade logs per active session regardless of conditions.
+  const isLastResort = (signal as any)._lastResort === true;
+  if (!isPremiumSelling && !isLastResort) {
     if (signal.intradayConfirmation === 'EXTENDED') {
       return { success: false, status: 'REJECTED', symbol: signal.symbol, exchange, reason: 'INTRADAY_EXTENDED — price overbought on hourly, waiting for pullback' };
     }
