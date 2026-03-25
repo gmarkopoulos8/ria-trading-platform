@@ -282,7 +282,7 @@ function PlaceOrderPanel({ onSuccess }: { onSuccess: () => void }) {
                 <button key={t} onClick={() => setOrderType(t)}
                   className={cn('py-1 rounded text-[9px] font-semibold border transition-colors text-center leading-tight px-0.5',
                     orderType === t ? 'bg-accent-blue/20 border-accent-blue/40 text-accent-blue' : 'bg-surface-2 border-surface-border text-slate-400 hover:text-white')}>
-                  {t === 'STOP_LIMIT' ? 'STP-LMT' : t === 'GOOD_TILL_CANCEL' ? 'GTC' : t}
+                  {t === 'STOP_LIMIT' ? 'STP-LMT' : t}
                 </button>
               ))}
             </div>
