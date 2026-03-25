@@ -813,28 +813,63 @@ router.get('/ria-status', async (req: Request, res: Response) => {
 
     const todayStart = new Date(); todayStart.setHours(0, 0, 0, 0);
 
-    const [openTrades, recentTrades, todayStats] = await Promise.allSettled([
-      prisma.trade.findMany({ where: { userId, status: 'OPEN' }, orderBy: { entryTime: 'desc' }, take: 20 }).catch(() => []),
-      prisma.trade.findMany({ where: { userId }, orderBy: { entryTime: 'desc' }, take: 8 }).catch(() => []),
-      prisma.trade.aggregate({ where: { userId, entryTime: { gte: todayStart } }, _sum: { realizedPnl: true, unrealizedPnl: true }, _count: { id: true } }).catch(() => ({ _sum: {}, _count: { id: 0 } })),
+    // Read all trade activity from autoTradeLog (the Trade table is never used by the autonomous system)
+    const [rawLogs, todayEntryStats, todayExitPnl, signals, latestScan] = await Promise.allSettled([
+      prisma.autoTradeLog.findMany({
+        where:   { userSettingsId: settings.id, phase: { in: ['ENTRY', 'EXIT'] }, symbol: { not: 'N/A' } },
+        orderBy: { executedAt: 'desc' },
+        take:    30,
+      }),
+      prisma.autoTradeLog.aggregate({
+        where: { userSettingsId: settings.id, phase: 'ENTRY', status: { in: ['FILLED', 'DRY_RUN'] }, executedAt: { gte: todayStart } },
+        _count: { id: true },
+      }),
+      prisma.autoTradeLog.aggregate({
+        where: { userSettingsId: settings.id, phase: 'EXIT', executedAt: { gte: todayStart } },
+        _sum: { pnl: true },
+      }),
+      buildSignalsFromLatestScan({
+        minConvictionScore: 55,
+        minConfidenceScore: 45,
+        allowedBiases:      ['BULLISH', 'BEARISH', 'NEUTRAL'],
+        maxSymbols:         6,
+      }),
+      prisma.dailyScanRun.findFirst({
+        where:   { status: 'COMPLETED' },
+        orderBy: { completedAt: 'desc' },
+        select:  { id: true, completedAt: true, totalRankedCount: true },
+      }),
     ]);
 
-    const signals = await buildSignalsFromLatestScan({
-      minConvictionScore: 55,
-      minConfidenceScore: 45,
-      allowedBiases:      ['BULLISH', 'BEARISH', 'NEUTRAL'],
-      maxSymbols:         6,
-    }).catch(() => []);
+    const logs       = rawLogs.status        === 'fulfilled' ? rawLogs.value        : [];
+    const entryStats = todayEntryStats.status === 'fulfilled' ? todayEntryStats.value : { _count: { id: 0 } };
+    const exitPnl    = todayExitPnl.status   === 'fulfilled' ? todayExitPnl.value   : { _sum: { pnl: 0 } };
+    const signalList = signals.status         === 'fulfilled' ? signals.value         : [];
+    const scan       = latestScan.status      === 'fulfilled' ? latestScan.value      : null;
 
-    const latestScan = await prisma.dailyScanRun.findFirst({
-      where:   { status: 'COMPLETED' },
-      orderBy: { completedAt: 'desc' },
-      select:  { id: true, completedAt: true, totalRankedCount: true },
-    }).catch(() => null);
+    // Transform autoTradeLog shape → what the UI expects
+    const mapLog = (log: any) => {
+      const isActive = log.phase === 'ENTRY' && log.exitPrice == null && ['FILLED', 'DRY_RUN'].includes(log.status);
+      const meta     = (log.metadata as any) ?? {};
+      return {
+        id:              log.id,
+        symbol:          log.symbol,
+        status:          isActive ? 'OPEN' : log.status,
+        realizedPnl:     log.phase === 'EXIT' ? (Number(log.pnl) || null) : null,
+        unrealizedPnl:   null,
+        strategy:        log.action ?? 'LONG',
+        claudeReasoning: meta?.signal?.aiReasoning ?? log.reason ?? null,
+        executedAt:      log.executedAt,
+        dryRun:          log.dryRun,
+        entryPrice:      log.entryPrice,
+        exitPrice:       log.exitPrice,
+        phase:           log.phase,
+      };
+    };
 
-    const openTradesVal  = openTrades.status  === 'fulfilled' ? openTrades.value  : [];
-    const recentVal      = recentTrades.status === 'fulfilled' ? recentTrades.value : [];
-    const todayVal       = todayStats.status  === 'fulfilled' ? todayStats.value  : { _sum: { realizedPnl: 0, unrealizedPnl: 0 }, _count: { id: 0 } };
+    const mappedLogs    = logs.map(mapLog);
+    const openTradesVal = mappedLogs.filter(l => l.status === 'OPEN');
+    const recentVal     = mappedLogs.slice(0, 8);
 
     res.json({
       success: true,
@@ -856,12 +891,12 @@ router.get('/ria-status', async (req: Request, res: Response) => {
 
         regime,
         portfolio,
-        signals,
-        latestScan,
+        signals:     signalList,
+        latestScan:  scan,
 
         today: {
-          pnl:    ((todayVal as any)._sum?.realizedPnl ?? 0) + ((todayVal as any)._sum?.unrealizedPnl ?? 0),
-          trades: (todayVal as any)._count?.id ?? 0,
+          pnl:    Number(exitPnl._sum?.pnl ?? 0),
+          trades: entryStats._count?.id ?? 0,
         },
         openTrades:   openTradesVal,
         recentTrades: recentVal,
