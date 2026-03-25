@@ -252,6 +252,7 @@ export const api = {
     intradaySignals: (withAI = true) => get(`/autotrader/intraday/signals?ai=${withAI}`),
     intradayPositions: () => get('/autotrader/intraday/positions'),
     intradayRun: (params?: { maxSignals?: number; dryRun?: boolean }) => post('/autotrader/intraday/run', params ?? {}),
+    diagnose: () => get('/autotrader/diagnose'),
     intradayConfig: (params: { intervalSeconds: number; timeframe: '1min' | '3min' | '5min' }) =>
       post('/autotrader/intraday/config', params),
     livePositions: () => get('/autotrader/live-positions'),

@@ -1,0 +1,419 @@
+# Replit Agent Prompt — Fix Alpaca Trades Not Executing
+
+Trades are logging as DRY_RUN instead of FILLED. The root cause is that `dryRun` is `true` on the Alpaca credentials, which causes the executor to simulate every trade and return before ever touching the Alpaca API. This is one setting change plus a diagnostic endpoint so you can always see exactly why any trade was blocked.
+
+-----
+
+## WHY TRADES AREN’T EXECUTING
+
+The execution path hits this check **before** the Alpaca block:
+
+```typescript
+// Line 493 in AutoTradeExecutor.ts
+if (config.dryRun) {
+  await prisma.autoTradeLog.update({ data: { status: 'DRY_RUN' } });
+  return { success: true, status: 'DRY_RUN' };  // ← returns here, never reaches Alpaca
+}
+```
+
+`config.dryRun` comes from `getAlpacaCredentials()?.dryRun` which defaults to `true` when credentials are saved. If you connected Alpaca with dry run enabled (the default), every single trade will simulate and log `DRY_RUN` forever.
+
+**To confirm this is the issue**, run this in Replit Shell:
+
+```bash
+node -e "
+const {PrismaClient} = require('@prisma/client');
+const p = new PrismaClient();
+p.exchangeCredential.findMany({
+  where: { exchange: 'alpaca' },
+  select: { alpacaApiKeyId: true, alpacaDryRun: true, isConnected: true }
+}).then(r => { console.log(JSON.stringify(r, null, 2)); p.\$disconnect(); });
+"
+```
+
+If `alpacaDryRun: true` — that’s the problem.
+
+-----
+
+## FIX 1 — Add a Live Paper Mode toggle to Alpaca credentials
+
+**File**: `server/src/routes/credentials.ts`
+
+Find the `PATCH /alpaca/settings` route and make sure it properly saves `dryRun`:
+
+```typescript
+router.patch('/alpaca/settings', requireAuth, async (req, res) => {
+  try {
+    const userId = (req as any).session?.userId as string;
+    if (!userId) return res.status(401).json({ success: false, error: 'Not authenticated' });
+
+    const { dryRun, maxDrawdownPct } = req.body;
+
+    const existing = await credentialService.getAlpacaCredentials(userId);
+    if (!existing) {
+      return res.status(400).json({ success: false, error: 'Alpaca not connected. Connect first.' });
+    }
+
+    const updatedDryRun      = typeof dryRun === 'boolean' ? dryRun : existing.dryRun;
+    const updatedMaxDrawdown = typeof maxDrawdownPct === 'number' ? maxDrawdownPct : existing.maxDrawdownPct;
+
+    await credentialService.saveAlpacaCredentials(userId, {
+      apiKeyId:       existing.apiKeyId,
+      secretKey:      existing.secretKey,
+      dryRun:         updatedDryRun,
+      maxDrawdownPct: updatedMaxDrawdown,
+    });
+
+    // CRITICAL: Also update the runtime credentials in memory
+    const { setAlpacaRuntimeCredentials, getAlpacaCredentials } = await import('../services/alpaca/alpacaConfig');
+    const current = getAlpacaCredentials();
+    if (current) {
+      setAlpacaRuntimeCredentials({
+        ...current,
+        dryRun:         updatedDryRun,
+        maxDrawdownPct: updatedMaxDrawdown,
+      });
+    }
+
+    return res.json({
+      success: true,
+      data: { dryRun: updatedDryRun, maxDrawdownPct: updatedMaxDrawdown },
+    });
+  } catch (err) {
+    return res.status(500).json({ success: false, error: (err as Error).message });
+  }
+});
+```
+
+-----
+
+## FIX 2 — Add a diagnostic endpoint to see exactly why trades are blocked
+
+**File**: `server/src/routes/autotrader.ts`
+
+Add this route before `export default router`:
+
+```typescript
+// GET — diagnose why trades are not executing
+router.get('/diagnose', async (req: Request, res: Response) => {
+  try {
+    const userId   = req.session!.userId as string;
+    const settings = await getUserSettings(userId);
+    const config   = parseConfig(settings);
+
+    const issues: string[]   = [];
+    const warnings: string[] = [];
+    const ok: string[]       = [];
+
+    // 1. Auto-trading enabled?
+    if (!settings.autoTradeEnabled) {
+      issues.push('Auto-trading is DISABLED — go to Mission Control and click START');
+    } else {
+      ok.push('Auto-trading enabled');
+    }
+
+    // 2. Autonomous mode?
+    if (!(settings as any).autonomousMode) {
+      issues.push('Autonomous mode is OFF — enable it in Mission Control');
+    } else {
+      ok.push('Autonomous mode active');
+    }
+
+    // 3. Alpaca connected?
+    let alpacaConnected = hasAlpacaCredentials();
+    let alpacaDryRun    = getAlpacaCredentials()?.dryRun ?? true;
+
+    if (!alpacaConnected) {
+      try {
+        const { credentialService } = await import('../services/credentials/CredentialService');
+        const creds = await credentialService.getAlpacaCredentials(userId);
+        if (creds) {
+          setAlpacaRuntimeCredentials(creds);
+          alpacaConnected = true;
+          alpacaDryRun    = creds.dryRun;
+          warnings.push('Alpaca credentials had to be reloaded from DB — server may have restarted');
+        }
+      } catch { /* non-fatal */ }
+    }
+
+    if (!alpacaConnected) {
+      issues.push('Alpaca NOT connected — go to Settings and connect your Alpaca account');
+    } else {
+      ok.push('Alpaca connected');
+    }
+
+    // 4. DRY RUN? This is the most common reason trades show DRY_RUN instead of FILLED
+    if (alpacaDryRun) {
+      issues.push('⚠️ DRY RUN IS ON — trades simulate but never reach Alpaca. Disable dry run in Settings → Connections → Alpaca to place real orders.');
+    } else {
+      ok.push('Live paper trading mode (dryRun = false)');
+    }
+
+    // 5. Signals available?
+    const signals = await buildSignalsFromLatestScan({
+      minConvictionScore: 55,
+      minConfidenceScore: 45,
+      allowedBiases:      ['BULLISH', 'BEARISH', 'NEUTRAL'],
+      maxSymbols:         5,
+    });
+
+    if (signals.length === 0) {
+      issues.push('No signals from latest scan — run a scan first or wait for the 9:30 AM automatic scan');
+    } else {
+      ok.push(`${signals.length} signals available (top: ${signals[0]?.symbol} conviction ${signals[0]?.convictionScore})`);
+    }
+
+    // 6. Regime blocking?
+    try {
+      const { detectRegime } = await import('../services/market/RegimeDetector');
+      const regime = await detectRegime();
+      const adj    = regime.autoTraderAdjustments;
+      ok.push(`Regime: ${regime.regime} (conviction floor: ${adj.minConvictionOverride}, size mult: ${adj.positionSizeMultiplier}x)`);
+      if (!adj.allowNewEntries) {
+        issues.push(`Regime ${regime.regime} has allowNewEntries=false — this should not happen with current config`);
+      }
+    } catch { /* non-fatal */ }
+
+    // 7. Circuit breakers?
+    try {
+      const { checkCircuitBreakers } = await import('../services/autotrader/CircuitBreaker');
+      const { getPortfolioState }    = await import('../services/portfolio/PortfolioStateService');
+      const portfolio = await getPortfolioState();
+      const cb = await checkCircuitBreakers({
+        exchange:            config.exchange,
+        dailyLossLimit:      config.dailyLossLimit,
+        maxDrawdownPct:      config.maxDrawdownPct,
+        maxOpenPositions:    config.maxOpenPositions,
+        currentOpenPositions: portfolio.openPositionCount,
+        currentEquity:       portfolio.totalEquity,
+      }, settings.id);
+
+      if (!cb.allowed) {
+        issues.push(`Circuit breaker ACTIVE: ${cb.reason}`);
+      } else {
+        ok.push(`Circuit breakers clear (equity: $${portfolio.totalEquity.toFixed(0)}, positions: ${portfolio.openPositionCount})`);
+      }
+    } catch { /* non-fatal */ }
+
+    // 8. Latest scan age?
+    const latestScan = await prisma.dailyScanRun.findFirst({
+      where:   { status: 'COMPLETED' },
+      orderBy: { completedAt: 'desc' },
+      select:  { completedAt: true, resultCount: true },
+    });
+    if (!latestScan) {
+      issues.push('No completed scan found — run a Daily Scan first');
+    } else {
+      const ageHours = (Date.now() - new Date(latestScan.completedAt!).getTime()) / 3_600_000;
+      if (ageHours > 8) {
+        warnings.push(`Scan is ${ageHours.toFixed(1)} hours old — signals may be stale`);
+      } else {
+        ok.push(`Latest scan: ${ageHours.toFixed(1)}h ago (${latestScan.resultCount ?? '?'} results)`);
+      }
+    }
+
+    // 9. Recent trade log — what happened last?
+    const recentLogs = await prisma.autoTradeLog.findMany({
+      where:   { userSettingsId: settings.id },
+      orderBy: { executedAt: 'desc' },
+      take:    5,
+      select:  { symbol: true, status: true, reason: true, executedAt: true },
+    });
+
+    res.json({
+      success: true,
+      data: {
+        canTrade:    issues.length === 0,
+        issues,
+        warnings,
+        ok,
+        config: {
+          exchange:           config.exchange,
+          dryRun:             alpacaDryRun,
+          minConvictionScore: config.minConvictionScore,
+          maxOpenPositions:   config.maxOpenPositions,
+          stopLossPct:        config.stopLossPct,
+          takeProfitPct:      config.takeProfitPct,
+        },
+        recentLogs,
+      },
+    });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err instanceof Error ? err.message : 'Diagnose failed' });
+  }
+});
+```
+
+Add to `client/src/api/client.ts`:
+
+```typescript
+diagnose: () => get('/autotrader/diagnose'),
+```
+
+-----
+
+## FIX 3 — Show Dry Run status clearly in Mission Control + Settings
+
+**File**: `client/src/pages/v2/Settings.tsx`
+
+In the Alpaca `ConnectionCard`, after showing the connected state, add a prominent dry run toggle:
+
+```tsx
+{alpaca?.isConnected && (
+  <div className="space-y-3">
+    {/* Existing key + mode display */}
+    <div className="flex gap-3 text-xs">
+      <div className="p-2 bg-surface-3 rounded-lg flex-1">
+        <p className="text-slate-500">API Key</p>
+        <p className="text-white font-mono">{alpaca.apiKeyId ?? '…'}</p>
+      </div>
+      <div className="p-2 bg-surface-3 rounded-lg flex-1">
+        <p className="text-slate-500">Last verified</p>
+        <p className="text-white text-[10px]">
+          {alpaca.lastVerifiedAt
+            ? new Date(alpaca.lastVerifiedAt).toLocaleDateString()
+            : 'Never'}
+        </p>
+      </div>
+    </div>
+
+    {/* DRY RUN TOGGLE — most important setting */}
+    <div className={cn(
+      'p-4 rounded-xl border space-y-2',
+      alpaca.dryRun
+        ? 'bg-amber-500/10 border-amber-500/30'
+        : 'bg-emerald-500/10 border-emerald-500/30',
+    )}>
+      <div className="flex items-center justify-between">
+        <div>
+          <p className={cn('text-sm font-bold', alpaca.dryRun ? 'text-amber-300' : 'text-emerald-300')}>
+            {alpaca.dryRun ? '⚠️ Dry Run Mode' : '✅ Live Paper Trading'}
+          </p>
+          <p className="text-xs text-slate-500 mt-0.5">
+            {alpaca.dryRun
+              ? 'Trades are simulated — nothing reaches Alpaca. Enable live mode to actually execute.'
+              : 'Real orders placed on Alpaca paper account. No real money at risk.'}
+          </p>
+        </div>
+        <button
+          onClick={() => toggleDryRun.mutate(!alpaca.dryRun)}
+          disabled={toggleDryRun.isPending}
+          className={cn(
+            'px-4 py-2 rounded-lg text-xs font-bold border transition-colors flex-shrink-0',
+            alpaca.dryRun
+              ? 'bg-emerald-500/20 border-emerald-500/40 text-emerald-300 hover:bg-emerald-500/30'
+              : 'bg-amber-500/20 border-amber-500/40 text-amber-300 hover:bg-amber-500/30',
+          )}
+        >
+          {toggleDryRun.isPending ? '...' : alpaca.dryRun ? 'Enable Live Mode' : 'Switch to Dry Run'}
+        </button>
+      </div>
+    </div>
+
+    <button
+      onClick={() => alpacaDisconnect.mutate()}
+      disabled={alpacaDisconnect.isPending}
+      className="w-full py-2 text-xs text-red-400 border border-red-400/20 rounded-xl hover:bg-red-400/5 transition-colors disabled:opacity-50"
+    >
+      Disconnect Alpaca
+    </button>
+  </div>
+)}
+```
+
+Add the `toggleDryRun` mutation:
+
+```typescript
+const toggleDryRun = useMutation({
+  mutationFn: (dryRun: boolean) => api.credentials.alpacaUpdateSettings({ dryRun }),
+  onSuccess: (_, dryRun) => {
+    toast.success(dryRun ? 'Switched to dry run mode' : '✅ Live paper trading enabled — trades will now execute on Alpaca');
+    qc.invalidateQueries({ queryKey: ['alpaca-cred-status'] });
+    qc.invalidateQueries({ queryKey: ['ria-status'] });
+  },
+  onError: (e: any) => toast.error(e?.response?.data?.error ?? 'Failed to update mode'),
+});
+```
+
+Add to api client:
+
+```typescript
+alpacaUpdateSettings: (data: { dryRun?: boolean; maxDrawdownPct?: number }) =>
+  api.patch('/credentials/alpaca/settings', data),
+```
+
+-----
+
+## FIX 4 — Add Diagnose button to Mission Control
+
+**File**: `client/src/pages/v2/MissionControl.tsx`
+
+Add a “Why aren’t trades executing?” button that runs the diagnostic. Find the header area and add:
+
+```tsx
+const diagnoseMut = useMutation({
+  mutationFn: () => (api.autotrader as any).diagnose(),
+  onSuccess: (r: any) => {
+    const d = r.data;
+    if (d.canTrade) {
+      toast.success('All systems go — trades should execute');
+    } else {
+      // Show issues as error toasts
+      d.issues.forEach((issue: string) => toast.error(issue, { duration: 8000 }));
+      d.warnings.forEach((w: string) => toast.warning(w, { duration: 5000 }));
+    }
+  },
+});
+```
+
+Add to the header action buttons:
+
+```tsx
+<button
+  onClick={() => diagnoseMut.mutate()}
+  disabled={diagnoseMut.isPending}
+  className="flex items-center gap-1.5 px-3 py-1.5 text-xs text-slate-400 border border-surface-border rounded-lg hover:text-amber-400 hover:border-amber-500/30 transition-colors disabled:opacity-50"
+>
+  {diagnoseMut.isPending ? '⟳ Checking…' : '🔍 Diagnose'}
+</button>
+```
+
+-----
+
+## IMMEDIATE FIX (do this right now in Replit Shell)
+
+Without waiting for the prompt to be applied, run this to disable dry run for your account:
+
+```bash
+node -e "
+const {PrismaClient} = require('@prisma/client');
+const p = new PrismaClient();
+p.exchangeCredential.updateMany({
+  where:  { exchange: 'alpaca' },
+  data:   { alpacaDryRun: false }
+}).then(r => {
+  console.log('Updated', r.count, 'credential(s) — dry run disabled');
+  p.\$disconnect();
+});
+"
+```
+
+Then restart the server. The runtime credentials will reload on restart with `dryRun: false` and trades will actually reach Alpaca.
+
+-----
+
+## SUMMARY
+
+|Problem                                |Root cause                                                      |Fix                                                |
+|---------------------------------------|----------------------------------------------------------------|---------------------------------------------------|
+|Trades log as DRY_RUN                  |`config.dryRun = true` — executor returns before reaching Alpaca|Disable dry run via shell or Settings toggle       |
+|No visible feedback on why             |No diagnostic endpoint                                          |`/autotrader/diagnose` checks every gate in order  |
+|Easy to miss dry run status            |Settings page just shows “Dry Run” in small text                |Prominent amber/green banner with one-click toggle |
+|Runtime credentials stale after restart|CredentialLoader timing issue                                   |Already fixed — auto-reload in /alpaca/status route|
+
+### After applying
+
+1. Run the shell command above to immediately disable dry run
+1. Restart the server
+1. Click GO in Mission Control
+1. If still no trades, click the 🔍 Diagnose button — it will tell you exactly which gate is blocking and why

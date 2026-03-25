@@ -899,4 +899,157 @@ router.post('/ria-mode', async (req: Request, res: Response) => {
   }
 });
 
+// ─── Diagnose: show exactly why trades are (or aren't) executing ────────────
+
+router.get('/diagnose', requireAuth, async (req: Request, res: Response) => {
+  try {
+    const userId   = req.session!.userId as string;
+    const settings = await getUserSettings(userId);
+    const config   = parseConfig(settings);
+
+    const issues: string[]   = [];
+    const warnings: string[] = [];
+    const ok: string[]       = [];
+
+    // 1. Auto-trading enabled?
+    if (!settings.autoTradeEnabled) {
+      issues.push('Auto-trading is DISABLED — click START in Mission Control to begin');
+    } else {
+      ok.push('Auto-trading enabled');
+    }
+
+    // 2. Autonomous mode?
+    if (!(settings as any).autonomousMode) {
+      issues.push('Autonomous mode is OFF — enable it in Mission Control');
+    } else {
+      ok.push('Autonomous mode active');
+    }
+
+    // 3. Alpaca connected?
+    let alpacaConnected = hasAlpacaCredentials();
+    let alpacaDryRun    = getAlpacaCredentials()?.dryRun ?? true;
+
+    if (!alpacaConnected) {
+      try {
+        const { credentialService } = await import('../services/credentials/CredentialService');
+        const creds = await credentialService.getAlpacaCredentials(userId);
+        if (creds) {
+          setAlpacaRuntimeCredentials(creds);
+          alpacaConnected = true;
+          alpacaDryRun    = creds.dryRun;
+          warnings.push('Alpaca credentials had to be reloaded from DB — server may have restarted');
+        }
+      } catch { /* non-fatal */ }
+    }
+
+    if (!alpacaConnected) {
+      issues.push('Alpaca NOT connected — go to Settings and connect your Alpaca account');
+    } else {
+      ok.push('Alpaca connected');
+    }
+
+    // 4. Dry run? Most common reason trades show DRY_RUN instead of FILLED
+    if (alpacaDryRun) {
+      issues.push('DRY RUN IS ON — trades are simulated and never reach Alpaca. Disable dry run in Settings → Alpaca to execute real orders.');
+    } else {
+      ok.push('Live paper trading mode (dryRun = false)');
+    }
+
+    // 5. Signals available?
+    let signalCount = 0;
+    let topSignal: any = null;
+    try {
+      const signals = await buildSignalsFromLatestScan({
+        minConvictionScore: 55,
+        minConfidenceScore: 45,
+        allowedBiases:      ['BULLISH', 'BEARISH', 'NEUTRAL'],
+        maxSymbols:         5,
+      });
+      signalCount = signals.length;
+      topSignal   = signals[0] ?? null;
+      if (signals.length === 0) {
+        issues.push('No signals from latest scan — wait for the 9:30 AM scan or click Force Scan');
+      } else {
+        ok.push(`${signals.length} signals available (top: ${signals[0]?.symbol} conviction ${signals[0]?.convictionScore})`);
+      }
+    } catch { /* non-fatal */ }
+
+    // 6. Regime?
+    try {
+      const { detectRegime } = await import('../services/market/RegimeDetector');
+      const regime = await detectRegime();
+      const adj    = (regime as any).autoTraderAdjustments ?? {};
+      ok.push(`Regime: ${regime.regime} (conviction floor: ${adj.minConvictionOverride ?? config.minConvictionScore}, size: ${adj.positionSizeMultiplier ?? 1}x)`);
+    } catch { /* non-fatal */ }
+
+    // 7. Circuit breakers?
+    try {
+      const { checkCircuitBreakers } = await import('../services/autotrader/CircuitBreaker');
+      const { getPortfolioState }    = await import('../services/portfolio/PortfolioStateService');
+      const portfolio = await getPortfolioState();
+      const cb = await checkCircuitBreakers({
+        exchange:             config.exchange,
+        dailyLossLimit:       config.dailyLossLimit,
+        maxDrawdownPct:       config.maxDrawdownPct,
+        maxOpenPositions:     config.maxOpenPositions,
+        currentOpenPositions: portfolio.openPositionCount,
+        currentEquity:        portfolio.totalEquity,
+      }, settings.id);
+
+      if (!cb.allowed) {
+        issues.push(`Circuit breaker ACTIVE: ${cb.reason}`);
+      } else {
+        ok.push(`Circuit breakers clear (equity: $${portfolio.totalEquity.toFixed(0)}, positions: ${portfolio.openPositionCount})`);
+      }
+    } catch { /* non-fatal */ }
+
+    // 8. Latest scan age?
+    const latestScan = await prisma.dailyScanRun.findFirst({
+      where:   { status: 'COMPLETED' },
+      orderBy: { completedAt: 'desc' },
+      select:  { completedAt: true, totalRankedCount: true },
+    });
+
+    if (!latestScan) {
+      issues.push('No completed scan found — run a Daily Scan or wait for the 9:30 AM automatic scan');
+    } else {
+      const ageHours = (Date.now() - new Date(latestScan.completedAt!).getTime()) / 3_600_000;
+      if (ageHours > 8) {
+        warnings.push(`Scan is ${ageHours.toFixed(1)} hours old — signals may be stale`);
+      } else {
+        ok.push(`Latest scan: ${ageHours.toFixed(1)}h ago (${latestScan.totalRankedCount ?? '?'} results)`);
+      }
+    }
+
+    // 9. Recent trade log
+    const recentLogs = await prisma.autoTradeLog.findMany({
+      where:   { userSettingsId: settings.id },
+      orderBy: { executedAt: 'desc' },
+      take:    5,
+      select:  { symbol: true, status: true, reason: true, executedAt: true },
+    });
+
+    res.json({
+      success: true,
+      data: {
+        canTrade: issues.length === 0,
+        issues,
+        warnings,
+        ok,
+        config: {
+          exchange:           config.exchange,
+          dryRun:             alpacaDryRun,
+          minConvictionScore: config.minConvictionScore,
+          maxOpenPositions:   config.maxOpenPositions,
+          stopLossPct:        config.stopLossPct,
+          takeProfitPct:      config.takeProfitPct,
+        },
+        recentLogs,
+      },
+    });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err instanceof Error ? err.message : 'Diagnose failed' });
+  }
+});
+
 export default router;

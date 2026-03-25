@@ -288,6 +288,20 @@ export default function MissionControl() {
     },
   });
 
+  const diagnoseMut = useMutation({
+    mutationFn: () => (api.autotrader as any).diagnose(),
+    onSuccess: (r: any) => {
+      const d = r.data;
+      if (d.canTrade) {
+        toast.success('All systems go — trades should execute');
+      } else {
+        d.issues.forEach((issue: string) => toast.error(issue, { duration: 8000 }));
+        d.warnings.forEach((w: string) => toast.warning(w, { duration: 5000 }));
+      }
+    },
+    onError: () => toast.error('Diagnostic failed'),
+  });
+
   if (isLoading) return (
     <div className="flex items-center justify-center min-h-screen">
       <div className="text-center space-y-3">
@@ -314,13 +328,22 @@ export default function MissionControl() {
             <p className="text-[10px] text-slate-500">Stocks · Crypto · Options · All markets · Always on</p>
           </div>
         </div>
-        <button
-          onClick={() => scanMut.mutate()}
-          disabled={scanMut.isPending}
-          className="flex items-center gap-1.5 px-3 py-1.5 text-xs text-slate-400 border border-surface-border rounded-lg hover:text-white hover:border-violet-500/30 transition-colors disabled:opacity-50"
-        >
-          {scanMut.isPending ? '⟳ Scanning…' : '⟳ Force Scan'}
-        </button>
+        <div className="flex items-center gap-2">
+          <button
+            onClick={() => diagnoseMut.mutate()}
+            disabled={diagnoseMut.isPending}
+            className="flex items-center gap-1.5 px-3 py-1.5 text-xs text-slate-400 border border-surface-border rounded-lg hover:text-amber-400 hover:border-amber-500/30 transition-colors disabled:opacity-50"
+          >
+            {diagnoseMut.isPending ? '⟳ Checking…' : '🔍 Diagnose'}
+          </button>
+          <button
+            onClick={() => scanMut.mutate()}
+            disabled={scanMut.isPending}
+            className="flex items-center gap-1.5 px-3 py-1.5 text-xs text-slate-400 border border-surface-border rounded-lg hover:text-white hover:border-violet-500/30 transition-colors disabled:opacity-50"
+          >
+            {scanMut.isPending ? '⟳ Scanning…' : '⟳ Force Scan'}
+          </button>
+        </div>
       </div>
 
       <div className="p-6 max-w-[1100px] mx-auto">

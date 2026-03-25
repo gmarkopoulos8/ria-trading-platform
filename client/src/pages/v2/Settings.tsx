@@ -253,6 +253,17 @@ export default function Settings() {
     onSuccess: () => { toast.info('Alpaca disconnected'); qc.invalidateQueries({ queryKey: ['alpaca-cred-status'] }); },
   });
 
+  const toggleDryRun = useMutation({
+    mutationFn: (dryRun: boolean) => api.credentials.alpacaUpdateSettings({ dryRun }),
+    onSuccess: (_: any, dryRun: boolean) => {
+      toast.success(dryRun
+        ? 'Switched to dry run — trades will simulate only'
+        : 'Live paper trading enabled — trades will now execute on Alpaca');
+      qc.invalidateQueries({ queryKey: ['alpaca-cred-status'] });
+    },
+    onError: (e: any) => toast.error(e?.response?.data?.error ?? 'Failed to update mode'),
+  });
+
   const telegramConnect = useMutation({
     mutationFn: (params: { botToken: string; botUsername: string }) =>
       (api.auth as any).telegramConnect(params),
@@ -289,18 +300,44 @@ export default function Settings() {
         </div>
         {alpaca?.isConnected ? (
           <div className="space-y-3">
-            <div className="flex gap-3 text-xs">
-              <div className="p-2 bg-surface-3 rounded-lg flex-1">
-                <p className="text-slate-500">API Key</p>
-                <p className="text-white font-mono">{alpaca.apiKeyId ?? '…'}</p>
-              </div>
-              <div className="p-2 bg-surface-3 rounded-lg">
-                <p className="text-slate-500">Mode</p>
-                <p className={cn('font-semibold', alpaca.dryRun ? 'text-violet-300' : 'text-emerald-400')}>
-                  {alpaca.dryRun ? 'Paper/Dry Run' : 'Live Paper'}
-                </p>
+            <div className="p-2 bg-surface-3 rounded-lg text-xs">
+              <p className="text-slate-500 mb-0.5">API Key</p>
+              <p className="text-white font-mono">{alpaca.apiKeyId ?? '…'}</p>
+            </div>
+
+            {/* DRY RUN TOGGLE — most important setting */}
+            <div className={cn(
+              'p-4 rounded-xl border space-y-2',
+              alpaca.dryRun
+                ? 'bg-amber-500/10 border-amber-500/30'
+                : 'bg-emerald-500/10 border-emerald-500/30',
+            )}>
+              <div className="flex items-start justify-between gap-3">
+                <div className="flex-1 min-w-0">
+                  <p className={cn('text-sm font-bold', alpaca.dryRun ? 'text-amber-300' : 'text-emerald-300')}>
+                    {alpaca.dryRun ? '⚠️ Dry Run Mode' : '✅ Live Paper Trading'}
+                  </p>
+                  <p className="text-xs text-slate-500 mt-0.5">
+                    {alpaca.dryRun
+                      ? 'Trades are simulated — nothing reaches Alpaca. Enable live mode to actually execute.'
+                      : 'Real orders placed on Alpaca paper account. No real money at risk.'}
+                  </p>
+                </div>
+                <button
+                  onClick={() => toggleDryRun.mutate(!alpaca.dryRun)}
+                  disabled={toggleDryRun.isPending}
+                  className={cn(
+                    'flex-shrink-0 px-3 py-2 rounded-lg text-xs font-bold border transition-colors',
+                    alpaca.dryRun
+                      ? 'bg-emerald-500/20 border-emerald-500/40 text-emerald-300 hover:bg-emerald-500/30'
+                      : 'bg-amber-500/20 border-amber-500/40 text-amber-300 hover:bg-amber-500/30',
+                  )}
+                >
+                  {toggleDryRun.isPending ? '…' : alpaca.dryRun ? 'Enable Live' : 'Switch to Dry Run'}
+                </button>
               </div>
             </div>
+
             <button
               onClick={() => alpacaDisconnect.mutate()}
               disabled={alpacaDisconnect.isPending}
