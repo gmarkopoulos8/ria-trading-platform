@@ -1,0 +1,311 @@
+# Replit Agent Prompt — Unify Mission Control and Alpaca Auto/Start
+
+Right now there are two separate trading systems that don’t know about each other. This merges them into one. The Alpaca dashboard becomes a view of the same system Mission Control controls — one source of truth.
+
+-----
+
+## THE PROBLEM
+
+```
+Mission Control GO  →  sets autonomousMode=true in DB  →  scheduler runs daily
+                                        ↕ no connection
+Alpaca Start Trading  →  one-shot fire-and-forget  →  never runs again
+```
+
+They call the same `runTradingCycle()` but with separately-built configs and zero shared state.
+
+## THE FIX
+
+```
+Mission Control GO  ─┐
+                      ├→  sets autonomousMode=true  →  scheduler runs daily
+Alpaca Start Trading ─┘       (same DB flag)
+
+Alpaca "Run Now" button  →  manual single cycle  →  same as "Run Cycle Now"
+```
+
+One flag. One scheduler. One status.
+
+-----
+
+## PART A — Alpaca /auto/start: Delegate to the Unified System
+
+**File**: `server/src/routes/alpaca.ts`
+
+Replace the entire `/auto/start` route with a thin wrapper that enables the autonomous system and optionally runs one cycle immediately:
+
+```typescript
+router.post('/auto/start', requireAuth, requireAlpacaCredentials, async (req: Request, res: Response) => {
+  try {
+    const userId = (req as any).session?.userId as string;
+    const {
+      capitalTotal       = 500,
+      maxPositions       = 3,
+      capitalPerTrade,
+      stopLossPct        = 3.0,
+      takeProfitPct      = 6.0,
+      minConvictionScore = 75,
+      dryRun             = false,
+      runNow             = true,  // whether to execute a cycle immediately
+    } = req.body;
+
+    // Update Alpaca dry run setting if changed
+    const { credentialService } = await import('../services/credentials/CredentialService');
+    const existing = await credentialService.getAlpacaCredentials(userId);
+    if (existing && existing.dryRun !== dryRun) {
+      await credentialService.saveAlpacaCredentials(userId, { ...existing, dryRun });
+      setAlpacaRuntimeCredentials({ ...getAlpacaCredentials()!, dryRun });
+    }
+
+    // Enable autonomous mode via the unified system
+    let settings = await prisma.userSettings.findUnique({ where: { userId } });
+    if (!settings) settings = await prisma.userSettings.create({ data: { userId } });
+
+    await prisma.userSettings.update({
+      where: { id: settings.id },
+      data: {
+        autoTradeEnabled:        true,
+        autonomousMode:          true,
+        autonomousMinConviction: minConvictionScore,
+        autonomousMaxPositions:  maxPositions,
+        autonomousCapitalPct:    capitalPerTrade
+          ? (capitalPerTrade / capitalTotal) * 100
+          : (100 / maxPositions),
+      } as any,
+    });
+
+    // Optionally run one cycle immediately (don't wait for 9:30 AM)
+    let immediateResult = null;
+    if (runNow) {
+      const { runAutonomousCycle } = await import('../services/autotrader/AutonomousExecutor');
+      const results = await runAutonomousCycle('MANUAL');
+      immediateResult = results[0] ?? null;
+    }
+
+    return res.json({
+      success: true,
+      data: {
+        autonomousMode:   true,
+        autoTradeEnabled: true,
+        dryRun,
+        message: runNow
+          ? `Autonomous trading enabled. ${immediateResult?.tradesPlaced ?? 0} trade(s) placed immediately.`
+          : 'Autonomous trading enabled. Next cycle at market open (9:30 AM ET).',
+        immediateResult,
+      },
+    });
+  } catch (err: any) {
+    res.status(500).json({ success: false, error: err?.message ?? 'Failed to start' });
+  }
+});
+```
+
+-----
+
+## PART B — Alpaca /auto/status: Read from the Unified System
+
+**File**: `server/src/routes/alpaca.ts`
+
+Replace the `/auto/status` route to read from `UserSettings` instead of its own state:
+
+```typescript
+router.get('/auto/status', requireAuth, async (req: Request, res: Response) => {
+  try {
+    const userId = (req as any).session?.userId as string;
+
+    let alpacaConnected = hasAlpacaCredentials();
+    if (!alpacaConnected) {
+      try {
+        const { credentialService } = await import('../services/credentials/CredentialService');
+        const creds = await credentialService.getAlpacaCredentials(userId);
+        if (creds) { setAlpacaRuntimeCredentials(creds); alpacaConnected = true; }
+      } catch { /* non-fatal */ }
+    }
+
+    const settings = await prisma.userSettings.findUnique({ where: { userId } });
+    const isActive  = !!(settings?.autoTradeEnabled && (settings as any)?.autonomousMode);
+    const creds     = getAlpacaCredentials();
+
+    const todayStart = new Date(); todayStart.setHours(0,0,0,0);
+    const todayStats = settings ? await prisma.autoTradeLog.aggregate({
+      where: { userSettingsId: settings.id, executedAt: { gte: todayStart } },
+      _count: { id: true },
+      _sum:   { pnl: true },
+    }) : null;
+
+    const openCount = settings ? await prisma.autoTradeLog.count({
+      where: { userSettingsId: settings.id, status: { in: ['FILLED', 'DRY_RUN'] }, phase: 'ENTRY' },
+    }) : 0;
+
+    // Get adaptive params if available
+    const { getCachedAdaptive } = await import('../services/autotrader/UniversalAdaptiveEngine');
+    const adaptiveParams = getCachedAdaptive(userId, 'PAPER');
+
+    res.json({
+      success: true,
+      data: {
+        active:           isActive,
+        alpacaConnected,
+        dryRun:           creds?.dryRun ?? true,
+        autonomousMode:   (settings as any)?.autonomousMode ?? false,
+        autoTradeEnabled: settings?.autoTradeEnabled ?? false,
+        minConviction:    (settings as any)?.autonomousMinConviction ?? 75,
+        maxPositions:     (settings as any)?.autonomousMaxPositions  ?? 3,
+        capitalPct:       (settings as any)?.autonomousCapitalPct    ?? 5.0,
+        lastRun:          (settings as any)?.lastAutonomousRun       ?? null,
+        today: {
+          trades: todayStats?._count.id ?? 0,
+          pnl:    todayStats?._sum.pnl  ?? 0,
+        },
+        openPositions:   openCount,
+        adaptiveParams,
+      },
+    });
+  } catch (err: any) {
+    res.status(500).json({ success: false, error: err?.message });
+  }
+});
+```
+
+-----
+
+## PART C — Alpaca /auto/monitor: Also Use Unified System
+
+**File**: `server/src/routes/alpaca.ts`
+
+Replace `/auto/monitor` to just run a single autonomous cycle (same as “Run Now”):
+
+```typescript
+router.post('/auto/monitor', requireAuth, requireAlpacaCredentials, async (req: Request, res: Response) => {
+  try {
+    const { runAutonomousCycle } = await import('../services/autotrader/AutonomousExecutor');
+    const results = await runAutonomousCycle('MANUAL');
+    const r = results[0];
+
+    res.json({
+      success: true,
+      data: {
+        tradesPlaced:   r?.tradesPlaced   ?? 0,
+        tradesRejected: r?.tradesRejected ?? 0,
+        regime:         r?.adaptiveRegime ?? 'UNKNOWN',
+        dryRun:         r?.dryRun         ?? true,
+        errors:         r?.errors         ?? [],
+      },
+    });
+  } catch (err: any) {
+    res.status(500).json({ success: false, error: err?.message ?? 'Monitor cycle failed' });
+  }
+});
+```
+
+-----
+
+## PART D — Mission Control: Show Unified Status
+
+**File**: `client/src/pages/v2/MissionControl.tsx`
+
+The `/autotrader/ria-status` endpoint already reads from `UserSettings` (`autonomousMode`, `autoTradeEnabled`). Since we just made `alpaca/auto/start` write to those same fields, Mission Control will automatically reflect the correct state when Alpaca starts trading.
+
+No changes needed to the page itself — the shared DB state handles it.
+
+-----
+
+## PART E — Alpaca Dashboard: Show It’s Controlled by Mission Control
+
+**File**: `client/src/pages/alpaca/AlpacaDashboard.tsx`
+
+In the autonomous trading section of the Alpaca dashboard, update the status display to read from the unified status and add a link to Mission Control:
+
+Find the auto status display area and add:
+
+```tsx
+{/* Show that this is controlled by Mission Control */}
+{autoStatus?.active && (
+  <div className="flex items-center gap-2 p-3 bg-violet-500/10 border border-violet-500/20 rounded-xl text-xs">
+    <span className="w-2 h-2 rounded-full bg-violet-400 animate-pulse flex-shrink-0" />
+    <span className="text-violet-300 font-semibold">Controlled by Mission Control</span>
+    <a href="/trade" className="ml-auto text-violet-400 hover:text-violet-300 underline">
+      View →
+    </a>
+  </div>
+)}
+{!autoStatus?.active && (
+  <div className="text-xs text-slate-500 p-3 bg-surface-2 rounded-xl">
+    Trading is stopped. <a href="/trade" className="text-violet-400 underline">Go to Mission Control</a> to start.
+  </div>
+)}
+```
+
+-----
+
+## PART F — Remove the Duplicate Stop Route
+
+**File**: `server/src/routes/alpaca.ts`
+
+Add a proper stop that matches what Mission Control does:
+
+```typescript
+// Already exists as auto/start — add stop at the same level
+router.post('/auto/stop', requireAuth, async (req: Request, res: Response) => {
+  try {
+    const userId  = (req as any).session?.userId as string;
+    const settings = await prisma.userSettings.findUnique({ where: { userId } });
+    if (settings) {
+      await prisma.userSettings.update({
+        where: { id: settings.id },
+        data: {
+          autoTradeEnabled: false,
+          autonomousMode:   false,
+        } as any,
+      });
+    }
+    res.json({ success: true, data: { autonomousMode: false, autoTradeEnabled: false } });
+  } catch (err: any) {
+    res.status(500).json({ success: false, error: err?.message });
+  }
+});
+```
+
+Add to `client/src/api/client.ts`:
+
+```typescript
+autoStop: () => post('/alpaca/auto/stop', {}),
+```
+
+-----
+
+## SUMMARY
+
+### Before
+
+```
+Mission Control GO     → sets autonomousMode in DB     → scheduler runs daily
+Alpaca Start Trading   → one-shot only                 → scheduler never knows
+                                                          two different statuses
+                                                          neither reflects the other
+```
+
+### After
+
+```
+Mission Control GO  ─┐
+                      ├→ sets autonomousMode in DB → scheduler runs daily
+Alpaca Start Trading ─┘           ↑
+                               same flag
+                            same status endpoint
+                            one source of truth
+
+Alpaca "Run Now"  →  runAutonomousCycle('MANUAL')  →  same executor as scheduler
+```
+
+### The key insight
+
+The Alpaca dashboard is a **view** into the trading system, not a separate trading system. It should reflect what Mission Control shows. Any action taken on the Alpaca page (start/stop/run now) should be equivalent to the same action on Mission Control — they write to and read from the same database fields.
+
+### After this is applied
+
+- Click GO in Mission Control → Alpaca dashboard shows active ✓
+- Click Start Trading in Alpaca → Mission Control shows active ✓
+- Status is always in sync because they read the same `UserSettings` row
+- The scheduler always knows the correct state
+- One stop button works everywhere

@@ -949,12 +949,12 @@ function AutoTradingPanel({ isDryRun: externalDryRun }: { isDryRun: boolean }) {
   const monitorMutation = useMutation({
     mutationFn: () => api.alpaca.autoMonitor({ dryRun }),
     onSuccess: (r: any) => {
-      const closed = (r?.data?.actions ?? []).filter((a: any) => ['CLOSED','WOULD_CLOSE'].includes(a.action));
-      if (closed.length > 0) toast.success(`${dryRun ? '[DRY RUN] ' : ''}Closed ${closed.length} position${closed.length !== 1 ? 's' : ''}`);
-      else                   toast.info('All positions within range');
-      qc.invalidateQueries({ queryKey: ['alpaca-positions', 'alpaca-positions-live', 'alpaca-status'] });
+      const n = r?.data?.tradesPlaced ?? 0;
+      if (n > 0) toast.success(`${dryRun ? '[DRY RUN] ' : ''}${n} trade${n !== 1 ? 's' : ''} placed`);
+      else       toast.info('Cycle complete — no new trades placed');
+      qc.invalidateQueries({ queryKey: ['alpaca-positions', 'alpaca-positions-live', 'alpaca-status', 'alpaca-auto-status'] });
     },
-    onError: (e: any) => toast.error(e?.response?.data?.error ?? 'Monitor failed'),
+    onError: (e: any) => toast.error(e?.response?.data?.error ?? 'Cycle failed'),
   });
 
   const toggleDryMutation = useMutation({
@@ -993,6 +993,22 @@ function AutoTradingPanel({ isDryRun: externalDryRun }: { isDryRun: boolean }) {
           </div>
         )}
       </div>
+
+      {/* Unified status banner */}
+      {(autoStatus as any)?.active ? (
+        <div className="flex items-center gap-2 p-3 mb-4 bg-violet-500/10 border border-violet-500/20 rounded-xl text-xs">
+          <span className="w-2 h-2 rounded-full bg-violet-400 animate-pulse flex-shrink-0" />
+          <span className="text-violet-300 font-semibold">Controlled by Mission Control</span>
+          <a href="/trade" className="ml-auto text-violet-400 hover:text-violet-300 underline">
+            View →
+          </a>
+        </div>
+      ) : (
+        <div className="text-xs text-slate-500 p-3 mb-4 bg-surface-2 rounded-xl">
+          Trading is stopped.{' '}
+          <a href="/trade" className="text-violet-400 underline">Go to Mission Control</a> to start, or use the button below.
+        </div>
+      )}
 
       {/* Stats row */}
       <div className="grid grid-cols-4 gap-2 mb-4">
