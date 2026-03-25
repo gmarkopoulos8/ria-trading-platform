@@ -1,5 +1,6 @@
 import { prisma } from '../../lib/prisma';
 import { DEFAULT_AUTO_TRADE_CONFIG, type AutoTradeConfig } from './AutoTradeExecutor';
+import { getAlpacaCredentials } from '../alpaca/alpacaConfig';
 import { checkSessionActive, pauseSession } from './ExchangeAutoConfigService';
 import { isKillswitchActive as isHLStopped } from '../hyperliquid/hyperliquidConfig';
 import { isKillswitchActive as isTOSStopped } from '../tos/tosConfig';
@@ -307,6 +308,8 @@ export async function runIntradayMonitor(): Promise<void> {
       where: { autoTradeEnabled: true },
     });
 
+    const liveDryRun = getAlpacaCredentials()?.dryRun ?? true;
+
     for (const settings of allSettings) {
       const config: AutoTradeConfig = {
         ...DEFAULT_AUTO_TRADE_CONFIG,
@@ -314,6 +317,7 @@ export async function runIntradayMonitor(): Promise<void> {
           ? (settings.autoTradeConfig as Partial<AutoTradeConfig>)
           : {}),
         enabled: settings.autoTradeEnabled,
+        dryRun:  liveDryRun,
       };
 
       await monitorOpenAutoTrades(settings.id, config);
@@ -333,6 +337,7 @@ export async function runIntradayMonitor(): Promise<void> {
               ? (settings.autoTradeConfig as Partial<AutoTradeConfig>)
               : {}),
             enabled: settings.autoTradeEnabled,
+            dryRun:  liveDryRun,
           };
           await monitorIntradayPositions(settings.id, cfg.dryRun);
         }
@@ -365,6 +370,7 @@ export async function runIntradayMonitor(): Promise<void> {
               ? (settings.autoTradeConfig as Partial<AutoTradeConfig>)
               : {}),
             enabled: settings.autoTradeEnabled,
+            dryRun:  liveDryRun,
           };
           if (!cfg.enabled) continue;
 
