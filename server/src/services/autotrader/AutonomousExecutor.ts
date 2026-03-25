@@ -263,6 +263,8 @@ export async function runAutonomousCycle(
         // Hard guarantee: if still 0 trades logged, write one DRY_RUN sentinel entry
         // directly so Mission Control always shows activity and the user can see
         // the bot is alive even when every filter rejects every signal.
+        // A synthetic cycleResult is also appended so downstream notification code
+        // never receives undefined symbol/entryPrice values.
         if (!fallbackSucceeded) {
           const best = (fallbackSignals.length > 0 ? fallbackSignals : signals)[0];
           if (best) {
@@ -283,6 +285,16 @@ export async function runAutonomousCycle(
                 metadata:       JSON.parse(JSON.stringify({ sentinel: true, regime: regimeName, signal: best })),
               } as any,
             });
+            // Append synthetic result so notification code has a valid symbol/price
+            cycleResults = [...cycleResults, {
+              success:     true,
+              status:      'DRY_RUN' as const,
+              symbol:      best.symbol,
+              exchange:    'PAPER' as const,
+              entryPrice:  best.entryPrice ?? 0,
+              dollarAmount: 0,
+              quantity:    0,
+            }];
             result.tradesPlaced = 1;
           }
         }
