@@ -877,10 +877,12 @@ router.get('/ria-status', async (req: Request, res: Response) => {
         riaMode:          (settings as any).riaMode        ?? 'OFF',
         autonomousMode:   (settings as any).autonomousMode ?? false,
         autoTradeEnabled: settings.autoTradeEnabled,
-        riskProfile:      (settings as any).riskProfile    ?? 'MODERATE',
-        maxPositionPct:   settings.maxPositionPct,
-        maxDailyDrawdownPct: (settings as any).maxDailyDrawdownPct ?? 3.0,
-        lastRun:          (settings as any).lastAutonomousRun ?? null,
+        riskProfile:           (settings as any).riskProfile          ?? 'MODERATE',
+        maxPositionPct:        settings.maxPositionPct,
+        maxDailyDrawdownPct:   (settings as any).maxDailyDrawdownPct  ?? 3.0,
+        perTradeUsd:           (settings as any).perTradeUsd          ?? null,
+        autonomousMaxPositions:(settings as any).autonomousMaxPositions ?? 3,
+        lastRun:               (settings as any).lastAutonomousRun     ?? null,
         dryRun:           getAlpacaCredentials()?.dryRun ?? true,
 
         connections: {
@@ -911,7 +913,7 @@ router.get('/ria-status', async (req: Request, res: Response) => {
 router.post('/ria-mode', async (req: Request, res: Response) => {
   try {
     const userId = req.session!.userId as string;
-    const { mode, riskProfile, maxPositionPct, maxDailyDrawdownPct } = req.body;
+    const { mode, riskProfile, maxPositionPct, maxDailyDrawdownPct, perTradeUsd, autonomousMaxPositions } = req.body;
 
     const settings = await getUserSettings(userId);
     const isOn = mode !== 'OFF';
@@ -922,9 +924,11 @@ router.post('/ria-mode', async (req: Request, res: Response) => {
         riaMode:          mode,
         autoTradeEnabled: isOn,
         autonomousMode:   isOn,
-        ...(riskProfile         !== undefined && { riskProfile }),
-        ...(maxPositionPct      !== undefined && { maxPositionPct }),
-        ...(maxDailyDrawdownPct !== undefined && { maxDailyDrawdownPct }),
+        ...(riskProfile            !== undefined && { riskProfile }),
+        ...(maxPositionPct         !== undefined && { maxPositionPct }),
+        ...(maxDailyDrawdownPct    !== undefined && { maxDailyDrawdownPct }),
+        ...(perTradeUsd            !== undefined && { perTradeUsd: perTradeUsd > 0 ? perTradeUsd : null }),
+        ...(autonomousMaxPositions !== undefined && { autonomousMaxPositions: Math.min(10, Math.max(1, Number(autonomousMaxPositions))) }),
       } as any,
     });
 

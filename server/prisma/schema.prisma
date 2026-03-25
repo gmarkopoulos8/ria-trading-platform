@@ -62,6 +62,7 @@ model UserSettings {
   autonomousMinConviction Int      @default(75)
   autonomousMaxPositions  Int      @default(3)
   autonomousCapitalPct    Float    @default(5.0)
+  perTradeUsd             Float?
   lastAutonomousRun       DateTime?
 
   riaMode             String   @default("OFF")

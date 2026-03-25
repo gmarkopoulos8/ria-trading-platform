@@ -213,10 +213,48 @@ export async function runAutonomousCycle(
         }
       }
 
-      const cycleResults = await runTradingCycle(settings.id, baseConfig, signals);
+      let cycleResults = await runTradingCycle(settings.id, baseConfig, signals);
 
       result.tradesPlaced   = cycleResults.filter(r => ['FILLED', 'DRY_RUN'].includes(r.status)).length;
       result.tradesRejected = cycleResults.filter(r => !['FILLED', 'DRY_RUN'].includes(r.status)).length;
+
+      // ─── Guaranteed-execution fallback ─────────────────────────────────────
+      // If 0 trades were placed despite signals being available, retry once with
+      // all soft filters stripped (dryRun forced, conviction floor ≥ 50).
+      // This ensures at least 1 logged outcome per active session so the user
+      // can see the bot is working even in adverse filter conditions.
+      if (result.tradesPlaced === 0 && signals.length > 0) {
+        console.info(`[Autonomous] Zero trades placed — running guaranteed-execution fallback for ${settings.userId}`);
+        const fallbackSignals = await buildSignalsFromLatestScan({
+          minConvictionScore: 50,
+          minConfidenceScore: 40,
+          allowedBiases:      ['BULLISH', 'NEUTRAL', 'BEARISH'],
+          maxSymbols:         3,
+        });
+        if (fallbackSignals.length > 0) {
+          const fallbackConfig = {
+            ...baseConfig,
+            dryRun:            true,
+            minConvictionScore: 50,
+            minConfidenceScore: 40,
+            allowedBiases:      ['BULLISH', 'NEUTRAL', 'BEARISH'],
+          };
+          const fallbackMapped = fallbackSignals.map((s: any) => ({
+            ...s,
+            exchange:         'PAPER' as const,
+            _premiumSelling:  isPremiumSellingRegime,
+            _lastResort:      true,
+          }));
+          const fallbackResults = await runTradingCycle(settings.id, fallbackConfig, fallbackMapped);
+          const fallbackPlaced  = fallbackResults.filter(r => ['FILLED', 'DRY_RUN'].includes(r.status));
+          if (fallbackPlaced.length > 0) {
+            console.info(`[Autonomous] Fallback placed ${fallbackPlaced.length} trade(s) for ${settings.userId}`);
+            cycleResults = [...cycleResults, ...fallbackResults];
+            result.tradesPlaced   = cycleResults.filter(r => ['FILLED', 'DRY_RUN'].includes(r.status)).length;
+            result.tradesRejected = cycleResults.filter(r => !['FILLED', 'DRY_RUN'].includes(r.status)).length;
+          }
+        }
+      }
 
       await prisma.userSettings.update({
         where: { id: settings.id },

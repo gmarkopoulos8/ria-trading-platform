@@ -24,7 +24,7 @@ let _regimeCache: { state: RegimeState; ts: number } | null = null;
 const ADJUSTMENTS: Record<MarketRegime, RegimeState['autoTraderAdjustments']> = {
   BULL_TREND:          { minConvictionOverride: 70,  positionSizeMultiplier: 1.10, allowNewEntries: true,  longOnly: false },
   CHOPPY:              { minConvictionOverride: 72,  positionSizeMultiplier: 0.75, allowNewEntries: true,  longOnly: false },
-  ELEVATED_VOLATILITY: { minConvictionOverride: 75,  positionSizeMultiplier: 0.50, allowNewEntries: true,  longOnly: false },
+  ELEVATED_VOLATILITY: { minConvictionOverride: 65,  positionSizeMultiplier: 0.50, allowNewEntries: true,  longOnly: false },
   BEAR_CRISIS:         { minConvictionOverride: 85,  positionSizeMultiplier: 0.20, allowNewEntries: true,  longOnly: false },
 };
 

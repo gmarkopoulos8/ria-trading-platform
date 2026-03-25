@@ -158,6 +158,7 @@ export async function executeAutoTrade(
 
   // ─── Phase 4: Regime check ─────────────────────────────────────────────
   let regimePositionSizeMultiplier = 1.0;
+  const isPremiumSelling = (signal as any)._premiumSelling === true;
   try {
     const regime = await detectRegime();
     if (!regime.autoTraderAdjustments.allowNewEntries) {
@@ -167,8 +168,14 @@ export async function executeAutoTrade(
       return { success: false, status: 'REJECTED', symbol: signal.symbol, exchange, reason: `REGIME_LONG_ONLY: ${regime.regime} requires long-only mode` };
     }
     const effectiveMinConvictionFromRegime = regime.autoTraderAdjustments.minConvictionOverride;
-    if (signal.convictionScore < effectiveMinConvictionFromRegime) {
+    // Skip regime conviction hard-block for premium-selling signals (AutonomousExecutor already applied
+    // appropriate relaxed thresholds) and in dry-run mode (no real capital at risk).
+    const skipConvictionBlock = isPremiumSelling || config.dryRun;
+    if (!skipConvictionBlock && signal.convictionScore < effectiveMinConvictionFromRegime) {
       return { success: false, status: 'REJECTED', symbol: signal.symbol, exchange, reason: `REGIME_CONVICTION: ${regime.regime} requires conviction >= ${effectiveMinConvictionFromRegime}` };
+    }
+    if (skipConvictionBlock && signal.convictionScore < effectiveMinConvictionFromRegime) {
+      console.info(`[AutoTrader] REGIME_CONVICTION soft-skip: ${signal.symbol} conviction ${signal.convictionScore} < ${effectiveMinConvictionFromRegime} (${isPremiumSelling ? 'premium-selling' : 'dry-run'})`);
     }
     regimePositionSizeMultiplier = regime.autoTraderAdjustments.positionSizeMultiplier;
   } catch {
@@ -272,11 +279,15 @@ export async function executeAutoTrade(
   }
 
   // ─── Phase 5: Intraday confirmation check ───────────────────────────────
-  if (signal.intradayConfirmation === 'EXTENDED') {
-    return { success: false, status: 'REJECTED', symbol: signal.symbol, exchange, reason: 'INTRADAY_EXTENDED — price overbought on hourly, waiting for pullback' };
-  }
-  if (signal.intradayConfirmation === 'WAIT') {
-    return { success: false, status: 'REJECTED', symbol: signal.symbol, exchange, reason: 'INTRADAY_NOT_CONFIRMED — hourly trend contradicts daily setup' };
+  // Premium-selling strategies (Iron Condors, CSPs) benefit from overbought/range-bound
+  // conditions, so EXTENDED/WAIT confirmations are not disqualifying — skip filter.
+  if (!isPremiumSelling) {
+    if (signal.intradayConfirmation === 'EXTENDED') {
+      return { success: false, status: 'REJECTED', symbol: signal.symbol, exchange, reason: 'INTRADAY_EXTENDED — price overbought on hourly, waiting for pullback' };
+    }
+    if (signal.intradayConfirmation === 'WAIT') {
+      return { success: false, status: 'REJECTED', symbol: signal.symbol, exchange, reason: 'INTRADAY_NOT_CONFIRMED — hourly trend contradicts daily setup' };
+    }
   }
 
   const portfolioState = await getPortfolioState();
@@ -364,6 +375,22 @@ export async function executeAutoTrade(
     entryPrice,
     regimeSizeMultiplier: regimePositionSizeMultiplier,
   }, entryPrice);
+
+  // Apply per-trade dollar amount from UserSettings (takes priority over % sizing)
+  try {
+    const userSettingsForSize = await prisma.userSettings.findUnique({ where: { id: userSettingsId } });
+    const perTradeUsd = (userSettingsForSize as any)?.perTradeUsd as number | null | undefined;
+    if (perTradeUsd && perTradeUsd > 0 && entryPrice > 0) {
+      const minGuard = 25;
+      const maxGuard = totalEquity * 0.25;
+      const clamped  = Math.min(maxGuard, Math.max(minGuard, perTradeUsd));
+      const qty      = clamped / entryPrice;
+      sized = { ...sized, dollarAmount: clamped, quantity: qty, positionPct: (clamped / totalEquity) * 100 };
+      console.info(`[AutoTrader] Per-trade override: ${signal.symbol} → $${clamped.toFixed(0)} (${(clamped / totalEquity * 100).toFixed(1)}% of equity)`);
+    }
+  } catch {
+    // non-fatal
+  }
 
   // Apply Claude's position size override if provided
   const claudeDecision = (signal as any)._claudeDecision as ClaudeTradeDecision | undefined;

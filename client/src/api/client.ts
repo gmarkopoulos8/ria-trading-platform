@@ -233,7 +233,7 @@ export const api = {
   },
   autotrader: {
     riaStatus: () => get('/autotrader/ria-status'),
-    riaMode:   (body: { mode: string; riskProfile?: string; maxPositionPct?: number; maxDailyDrawdownPct?: number }) =>
+    riaMode:   (body: { mode: string; riskProfile?: string; maxPositionPct?: number; maxDailyDrawdownPct?: number; perTradeUsd?: number; autonomousMaxPositions?: number }) =>
       post('/autotrader/ria-mode', body),
     status: () => get('/autotrader/status'),
     enable: () => post('/autotrader/enable'),

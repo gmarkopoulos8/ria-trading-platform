@@ -22,14 +22,25 @@ const REGIME_META: Record<string, { label: string; color: string; bg: string; st
 
 function GoButton({ status, onStart, onStop }: {
   status: any;
-  onStart: (mode: string, riskProfile: string) => void;
+  onStart: (mode: string, riskProfile: string, perTradeUsd: number | null, maxPositions: number) => void;
   onStop: () => void;
 }) {
-  const [riskProfile, setRiskProfile] = useState(status?.riskProfile ?? 'MODERATE');
-  const [showConfig, setShowConfig] = useState(false);
-  const isOn     = status?.riaMode !== 'OFF' && !!status?.riaMode;
-  const isDryRun = status?.dryRun ?? true;
+  const [riskProfile,   setRiskProfile]   = useState<string>(status?.riskProfile ?? 'MODERATE');
+  const [showConfig,    setShowConfig]     = useState(false);
+  const [perTradeUsd,   setPerTradeUsd]   = useState<string>(status?.perTradeUsd ? String(status.perTradeUsd) : '');
+  const [maxPositions,  setMaxPositions]  = useState<string>(String(status?.autonomousMaxPositions ?? 3));
+  const isOn      = status?.riaMode !== 'OFF' && !!status?.riaMode;
+  const isDryRun  = status?.dryRun ?? true;
   const hasAlpaca = status?.connections?.alpaca;
+
+  const perTradeNum   = perTradeUsd !== '' ? Number(perTradeUsd) : null;
+  const maxPosNum     = Math.min(10, Math.max(1, Number(maxPositions) || 3));
+
+  const riskPctLabel: Record<string, string> = {
+    CONSERVATIVE: '2% per trade',
+    MODERATE:     '5% per trade',
+    AGGRESSIVE:   '10% per trade',
+  };
 
   return (
     <div className="flex flex-col items-center gap-5">
@@ -41,7 +52,7 @@ function GoButton({ status, onStart, onStop }: {
           </>
         )}
         <button
-          onClick={() => isOn ? onStop() : (hasAlpaca ? onStart('PAPER', riskProfile) : null)}
+          onClick={() => isOn ? onStop() : (hasAlpaca ? onStart('PAPER', riskProfile, perTradeNum, maxPosNum) : null)}
           disabled={!hasAlpaca && !isOn}
           className={cn(
             'relative w-44 h-44 rounded-full font-bold text-xl flex flex-col items-center justify-center gap-2 transition-all duration-300 border-4 shadow-2xl',
@@ -60,9 +71,16 @@ function GoButton({ status, onStart, onStop }: {
 
       <div className="text-center">
         {isOn ? (
-          <div className="flex items-center gap-2">
-            <div className="w-2 h-2 rounded-full bg-violet-400 animate-pulse" />
-            <span className="text-sm font-semibold text-violet-300">RIA is trading autonomously</span>
+          <div className="flex flex-col items-center gap-1">
+            <div className="flex items-center gap-2">
+              <div className="w-2 h-2 rounded-full bg-violet-400 animate-pulse" />
+              <span className="text-sm font-semibold text-violet-300">RIA is trading autonomously</span>
+            </div>
+            {status?.perTradeUsd && (
+              <span className="text-[10px] text-slate-500">
+                ${Number(status.perTradeUsd).toLocaleString()} per trade · max {status?.autonomousMaxPositions ?? 3} positions
+              </span>
+            )}
           </div>
         ) : hasAlpaca ? (
           <p className="text-sm text-slate-500">Click START to begin autonomous trading</p>
@@ -82,37 +100,86 @@ function GoButton({ status, onStart, onStop }: {
             onClick={() => setShowConfig(!showConfig)}
             className="text-xs text-slate-600 hover:text-slate-400 transition-colors"
           >
-            {showConfig ? '▲ Hide settings' : '⚙ Configure risk settings'}
+            {showConfig ? '▲ Hide settings' : '⚙ Configure settings'}
           </button>
           {showConfig && (
-            <div className="w-full max-w-xs bg-surface-2 border border-surface-border rounded-2xl p-4 space-y-3">
-              <p className="text-xs font-semibold text-slate-400 uppercase tracking-wider">Risk Profile</p>
-              <div className="grid grid-cols-3 gap-2">
-                {['CONSERVATIVE', 'MODERATE', 'AGGRESSIVE'].map(p => (
-                  <button
-                    key={p}
-                    onClick={() => setRiskProfile(p)}
-                    className={cn(
-                      'py-2 rounded-lg text-xs font-semibold border transition-colors',
-                      riskProfile === p
-                        ? 'bg-violet-500/20 border-violet-500/50 text-violet-300'
-                        : 'bg-surface-3 border-surface-border text-slate-500 hover:text-slate-300',
-                    )}
-                  >
-                    {p.slice(0, 4)}
-                  </button>
-                ))}
+            <div className="w-full max-w-xs bg-surface-2 border border-surface-border rounded-2xl p-4 space-y-4">
+
+              {/* Risk Profile */}
+              <div className="space-y-2">
+                <p className="text-xs font-semibold text-slate-400 uppercase tracking-wider">Risk Profile</p>
+                <div className="grid grid-cols-3 gap-2">
+                  {['CONSERVATIVE', 'MODERATE', 'AGGRESSIVE'].map(p => (
+                    <button
+                      key={p}
+                      onClick={() => setRiskProfile(p)}
+                      className={cn(
+                        'py-2 rounded-lg text-xs font-semibold border transition-colors',
+                        riskProfile === p
+                          ? 'bg-violet-500/20 border-violet-500/50 text-violet-300'
+                          : 'bg-surface-3 border-surface-border text-slate-500 hover:text-slate-300',
+                      )}
+                    >
+                      {p.slice(0, 4)}
+                    </button>
+                  ))}
+                </div>
+                <p className="text-[10px] text-slate-600">
+                  {perTradeNum && perTradeNum > 0
+                    ? `Fixed $${perTradeNum.toLocaleString()} per trade (overrides % below)`
+                    : riskPctLabel[riskProfile] + ' of portfolio · All strategies enabled'}
+                </p>
               </div>
-              <div className="text-[10px] text-slate-600 space-y-1">
-                {riskProfile === 'CONSERVATIVE' && <p>Max 2% per trade · Lower conviction required · Iron Condors only in bad markets</p>}
-                {riskProfile === 'MODERATE'     && <p>Max 5% per trade · Balanced approach · All strategies enabled</p>}
-                {riskProfile === 'AGGRESSIVE'   && <p>Max 10% per trade · High conviction required · Leveraged positions via HL</p>}
+
+              {/* Capital Controls */}
+              <div className="space-y-2">
+                <p className="text-xs font-semibold text-slate-400 uppercase tracking-wider">Capital Per Trade</p>
+                <div className="relative">
+                  <span className="absolute left-3 top-1/2 -translate-y-1/2 text-slate-500 text-xs">$</span>
+                  <input
+                    type="number"
+                    min={25}
+                    max={50000}
+                    step={50}
+                    placeholder="e.g. 500  (leave blank to use % above)"
+                    value={perTradeUsd}
+                    onChange={e => setPerTradeUsd(e.target.value)}
+                    className="w-full pl-6 pr-3 py-2 bg-surface-3 border border-surface-border rounded-lg text-xs text-white placeholder-slate-600 focus:outline-none focus:border-violet-500/50"
+                  />
+                </div>
+                <p className="text-[10px] text-slate-600">
+                  Fixed dollar amount per trade. Overrides the risk profile %. Leave blank to use %.
+                </p>
               </div>
+
+              {/* Max Concurrent Trades */}
+              <div className="space-y-2">
+                <p className="text-xs font-semibold text-slate-400 uppercase tracking-wider">Max Concurrent Trades</p>
+                <div className="flex items-center gap-2">
+                  {[1, 2, 3, 5, 8, 10].map(n => (
+                    <button
+                      key={n}
+                      onClick={() => setMaxPositions(String(n))}
+                      className={cn(
+                        'flex-1 py-1.5 rounded-lg text-xs font-semibold border transition-colors',
+                        maxPosNum === n
+                          ? 'bg-violet-500/20 border-violet-500/50 text-violet-300'
+                          : 'bg-surface-3 border-surface-border text-slate-500 hover:text-slate-300',
+                      )}
+                    >
+                      {n}
+                    </button>
+                  ))}
+                </div>
+              </div>
+
               <button
-                onClick={() => { onStart('PAPER', riskProfile); setShowConfig(false); }}
+                onClick={() => { onStart('PAPER', riskProfile, perTradeNum, maxPosNum); setShowConfig(false); }}
                 className="w-full py-2.5 bg-violet-600 hover:bg-violet-700 text-white text-sm font-bold rounded-xl transition-colors"
               >
-                Start with {riskProfile.toLowerCase()} risk
+                {perTradeNum && perTradeNum > 0
+                  ? `Start · $${perTradeNum.toLocaleString()}/trade · ${maxPosNum} max`
+                  : `Start · ${riskPctLabel[riskProfile]} · ${maxPosNum} max`}
               </button>
             </div>
           )}
@@ -353,11 +420,13 @@ export default function MissionControl() {
           <div className="flex flex-col items-center gap-6 lg:pt-8">
             <GoButton
               status={status}
-              onStart={(mode, riskProfile) => modeMut.mutate({
+              onStart={(mode, riskProfile, perTradeUsd, autonomousMaxPositions) => modeMut.mutate({
                 mode,
                 riskProfile,
-                maxPositionPct:      riskProfile === 'CONSERVATIVE' ? 2.0 : riskProfile === 'AGGRESSIVE' ? 10.0 : 5.0,
-                maxDailyDrawdownPct: riskProfile === 'CONSERVATIVE' ? 1.5 : riskProfile === 'AGGRESSIVE' ? 5.0  : 3.0,
+                maxPositionPct:       riskProfile === 'CONSERVATIVE' ? 2.0 : riskProfile === 'AGGRESSIVE' ? 10.0 : 5.0,
+                maxDailyDrawdownPct:  riskProfile === 'CONSERVATIVE' ? 1.5 : riskProfile === 'AGGRESSIVE' ? 5.0  : 3.0,
+                ...(perTradeUsd != null && perTradeUsd > 0 && { perTradeUsd }),
+                autonomousMaxPositions,
               })}
               onStop={() => modeMut.mutate({ mode: 'OFF' })}
             />
